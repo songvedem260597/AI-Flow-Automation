@@ -51,6 +51,9 @@ gen-assets/
 # C: scratch / recovery files
 C:/
 
+# Reference folder (third-party code snapshot — kept locally, not in repo)
+reference/
+
 # Local debug / scratch
 *.log
 *.tsbuildinfo
