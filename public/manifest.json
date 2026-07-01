@@ -1,0 +1,60 @@
+{
+  "icons": {
+    "16": "assets/icon16.png",
+    "32": "assets/icon32.png",
+    "48": "assets/icon48.png",
+    "64": "assets/icon64.png",
+    "128": "assets/icon128.png"
+  },
+  "manifest_version": 3,
+  "action": {
+    "default_icon": {
+      "16": "assets/icon16.png",
+      "32": "assets/icon32.png",
+      "48": "assets/icon48.png",
+      "64": "assets/icon64.png",
+      "128": "assets/icon128.png"
+    }
+  },
+  "version": "1.0.0",
+  "name": "AI Flow Automation",
+  "description": "AI Workflow Automation Tool for Google Flow, ChatGPT, Grok and other AI platforms",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "permissions": [
+    "sidePanel",
+    "tabs",
+    "storage",
+    "activeTab",
+    "scripting",
+    "notifications"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://labs.google/*",
+        "https://flow.google.com/*",
+        "https://chatgpt.com/*",
+        "https://x.com/*",
+        "https://grok.com/*"
+      ],
+      "js": ["content-scripts/content-script.js"],
+      "css": ["content-scripts/content-style.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["content-scripts/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

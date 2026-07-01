@@ -1,0 +1,56 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+.yarn/install-state.gz
+
+# Build output
+build/
+.plasmo/
+dist/
+out/
+
+# Plasmo
+.plasmo-cache/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+*.swp
+*.swo
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Plasmo generated icons / assets (regenerated)
+icon16.png
+icon32.png
+icon48.png
+icon64.png
+icon128.png
+icon256.png
+
+# Generated icons scripts outputs
+gen-assets/
+
+# C: scratch / recovery files
+C:/
+
+# Local debug / scratch
+*.log
+*.tsbuildinfo

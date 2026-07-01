@@ -1,0 +1,71 @@
+{
+   "background": {
+      "service_worker": "background.js"
+   },
+   "commands": {
+      "generate": {
+         "description": "Generate with current prompt",
+         "suggested_key": {
+            "default": "Alt+G"
+         }
+      },
+      "toggle-sidebar": {
+         "description": "Toggle sidebar",
+         "suggested_key": {
+            "default": "Alt+S"
+         }
+      }
+   },
+   "content_scripts": [ {
+      "css": [  ],
+      "js": [ "content.js" ],
+      "matches": [ "https://labs.google/fx/*" ],
+      "run_at": "document_idle"
+   }, {
+      "js": [ "slate-bridge.js" ],
+      "matches": [ "https://labs.google/fx/*" ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+   }, {
+      "js": [ "oauth-bridge.js" ],
+      "matches": [ "*://labs.toby.vn/auth/google/success*" ],
+      "run_at": "document_idle"
+   }, {
+      "js": [ "chat-content-chatgpt.js" ],
+      "matches": [ "*://chatgpt.com/*" ],
+      "run_at": "document_idle"
+   }, {
+      "js": [ "chat-content-grok.js" ],
+      "matches": [ "https://grok.com/*", "https://*.grok.com/*" ],
+      "run_at": "document_idle"
+   }, {
+      "js": [ "chat-content-gemini.js" ],
+      "matches": [ "*://gemini.google.com/*" ],
+      "run_at": "document_idle"
+   } ],
+   "content_security_policy": {
+      "extension_pages": "script-src 'self'; object-src 'self';"
+   },
+   "description": "Auto Flow - Automate ChatGPT, Grok & Google Flow for AI image/video generation. Batch prompts, smart workflows, auto 2K/4K download.",
+   "host_permissions": [ "https://labs.google/*", "*://chatgpt.com/*", "*://gemini.google.com/*", "https://grok.com/*", "https://*.grok.com/*", "*://x.com/*", "*://*.x.com/*", "*://*.x.ai/*", "*://labs.toby.vn/*", "*://storage.googleapis.com/*", "*://flow-content.google/*", "*://www.pinterest.com/*", "*://www.youtube.com/*", "*://www.tiktok.com/*", "*://www.google.com/*", "*://www.facebook.com/*", "*://unsplash.com/*", "*://www.etsy.com/*", "*://pixabay.com/*", "*://www.amazon.com/*" ],
+   "icons": {
+      "128": "icons/icon-128.png",
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png"
+   },
+   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApneCRvUvStXJFKTDTnMo/dAKGdnTX1Ng9QGSr6bUyi6HYtKo3jFLRb4EDrjbicc72r1wLqOuJMiHvjbnLdqy/K1PShQeJki2/TrJF630/g9a5V5k+AUOQZQRbcbpdGDXLRY87q/k3VfaUUrgLuIWK4OYLVaIKINzKThOTK0WReW4OOfiZpYoS8qTH3xAJiiRLZdKAgIiLvb+daxBD+li0WDaZucQ+uLOXiPBcxh5BdRW9c0jijghephxOjVWGx7QbZ3AfyZpAB0CVuW6qafLMe6BtsDAcxybzrRU0Dexi5s/JKjmVP77To3qD+s/K6tQPHCptnvcrlv3JUJQOe7UFwIDAQAB",
+   "manifest_version": 3,
+   "name": "TobyFlow - Auto Flow, Auto ChatGPT, Auto Grok & AI Workflow Automation",
+   "permissions": [ "activeTab", "storage", "unlimitedStorage", "sidePanel", "scripting", "tabs", "downloads", "notifications", "alarms" ],
+   "short_name": "Toby Flow",
+   "side_panel": {
+      "default_path": "sidebar.html"
+   },
+   "update_url": "https://clients2.google.com/service/update2/crx",
+   "version": "1.1.5",
+   "web_accessible_resources": [ {
+      "matches": [ "https://labs.google/*" ],
+      "resources": [ "sidebar.html", "workflow-editor.html", "workflow-template-editor.html", "workflow-template-editor-init.js", "angles-editor.html", "effects-editor.html", "settings.html", "settings.css", "settings-page.js", "workflow-editor-init.js", "angles-editor-init.js", "effects-editor-init.js", "angles-editor.css", "src/**/*.js", "src/**/*.css", "lib/*.js", "lib/*.css" ]
+   } ]
+}

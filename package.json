@@ -1,0 +1,57 @@
+{
+  "name": "ai-workflow-automation",
+  "displayName": "AI Flow Automation",
+  "version": "1.0.0",
+  "description": "AI Workflow Automation Tool for Google Flow, ChatGPT, Grok and other AI platforms",
+  "scripts": {
+    "dev": "node prebuild.js && plasmo dev",
+    "build": "node prebuild.js && plasmo build && node postbuild.js",
+    "package": "node prebuild.js && plasmo package && node postbuild.js"
+  },
+  "dependencies": {
+    "@types/chrome": "^0.0.304",
+    "@xyflow/react": "^12.10.2",
+    "clsx": "^2.1.1",
+    "date-fns": "^4.1.0",
+    "framer-motion": "^11.15.0",
+    "lucide-react": "^0.469.0",
+    "plasmo": "0.90.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "sharp": "^0.35.2",
+    "tailwind-merge": "^2.6.0",
+    "uuid": "^11.0.5",
+    "zustand": "^4.5.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.17",
+    "@types/react-dom": "^18.3.5",
+    "@types/uuid": "^10.0.0",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.7.2"
+  },
+  "manifest": {
+    "host_permissions": [
+      "https://*/*",
+      "http://*/*"
+    ],
+    "permissions": [
+      "sidePanel",
+      "tabs",
+      "storage",
+      "activeTab",
+      "scripting",
+      "notifications"
+    ],
+    "side_panel": {
+      "default_path": "sidepanel.html"
+    },
+    "background": {
+      "service_worker": "background.js",
+      "type": "module"
+    }
+  }
+}
