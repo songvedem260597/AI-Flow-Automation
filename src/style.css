@@ -29,6 +29,11 @@ html, body {
   overflow: hidden;
 }
 
+#__plasmo {
+  width: 100%;
+  height: 100%;
+}
+
 body {
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
   background: var(--bg-primary);
@@ -63,65 +68,6 @@ body {
   }
 }
 
-/* React Flow custom styles */
-.react-flow__node {
-  cursor: grab;
-}
-
-.react-flow__node:active {
-  cursor: grabbing;
-}
-
-.react-flow__handle {
-  transition: all 0.15s ease;
-  opacity: 0;
-}
-
-.react-flow__node:hover .react-flow__handle {
-  opacity: 1;
-}
-
-.react-flow__handle:hover {
-  transform: scale(1.3);
-}
-
-.react-flow__edge-path {
-  stroke-linecap: round;
-}
-
-.react-flow__minimap {
-  border-radius: 16px !important;
-}
-
-.react-flow__controls {
-  display: none !important;
-}
-
-.react-flow__background {
-  background-color: #0F0F0F !important;
-}
-
-/* React Flow panel overrides */
-.react-flow__panel {
-  margin: 0 !important;
-}
-
-.react-flow__panel-top {
-  top: 0 !important;
-}
-
-.react-flow__panel-bottom {
-  bottom: 0 !important;
-}
-
-.react-flow__panel-left {
-  left: 0 !important;
-}
-
-.react-flow__panel-right {
-  right: 0 !important;
-}
-
 /* Input styles */
 input, textarea, select {
   font-family: inherit;
@@ -139,4 +85,1734 @@ input::placeholder, textarea::placeholder {
 
 .animate-pulse-glow {
   animation: pulse-glow 2s ease-in-out infinite;
+}
+
+/* Drawflow workflow editor */
+.ai-drawflow-canvas,
+.ai-drawflow-canvas .parent-drawflow {
+  width: 100%;
+  height: 100%;
+}
+
+.ai-drawflow-canvas .parent-drawflow,
+.ai-drawflow-canvas .drawflow {
+  background: transparent !important;
+}
+
+.ai-drawflow-canvas .drawflow {
+  min-width: 2400px;
+  min-height: 1600px;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node {
+  width: auto;
+  min-width: 320px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  box-shadow: none;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node.selected {
+  background: transparent;
+  box-shadow:
+    0 0 0 1px rgba(124, 92, 255, 0.95),
+    0 0 0 5px rgba(124, 92, 255, 0.18),
+    0 12px 30px rgba(0, 0, 0, 0.35);
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node .inputs,
+.ai-drawflow-canvas .drawflow .drawflow-node .outputs {
+  height: auto;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node .input,
+.ai-drawflow-canvas .drawflow .drawflow-node .output {
+  width: 12px;
+  height: 12px;
+  border: 2px solid #7C5CFF;
+  background: #111111;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node .input {
+  left: auto;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node .output {
+  right: auto;
+}
+
+.ai-drawflow-canvas .drawflow .connection .main-path {
+  stroke: #7C5CFF;
+  stroke-width: 3px;
+  stroke-linecap: round;
+}
+
+.ai-drawflow-canvas .drawflow .connection .main-path.selected {
+  stroke: #34d399;
+}
+
+.ai-df-node {
+  width: 320px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-left-width: 3px;
+  border-radius: 8px;
+  background: #1A1A1A;
+  color: rgba(255, 255, 255, 0.82);
+}
+
+.ai-df-node-sky { border-left-color: #38bdf8; }
+.ai-df-node-emerald { border-left-color: #34d399; }
+.ai-df-node-amber { border-left-color: #fbbf24; }
+.ai-df-node-rose { border-left-color: #fb7185; }
+
+.ai-df-node-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.ai-df-node-icon {
+  display: flex;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.ai-df-node-heading {
+  min-width: 0;
+  flex: 1;
+}
+
+.ai-df-node-title {
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.86);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-df-node-subtitle {
+  margin-top: 1px;
+  color: rgba(255, 255, 255, 0.28);
+  font-size: 10px;
+  line-height: 13px;
+}
+
+.ai-df-node-provider {
+  flex: 0 0 auto;
+  max-width: 68px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: rgba(124, 92, 255, 0.12);
+  padding: 3px 6px;
+  color: rgba(196, 181, 253, 0.95);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 12px;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.ai-df-node-body {
+  padding: 12px;
+}
+
+.ai-df-node-prompt,
+.ai-df-node-empty {
+  min-height: 52px;
+  border-radius: 7px;
+  background: #141414;
+  padding: 9px 10px;
+  color: rgba(255, 255, 255, 0.48);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.ai-df-node-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(255, 255, 255, 0.22);
+}
+
+.ai-df-node-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-radius: 7px;
+  background: #141414;
+  padding: 9px 10px;
+  color: rgba(255, 255, 255, 0.35);
+  font-size: 11px;
+}
+
+.ai-df-node-row strong {
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 12px;
+}
+
+.ai-df-node-badges {
+  display: flex;
+  gap: 6px;
+}
+
+.ai-df-node-badges span {
+  border-radius: 6px;
+  background: rgba(52, 211, 153, 0.1);
+  padding: 5px 8px;
+  color: #34d399;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.ai-df-node-big {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 4px;
+  border-radius: 7px;
+  background: #141414;
+  padding: 12px;
+  color: #fbbf24;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 28px;
+  font-weight: 800;
+}
+
+.ai-df-node-big span {
+  color: rgba(255, 255, 255, 0.32);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* TobyFlow-style workflow editor */
+.tobyflow-wf-toolbar {
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px;
+  background: #191919;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  z-index: 50;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.35);
+}
+
+.tobyflow-wf-tool-btn {
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: #8b8b92;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+}
+
+.tobyflow-wf-tool-btn:hover,
+.tobyflow-wf-tool-btn.active {
+  background: #2e2e33;
+  color: #e8e8ea;
+}
+
+.tobyflow-wf-tool-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+.tobyflow-wf-tool-divider {
+  width: 24px;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.08);
+  margin: 2px auto;
+}
+
+.tobyflow-node-picker {
+  position: absolute;
+  width: 320px;
+  max-height: min(520px, calc(100% - 96px));
+  background: #2e2e33;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  z-index: 200;
+  overflow: hidden;
+}
+
+.tobyflow-node-picker-context-hint {
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 11px;
+  color: #8b8b92;
+  background: rgba(255, 255, 255, 0.02);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tobyflow-node-picker-context-hint--no-text {
+  padding: 4px 6px 4px 12px;
+  justify-content: flex-end;
+}
+
+.tobyflow-node-picker-close {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  margin-left: auto;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: #8b8b92;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.tobyflow-node-picker-close:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #e8e8ea;
+}
+
+.tobyflow-node-picker-search {
+  padding: 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.tobyflow-node-picker-input {
+  width: 100%;
+  background: #1c1c1f;
+  color: #e8e8ea;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.tobyflow-node-picker-input:focus {
+  border-color: rgba(255, 255, 255, 0.14);
+}
+
+.tobyflow-node-picker-list {
+  max-height: 280px;
+  overflow-y: auto;
+  padding: 4px;
+}
+
+.tobyflow-node-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  color: #e8e8ea;
+  text-align: left;
+  transition: background 0.15s ease;
+  font-family: inherit;
+}
+
+.tobyflow-node-picker-item:hover,
+.tobyflow-node-picker-item.selected {
+  background: #252529;
+}
+
+.tobyflow-node-picker-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tobyflow-node-picker-name {
+  font-size: 12px;
+  font-weight: 500;
+  color: #e8e8ea;
+}
+
+.tobyflow-node-picker-desc {
+  font-size: 10px;
+  color: #8b8b92;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tobyflow-node-picker-footer {
+  padding: 6px 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 10px;
+  color: #6b6b73;
+}
+
+.tobyflow-node-picker-footer kbd {
+  background: #1c1c1f;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 10px;
+  color: #a1a1aa;
+}
+
+.tobyflow-node-picker-port-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  text-transform: capitalize;
+}
+
+.tobyflow-node-picker-port-tag[data-port-type="text"] { background: #6f8bf7; }
+.tobyflow-node-picker-port-tag[data-port-type="image"] { background: #3b82f6; }
+.tobyflow-node-picker-port-tag[data-port-type="any"] { background: #71717a; }
+
+.node-palette-item-icon {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node {
+  display: block;
+  align-items: unset;
+  width: auto;
+  min-width: 360px;
+  min-height: auto;
+  padding: 0;
+  color: #e8e8ea;
+  background: #181818;
+  border: 1px solid #3a3a3a;
+  border-radius: 10px;
+  box-sizing: border-box;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  overflow: visible;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node:hover {
+  border-color: rgba(255, 255, 255, 0.14);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node.selected {
+  background: #181818;
+  border-color: #cdff01;
+  outline: 1px solid #cdff01;
+  outline-offset: 0;
+  box-shadow:
+    0 0 0 1px #cdff01,
+    0 0 0 4px rgba(205, 255, 1, 0.18),
+    0 0 28px 6px rgba(205, 255, 1, 0.32),
+    0 8px 24px rgba(0, 0, 0, 0.45);
+  animation: dfNodeSelectedPulse 2.6s ease-in-out infinite;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node.selected:has(.df-node[data-provider="flow"]) {
+  border-color: #3186ff;
+  outline-color: #3186ff;
+  box-shadow:
+    0 0 0 1px #3186ff,
+    0 0 0 4px rgba(49, 134, 255, 0.25),
+    0 0 28px 6px rgba(49, 134, 255, 0.4),
+    0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node.selected:has(.df-node[data-provider="openai"]) {
+  border-color: #10a37f;
+  outline-color: #10a37f;
+  box-shadow:
+    0 0 0 1px #10a37f,
+    0 0 0 4px rgba(16, 163, 127, 0.28),
+    0 0 28px 6px rgba(16, 163, 127, 0.42),
+    0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node.selected:has(.df-node[data-provider="grok"]) {
+  border-color: #a855f7;
+  outline-color: #a855f7;
+  box-shadow:
+    0 0 0 1px #a855f7,
+    0 0 0 4px rgba(168, 85, 247, 0.28),
+    0 0 28px 6px rgba(168, 85, 247, 0.42),
+    0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+@keyframes dfNodeSelectedPulse {
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(1.08); }
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node .inputs,
+.ai-drawflow-canvas .drawflow .drawflow-node .outputs {
+  position: absolute;
+  top: 50%;
+  height: auto;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 2;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node .inputs {
+  left: -42px;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node .outputs {
+  right: -6px;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node .input,
+.ai-drawflow-canvas .drawflow .drawflow-node .output {
+  width: 12px;
+  height: 12px;
+  background: #71717a;
+  border: 2px solid rgba(255, 255, 255, 0.14);
+  border-radius: 50%;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+  position: relative;
+  left: auto;
+  right: auto;
+  top: auto;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node.df-port-text .input,
+.ai-drawflow-canvas .drawflow .drawflow-node.df-port-text .output {
+  background: #9177e1;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node.df-port-image .input,
+.ai-drawflow-canvas .drawflow .drawflow-node.df-port-image .output {
+  background: #3b82f6;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node.df-port-any .input,
+.ai-drawflow-canvas .drawflow .drawflow-node.df-port-any .output {
+  background: #71717a;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node .input:hover,
+.ai-drawflow-canvas .drawflow .drawflow-node .output:hover {
+  background: #cdff01;
+  border-color: #cdff01;
+  transform: scale(1.2);
+}
+
+.ai-drawflow-canvas .drawflow .input[data-port-type],
+.ai-drawflow-canvas .drawflow .output[data-port-type] {
+  width: 36px !important;
+  height: 36px !important;
+  border-radius: 100% !important;
+  background: #27272a !important;
+  border: 1.5px solid rgba(255, 255, 255, 0.18) !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  color: #fff !important;
+  position: relative;
+  cursor: crosshair !important;
+  transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+}
+
+.ai-drawflow-canvas .drawflow .input[data-port-type="text"],
+.ai-drawflow-canvas .drawflow .output[data-port-type="text"] {
+  border-color: #50476a !important;
+}
+
+.ai-drawflow-canvas .drawflow .input[data-port-type="image"],
+.ai-drawflow-canvas .drawflow .output[data-port-type="image"] {
+  border-color: #303961 !important;
+}
+
+.ai-drawflow-canvas .drawflow .input[data-port-type="video"],
+.ai-drawflow-canvas .drawflow .output[data-port-type="video"],
+.ai-drawflow-canvas .drawflow .input[data-port-type="frame"],
+.ai-drawflow-canvas .drawflow .output[data-port-type="frame"] {
+  border-color: #1e5340 !important;
+}
+
+.ai-drawflow-canvas .drawflow .input[data-port-type="any"],
+.ai-drawflow-canvas .drawflow .output[data-port-type="any"] {
+  border-color: rgba(113, 113, 122, 0.55) !important;
+}
+
+.ai-drawflow-canvas .drawflow .input[data-port-type]:not([data-port-empty="true"]),
+.ai-drawflow-canvas .drawflow .output[data-port-type]:not([data-port-empty="true"]) {
+  border-width: 2px !important;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node.selected .input[data-port-type="text"],
+.ai-drawflow-canvas .drawflow .drawflow-node.selected .output[data-port-type="text"],
+.ai-drawflow-canvas .drawflow .drawflow-node.node-running .input[data-port-type="text"],
+.ai-drawflow-canvas .drawflow .drawflow-node.node-running .output[data-port-type="text"] {
+  border-color: #9c82e5 !important;
+  box-shadow: 0 0 0 2px rgba(156, 130, 229, 0.25), 0 2px 6px rgba(0, 0, 0, 0.4) !important;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node.selected .input[data-port-type="image"],
+.ai-drawflow-canvas .drawflow .drawflow-node.selected .output[data-port-type="image"],
+.ai-drawflow-canvas .drawflow .drawflow-node.node-running .input[data-port-type="image"],
+.ai-drawflow-canvas .drawflow .drawflow-node.node-running .output[data-port-type="image"] {
+  border-color: #6f8bf7 !important;
+  box-shadow: 0 0 0 2px rgba(111, 139, 247, 0.25), 0 2px 6px rgba(0, 0, 0, 0.4) !important;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node.selected .input[data-port-type="video"],
+.ai-drawflow-canvas .drawflow .drawflow-node.selected .output[data-port-type="video"],
+.ai-drawflow-canvas .drawflow .drawflow-node.selected .input[data-port-type="frame"],
+.ai-drawflow-canvas .drawflow .drawflow-node.selected .output[data-port-type="frame"],
+.ai-drawflow-canvas .drawflow .drawflow-node.node-running .input[data-port-type="video"],
+.ai-drawflow-canvas .drawflow .drawflow-node.node-running .output[data-port-type="video"],
+.ai-drawflow-canvas .drawflow .drawflow-node.node-running .input[data-port-type="frame"],
+.ai-drawflow-canvas .drawflow .drawflow-node.node-running .output[data-port-type="frame"] {
+  border-color: #3cd39f !important;
+  box-shadow: 0 0 0 2px rgba(60, 211, 159, 0.25), 0 2px 6px rgba(0, 0, 0, 0.4) !important;
+}
+
+.ai-drawflow-canvas .drawflow .input[data-port-type]:hover,
+.ai-drawflow-canvas .drawflow .output[data-port-type]:hover {
+  transform: scale(1.12);
+  z-index: 5;
+}
+
+.ai-drawflow-canvas .drawflow .input[data-port-type="text"]:hover,
+.ai-drawflow-canvas .drawflow .output[data-port-type="text"]:hover {
+  border-color: #9c82e5 !important;
+  box-shadow: 0 0 0 2px rgba(156, 130, 229, 0.3), 0 2px 6px rgba(0, 0, 0, 0.4) !important;
+}
+
+.ai-drawflow-canvas .drawflow .input[data-port-type="image"]:hover,
+.ai-drawflow-canvas .drawflow .output[data-port-type="image"]:hover {
+  border-color: #6f8bf7 !important;
+  box-shadow: 0 0 0 2px rgba(111, 139, 247, 0.3), 0 2px 6px rgba(0, 0, 0, 0.4) !important;
+}
+
+.ai-drawflow-canvas .drawflow .input[data-port-type="video"]:hover,
+.ai-drawflow-canvas .drawflow .output[data-port-type="video"]:hover,
+.ai-drawflow-canvas .drawflow .input[data-port-type="frame"]:hover,
+.ai-drawflow-canvas .drawflow .output[data-port-type="frame"]:hover {
+  border-color: #3cd39f !important;
+  box-shadow: 0 0 0 2px rgba(60, 211, 159, 0.3), 0 2px 6px rgba(0, 0, 0, 0.4) !important;
+}
+
+.ai-drawflow-canvas .drawflow .df-port-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  pointer-events: none;
+}
+
+.ai-drawflow-canvas .drawflow .df-port-icon * {
+  pointer-events: none;
+}
+
+.ai-drawflow-canvas .drawflow .df-port-icon svg {
+  width: 18px;
+  height: 18px;
+  color: #ffffff !important;
+  stroke: #ffffff;
+}
+
+.ai-drawflow-canvas .drawflow .input[data-port-label]:hover::before,
+.ai-drawflow-canvas .drawflow .output[data-port-label]:hover::before {
+  content: attr(data-port-label);
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1a1a1e;
+  color: #fff;
+  padding: 5px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 1000;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.ai-drawflow-canvas .drawflow .output[data-port-label]:hover::before {
+  bottom: auto;
+  top: calc(100% + 8px);
+}
+
+.ai-drawflow-canvas .drawflow .input[data-port-empty="true"],
+.ai-drawflow-canvas .drawflow .output[data-port-empty="true"] {
+  animation: df-port-empty-glow 2.4s ease-in-out infinite;
+}
+
+@keyframes df-port-empty-glow {
+  0%, 100% { box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25); }
+  50% { box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25), 0 0 0 4px rgba(255, 255, 255, 0.12); }
+}
+
+.df-node {
+  min-width: 280px;
+  max-width: 360px;
+  background: #181818;
+  border: 2px solid #3a3a3a;
+  border-radius: 10px;
+  overflow: visible;
+  font-family: Inter, system-ui, -apple-system, sans-serif;
+  position: relative;
+}
+
+.df-node:hover {
+  border-color: rgba(255, 255, 255, 0.14);
+}
+
+.df-node-status {
+  height: 0;
+  width: 100%;
+}
+
+.df-node-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  border-top-right-radius: 10px;
+  border-top-left-radius: 10px;
+}
+
+.df-node-icon {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  flex-shrink: 0;
+}
+
+.df-node-icon.generate { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
+.df-node-icon.download { background: rgba(14, 165, 233, 0.15); color: #0ea5e9; }
+.df-node-icon.delay { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
+.df-node-icon.image { background: rgba(236, 72, 153, 0.15); color: #ec4899; }
+.df-node-icon.prompt { background: rgba(111, 139, 247, 0.15); color: #6f8bf7; }
+.df-node-icon.note { background: rgba(139, 139, 146, 0.15); color: #8b8b92; }
+.df-node-icon.condition { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
+.df-node-icon.merge { background: rgba(168, 85, 247, 0.15); color: #a855f7; }
+
+.df-node-title {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+  color: #e8e8ea;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.df-node-body {
+  padding: 8px 10px 10px;
+  min-height: 50px;
+  position: relative;
+}
+
+.df-node-preview-wrap {
+  position: relative;
+  width: calc(100% + 20px);
+  margin: -8px -10px 0;
+}
+
+.df-node-preview {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  min-height: 120px;
+  background: #181818;
+  overflow: hidden;
+  border-radius: 8px 8px 6px 6px;
+  margin-bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  pointer-events: none;
+}
+
+.df-node-body > .df-node-preview {
+  width: calc(100% + 20px);
+  margin: -8px -10px 0;
+}
+
+.df-node-preview.ratio-16-9 {
+  aspect-ratio: 16 / 9;
+}
+
+.df-node-preview.ratio-9-16 {
+  aspect-ratio: 9 / 16;
+}
+
+.df-node-preview.ratio-4-3 {
+  aspect-ratio: 4 / 3;
+}
+
+.df-node-preview.ratio-3-4 {
+  aspect-ratio: 3 / 4;
+}
+
+.df-node-preview.ratio-custom {
+  aspect-ratio: 1 / 1;
+}
+
+.df-node-preview-placeholder {
+  color: #6b6b73;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  min-height: 120px;
+}
+
+.df-node-preview-placeholder svg {
+  opacity: 0.7;
+}
+
+.df-node-prompt {
+  font-size: 11px;
+  color: #e8e8ea;
+  line-height: 1.4;
+  max-height: 48px;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  margin-bottom: 10px;
+  opacity: 0.85;
+  font-style: italic;
+  padding-top: 5px;
+}
+
+.df-node-prompt-empty {
+  color: #6b6b73;
+  font-style: italic;
+}
+
+.df-node-prompt-overlay {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  margin: 0;
+  padding: 6px 8px;
+  box-sizing: border-box;
+  -webkit-line-clamp: 2;
+  max-height: calc(1.35em * 2 + 12px);
+  opacity: 0.55;
+  font-style: normal;
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
+  background: transparent;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.df-node-settings-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding-top: 7px;
+}
+
+.df-node-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 20px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #a1a1aa;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1;
+}
+
+button.df-node-tag {
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.df-node-pill-trigger {
+  position: relative;
+  max-width: 116px;
+  padding: 2px 20px 2px 8px;
+  outline: none;
+  appearance: none;
+}
+
+.df-node-pill-trigger:focus-visible {
+  border-color: rgba(124, 92, 255, 0.45);
+  box-shadow: 0 0 0 2px rgba(124, 92, 255, 0.16);
+}
+
+.df-node-pill-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.df-node-select-chevron {
+  pointer-events: none;
+  position: absolute;
+  right: 7px;
+  top: 50%;
+  display: inline-flex;
+  width: 11px;
+  height: 11px;
+  align-items: center;
+  justify-content: center;
+  transform: translateY(-50%);
+  color: rgba(255, 255, 255, 0.34);
+  line-height: 1;
+  transition: color 0.14s ease, transform 0.14s ease;
+}
+
+.df-node-select-chevron svg {
+  width: 11px;
+  height: 11px;
+  display: block;
+}
+
+.df-node-pill-trigger:hover .df-node-select-chevron,
+.df-node-pill-trigger:focus-visible .df-node-select-chevron {
+  color: #B8A8FF;
+}
+
+.df-node-pill-menu {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 9999;
+  min-width: 154px;
+  max-width: 220px;
+  padding: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  background: rgba(18, 18, 18, 0.98);
+  box-shadow: 0 18px 46px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(124, 92, 255, 0.06);
+  backdrop-filter: blur(16px);
+  transform: scale(var(--df-pill-menu-scale, 1));
+  transform-origin: top left;
+}
+
+.df-node-pill-menu-title {
+  padding: 5px 7px 6px;
+  color: rgba(255, 255, 255, 0.32);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1;
+}
+
+.df-node-pill-menu-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.df-node-pill-menu-item {
+  display: flex;
+  min-height: 28px;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.62);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 0 7px;
+  text-align: left;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+
+.df-node-pill-menu-item:hover,
+.df-node-pill-menu-item:focus-visible {
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.86);
+  outline: none;
+}
+
+.df-node-pill-menu-item.selected {
+  background: rgba(124, 92, 255, 0.14);
+  color: #C7BBFF;
+}
+
+.df-node-pill-menu-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.df-node-pill-menu-check {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  color: #B8A8FF;
+}
+
+.df-node-tag-editable:hover {
+  color: #fff;
+  border-color: rgba(205, 255, 1, 0.35);
+}
+
+.df-node-tag-mode-image {
+  background: rgba(16, 163, 127, 0.18);
+  color: #10a37f;
+  border-color: rgba(16, 163, 127, 0.35);
+}
+
+.df-node-delay-setting,
+.df-node-download-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #a1a1aa;
+  font-size: 11px;
+}
+
+.df-node-inline-input {
+  height: 24px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.04);
+  color: #e8e8ea;
+  padding: 0 6px;
+  font-size: 11px;
+  outline: none;
+}
+
+.df-node-toggle {
+  display: flex;
+  align-items: center;
+  margin-left: auto;
+  padding: 0;
+  background: none;
+  border: none;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.df-node-toggle-track {
+  position: relative;
+  width: 28px;
+  height: 16px;
+  border-radius: 8px;
+  background: #8b8b92;
+  transition: background 0.15s ease;
+  pointer-events: none;
+}
+
+.df-node-toggle.on .df-node-toggle-track {
+  background: #cdff01;
+}
+
+.df-node-toggle-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #0f0f0f;
+  transition: transform 0.15s ease;
+}
+
+.df-node-toggle.on .df-node-toggle-thumb {
+  transform: translateX(12px);
+}
+
+.df-node-provider-pill {
+  position: absolute;
+  top: -40px;
+  left: -4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 16px 0 5px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  color: #fff;
+  background: rgba(20, 20, 24, 0.95);
+  z-index: 6;
+  pointer-events: auto;
+  white-space: nowrap;
+  user-select: none;
+  transition: transform 0.18s ease;
+  backdrop-filter: blur(6px);
+}
+
+.df-node-provider-pill:hover {
+  transform: translateY(-1px);
+}
+
+.df-node-provider-pill-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.df-node-provider-pill-logo svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+}
+
+.df-node-provider-pill-label {
+  line-height: 1;
+}
+
+.df-node-provider-pill.df-node-provider-flow {
+  background: linear-gradient(135deg, rgba(49, 134, 255, 0.22), rgba(20, 20, 24, 0.95));
+}
+
+.df-node-provider-pill.df-node-provider-flow .df-node-provider-pill-logo {
+  background: rgba(255, 255, 255, 0.95);
+}
+
+.df-node-provider-pill.df-node-provider-openai {
+  background: linear-gradient(135deg, rgba(16, 163, 127, 0.28), rgba(20, 20, 24, 0.95));
+}
+
+.df-node-provider-pill.df-node-provider-openai .df-node-provider-pill-logo {
+  background: #10a37f;
+  color: #fff;
+}
+
+.df-node-provider-pill.df-node-provider-grok {
+  background: linear-gradient(135deg, rgba(168, 85, 247, 0.25), rgba(20, 20, 24, 0.95));
+}
+
+.df-node-provider-pill.df-node-provider-grok .df-node-provider-pill-logo {
+  background: #1a1a1e;
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+}
+
+.df-hover-toolbar {
+  position: absolute;
+  top: -44px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: none;
+  align-items: center;
+  gap: 2px;
+  padding: 5px;
+  background: #18181b;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5), 0 1px 2px rgba(0, 0, 0, 0.3);
+  z-index: 100;
+}
+
+.drawflow-node:hover .df-hover-toolbar,
+.drawflow-node.selected .df-hover-toolbar {
+  display: flex;
+}
+
+.df-hover-btn {
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.7);
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.df-hover-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+}
+
+.ai-drawflow-canvas .drawflow .connection {
+  margin-left: 0;
+}
+
+.ai-drawflow-canvas .drawflow .connection .main-path {
+  stroke: #3a3a3a;
+  stroke-width: 5px !important;
+  stroke-linecap: round;
+  fill: none;
+  cursor: pointer;
+  pointer-events: stroke;
+  transition: stroke-width 0.15s ease, filter 0.15s ease;
+}
+
+.ai-drawflow-canvas .drawflow .connection:hover .main-path,
+.ai-drawflow-canvas .drawflow .connection .main-path:hover,
+.ai-drawflow-canvas .drawflow .connection.selected .main-path,
+.ai-drawflow-canvas .drawflow .connection .main-path.selected {
+  stroke-width: 6px !important;
+  filter: brightness(1.25);
+}
+
+.ai-drawflow-canvas .drawflow .connection .main-path-overlay {
+  stroke: rgba(255, 255, 255, 0.85);
+  stroke-width: 2.5px;
+  stroke-linecap: round;
+  stroke-dasharray: 8 6;
+  fill: none;
+  pointer-events: none;
+  transition: stroke-width 0.15s ease;
+}
+
+.ai-drawflow-canvas .drawflow .connection:hover .main-path-overlay,
+.ai-drawflow-canvas .drawflow .connection.selected .main-path-overlay {
+  stroke-width: 3px;
+}
+
+.ai-drawflow-canvas .drawflow .connection.conn-type-frame .main-path {
+  stroke: #1e5340;
+  color: #1e5340;
+}
+
+.ai-drawflow-canvas .drawflow .connection.conn-type-frame .main-path-overlay {
+  stroke: #1e5340;
+}
+
+.ai-drawflow-canvas .drawflow .connection.conn-type-frame.connection-active .main-path,
+.ai-drawflow-canvas .drawflow .connection.conn-type-frame.conn-node-selected .main-path {
+  stroke: #3cd39f;
+  color: #3cd39f;
+}
+
+.ai-drawflow-canvas .drawflow .connection.conn-type-frame.connection-active .main-path-overlay,
+.ai-drawflow-canvas .drawflow .connection.conn-type-frame.conn-node-selected .main-path-overlay {
+  stroke: #ffffff;
+}
+
+.ai-drawflow-canvas .drawflow .connection.conn-type-text .main-path {
+  stroke: #50476a;
+  color: #50476a;
+}
+
+.ai-drawflow-canvas .drawflow .connection.conn-type-text .main-path-overlay {
+  stroke: #50476a;
+}
+
+.ai-drawflow-canvas .drawflow .connection.conn-type-text.connection-active .main-path,
+.ai-drawflow-canvas .drawflow .connection.conn-type-text.conn-node-selected .main-path {
+  stroke: #9c82e5;
+  color: #9c82e5;
+}
+
+.ai-drawflow-canvas .drawflow .connection.conn-type-text.connection-active .main-path-overlay,
+.ai-drawflow-canvas .drawflow .connection.conn-type-text.conn-node-selected .main-path-overlay {
+  stroke: #ffffff;
+}
+
+.ai-drawflow-canvas .drawflow .connection.conn-type-image .main-path {
+  stroke: #303961;
+  color: #303961;
+}
+
+.ai-drawflow-canvas .drawflow .connection.conn-type-image .main-path-overlay {
+  stroke: #303961;
+}
+
+.ai-drawflow-canvas .drawflow .connection.conn-type-image.connection-active .main-path,
+.ai-drawflow-canvas .drawflow .connection.conn-type-image.conn-node-selected .main-path {
+  stroke: #6f8bf7;
+  color: #6f8bf7;
+}
+
+.ai-drawflow-canvas .drawflow .connection.conn-type-image.connection-active .main-path-overlay,
+.ai-drawflow-canvas .drawflow .connection.conn-type-image.conn-node-selected .main-path-overlay {
+  stroke: #ffffff;
+}
+
+.ai-drawflow-canvas .drawflow .connection.conn-type-any .main-path {
+  stroke: #6b7280;
+  color: #6b7280;
+}
+
+.ai-drawflow-canvas .drawflow .connection.conn-type-any.connection-active .main-path,
+.ai-drawflow-canvas .drawflow .connection.conn-type-any.conn-node-selected .main-path {
+  stroke: #a1a1aa;
+  color: #a1a1aa;
+}
+
+.ai-drawflow-canvas .drawflow .connection.conn-type-any.connection-active .main-path-overlay,
+.ai-drawflow-canvas .drawflow .connection.conn-type-any.conn-node-selected .main-path-overlay {
+  stroke: #ffffff;
+}
+
+.ai-drawflow-canvas .drawflow .connection.connection-active .main-path,
+.ai-drawflow-canvas .drawflow .connection.conn-node-selected .main-path {
+  stroke-width: 9px !important;
+  filter: drop-shadow(0 0 8px currentColor) brightness(1.2);
+}
+
+.ai-drawflow-canvas .drawflow .connection.connection-active .main-path-overlay,
+.ai-drawflow-canvas .drawflow .connection.conn-node-selected .main-path-overlay {
+  stroke-width: 3px;
+}
+
+.ai-drawflow-canvas .drawflow .connection.connection-active .main-path-overlay {
+  animation: dfConnectionFlow 0.8s linear infinite;
+}
+
+.ai-drawflow-canvas .drawflow svg.connection:not([class*="node_in_"]) .main-path {
+  stroke: rgba(140, 140, 160, 0.85) !important;
+  stroke-width: 2.5px !important;
+  stroke-dasharray: 6 4;
+  stroke-linecap: round;
+  filter: none !important;
+  animation: dfConnectingPulse 1s linear infinite;
+}
+
+@keyframes dfConnectingPulse {
+  0% { stroke-opacity: 0.55; stroke-dashoffset: 0; }
+  50% { stroke-opacity: 1; stroke-dashoffset: -5; }
+  100% { stroke-opacity: 0.55; stroke-dashoffset: -10; }
+}
+
+@keyframes dfConnectionFlow {
+  to { stroke-dashoffset: -14; }
+}
+
+/* Workflow canvas typography: sync with Gen tab, keep only workflow layout from TobyFlow. */
+.ai-drawflow-canvas,
+.ai-drawflow-canvas *,
+.tobyflow-node-picker,
+.tobyflow-node-picker *,
+.tobyflow-wf-toolbar,
+.tobyflow-wf-toolbar * {
+  font-family: inherit;
+  letter-spacing: 0;
+}
+
+.ai-drawflow-canvas {
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.df-node {
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.df-node-title {
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 16px;
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.df-node-prompt {
+  font-size: 12px;
+  line-height: 1.625;
+  color: rgba(255, 255, 255, 0.56);
+  font-style: normal;
+}
+
+.df-node-prompt-empty {
+  color: rgba(255, 255, 255, 0.25);
+  font-style: normal;
+}
+
+.df-node-prompt-overlay {
+  font-size: 11px;
+  line-height: 1.45;
+  font-style: normal;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.df-node-tag,
+button.df-node-tag {
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.df-node-tag-mode-image {
+  font-weight: 500;
+}
+
+.df-node-delay-setting,
+.df-node-download-info,
+.df-node-inline-input {
+  font-size: 11px;
+  font-weight: 400;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.df-node-provider-pill {
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+.tobyflow-node-picker-input {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.tobyflow-node-picker-name {
+  font-size: 11px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.tobyflow-node-picker-desc {
+  font-size: 10px;
+  font-weight: 400;
+  color: rgba(255, 255, 255, 0.3);
+}
+
+.tobyflow-node-picker-footer,
+.tobyflow-node-picker-footer kbd {
+  font-size: 10px;
+  font-weight: 400;
+}
+
+.tobyflow-node-picker-port-tag {
+  font-size: 10px;
+  font-weight: 500;
+}
+
+/* Workflow app palette: keep TobyFlow mechanics, replace its bright colors with the app theme. */
+.tobyflow-wf-toolbar {
+  background: rgba(20, 20, 20, 0.96);
+  border-color: rgba(255, 255, 255, 0.07);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.38);
+}
+
+.tobyflow-wf-tool-btn {
+  color: rgba(255, 255, 255, 0.42);
+}
+
+.tobyflow-wf-tool-btn:hover,
+.tobyflow-wf-tool-btn.active {
+  background: rgba(124, 92, 255, 0.12);
+  color: #B8A8FF;
+}
+
+.tobyflow-node-picker {
+  background: rgba(22, 22, 22, 0.98);
+  border-color: rgba(255, 255, 255, 0.08);
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.46);
+}
+
+.tobyflow-node-picker-context-hint,
+.tobyflow-node-picker-search,
+.tobyflow-node-picker-footer {
+  background: transparent;
+  border-color: rgba(255, 255, 255, 0.06);
+}
+
+.tobyflow-node-picker-close {
+  color: rgba(255, 255, 255, 0.38);
+}
+
+.tobyflow-node-picker-close:hover {
+  background: rgba(124, 92, 255, 0.1);
+  color: #B8A8FF;
+}
+
+.tobyflow-node-picker-input {
+  background: #101010;
+  border-color: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.68);
+}
+
+.tobyflow-node-picker-input:focus {
+  border-color: rgba(124, 92, 255, 0.55);
+  box-shadow: 0 0 0 1px rgba(124, 92, 255, 0.18);
+}
+
+.tobyflow-node-picker-item {
+  color: rgba(255, 255, 255, 0.76);
+}
+
+.tobyflow-node-picker-item:hover,
+.tobyflow-node-picker-item.selected {
+  background: rgba(124, 92, 255, 0.1);
+  box-shadow: inset 0 0 0 1px rgba(124, 92, 255, 0.12);
+}
+
+.tobyflow-node-picker-name {
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.tobyflow-node-picker-desc,
+.tobyflow-node-picker-footer {
+  color: rgba(255, 255, 255, 0.34);
+}
+
+.tobyflow-node-picker-footer kbd {
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.tobyflow-node-picker-port-tag,
+.tobyflow-node-picker-port-tag[data-port-type="text"],
+.tobyflow-node-picker-port-tag[data-port-type="image"],
+.tobyflow-node-picker-port-tag[data-port-type="any"] {
+  background: rgba(124, 92, 255, 0.14);
+  border-color: rgba(124, 92, 255, 0.28);
+  color: #C7BBFF;
+}
+
+.ai-df-node-sky,
+.ai-df-node-emerald,
+.ai-df-node-amber,
+.ai-df-node-rose {
+  border-left-color: var(--accent);
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node,
+.df-node {
+  background: #171717;
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node:hover {
+  border-color: rgba(124, 92, 255, 0.32);
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node.selected,
+.ai-drawflow-canvas .drawflow .drawflow-node.selected:has(.df-node[data-provider="flow"]),
+.ai-drawflow-canvas .drawflow .drawflow-node.selected:has(.df-node[data-provider="openai"]),
+.ai-drawflow-canvas .drawflow .drawflow-node.selected:has(.df-node[data-provider="grok"]) {
+  background: #171717;
+  border-color: var(--accent);
+  outline-color: rgba(124, 92, 255, 0.72);
+  box-shadow:
+    0 0 0 1px rgba(124, 92, 255, 0.72),
+    0 0 0 4px rgba(124, 92, 255, 0.12),
+    0 0 26px rgba(124, 92, 255, 0.22),
+    0 10px 28px rgba(0, 0, 0, 0.48);
+  animation: none;
+}
+
+.df-node-icon.generate,
+.df-node-icon.download,
+.df-node-icon.image,
+.df-node-icon.prompt,
+.df-node-icon.condition,
+.df-node-icon.merge,
+.df-node-icon.delay,
+.df-node-icon.note {
+  background: rgba(124, 92, 255, 0.12);
+  border: 1px solid rgba(124, 92, 255, 0.18);
+  color: #B8A8FF;
+}
+
+.df-node-icon.delay,
+.df-node-icon.note {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.52);
+}
+
+.df-node-tag-editable:hover,
+.df-node-pill-trigger:hover,
+.df-node-pill-trigger:focus-visible,
+.df-node-tag-mode-image {
+  border-color: rgba(124, 92, 255, 0.3);
+  color: #B8A8FF;
+}
+
+.df-node-tag-mode-image {
+  background: rgba(124, 92, 255, 0.12);
+}
+
+.df-node-pill-trigger:hover,
+.df-node-pill-trigger:focus-visible {
+  background: rgba(124, 92, 255, 0.12);
+}
+
+.df-node-toggle.on .df-node-toggle-track {
+  background: var(--accent);
+}
+
+.df-node-toggle-thumb {
+  background: #ffffff;
+}
+
+.df-node-provider-pill,
+.df-node-provider-pill.df-node-provider-flow,
+.df-node-provider-pill.df-node-provider-openai,
+.df-node-provider-pill.df-node-provider-grok {
+  background: linear-gradient(135deg, rgba(124, 92, 255, 0.16), rgba(20, 20, 20, 0.96));
+  color: rgba(255, 255, 255, 0.86);
+}
+
+.df-node-provider-pill-logo,
+.df-node-provider-pill.df-node-provider-flow .df-node-provider-pill-logo,
+.df-node-provider-pill.df-node-provider-openai .df-node-provider-pill-logo,
+.df-node-provider-pill.df-node-provider-grok .df-node-provider-pill-logo {
+  background: rgba(124, 92, 255, 0.15);
+  border: 1px solid rgba(124, 92, 255, 0.22);
+  color: #C7BBFF;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node.df-port-text .input,
+.ai-drawflow-canvas .drawflow .drawflow-node.df-port-text .output,
+.ai-drawflow-canvas .drawflow .drawflow-node.df-port-image .input,
+.ai-drawflow-canvas .drawflow .drawflow-node.df-port-image .output,
+.ai-drawflow-canvas .drawflow .drawflow-node.df-port-any .input,
+.ai-drawflow-canvas .drawflow .drawflow-node.df-port-any .output {
+  background: rgba(124, 92, 255, 0.16);
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node .input:hover,
+.ai-drawflow-canvas .drawflow .drawflow-node .output:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.ai-drawflow-canvas .drawflow .input[data-port-type],
+.ai-drawflow-canvas .drawflow .output[data-port-type] {
+  background: #181818 !important;
+  border-color: rgba(255, 255, 255, 0.14) !important;
+  color: rgba(255, 255, 255, 0.76) !important;
+}
+
+.ai-drawflow-canvas .drawflow .input[data-port-type="text"],
+.ai-drawflow-canvas .drawflow .output[data-port-type="text"],
+.ai-drawflow-canvas .drawflow .input[data-port-type="image"],
+.ai-drawflow-canvas .drawflow .output[data-port-type="image"],
+.ai-drawflow-canvas .drawflow .input[data-port-type="video"],
+.ai-drawflow-canvas .drawflow .output[data-port-type="video"],
+.ai-drawflow-canvas .drawflow .input[data-port-type="frame"],
+.ai-drawflow-canvas .drawflow .output[data-port-type="frame"] {
+  border-color: rgba(124, 92, 255, 0.34) !important;
+}
+
+.ai-drawflow-canvas .drawflow .input[data-port-type="any"],
+.ai-drawflow-canvas .drawflow .output[data-port-type="any"] {
+  border-color: rgba(255, 255, 255, 0.18) !important;
+}
+
+.ai-drawflow-canvas .drawflow .drawflow-node.selected .input[data-port-type],
+.ai-drawflow-canvas .drawflow .drawflow-node.selected .output[data-port-type],
+.ai-drawflow-canvas .drawflow .drawflow-node.node-running .input[data-port-type],
+.ai-drawflow-canvas .drawflow .drawflow-node.node-running .output[data-port-type],
+.ai-drawflow-canvas .drawflow .input[data-port-type]:hover,
+.ai-drawflow-canvas .drawflow .output[data-port-type]:hover {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 2px rgba(124, 92, 255, 0.24), 0 2px 8px rgba(0, 0, 0, 0.42) !important;
+}
+
+.ai-drawflow-canvas .drawflow .df-port-icon svg {
+  color: rgba(255, 255, 255, 0.78) !important;
+  stroke: rgba(255, 255, 255, 0.78);
+}
+
+.ai-drawflow-canvas .drawflow .connection .main-path,
+.ai-drawflow-canvas .drawflow .connection .main-path.selected,
+.ai-drawflow-canvas .drawflow .connection.conn-type-frame .main-path,
+.ai-drawflow-canvas .drawflow .connection.conn-type-text .main-path,
+.ai-drawflow-canvas .drawflow .connection.conn-type-image .main-path,
+.ai-drawflow-canvas .drawflow .connection.conn-type-any .main-path {
+  stroke: rgba(124, 92, 255, 0.46);
+  color: var(--accent);
+}
+
+.ai-drawflow-canvas .drawflow .connection .main-path-overlay,
+.ai-drawflow-canvas .drawflow .connection.conn-type-frame .main-path-overlay,
+.ai-drawflow-canvas .drawflow .connection.conn-type-text .main-path-overlay,
+.ai-drawflow-canvas .drawflow .connection.conn-type-image .main-path-overlay {
+  stroke: rgba(255, 255, 255, 0.42);
+}
+
+.ai-drawflow-canvas .drawflow .connection.connection-active .main-path,
+.ai-drawflow-canvas .drawflow .connection.conn-node-selected .main-path,
+.ai-drawflow-canvas .drawflow .connection.conn-type-frame.connection-active .main-path,
+.ai-drawflow-canvas .drawflow .connection.conn-type-frame.conn-node-selected .main-path,
+.ai-drawflow-canvas .drawflow .connection.conn-type-text.connection-active .main-path,
+.ai-drawflow-canvas .drawflow .connection.conn-type-text.conn-node-selected .main-path,
+.ai-drawflow-canvas .drawflow .connection.conn-type-image.connection-active .main-path,
+.ai-drawflow-canvas .drawflow .connection.conn-type-image.conn-node-selected .main-path,
+.ai-drawflow-canvas .drawflow .connection.conn-type-any.connection-active .main-path,
+.ai-drawflow-canvas .drawflow .connection.conn-type-any.conn-node-selected .main-path {
+  stroke: var(--accent);
+  color: var(--accent);
+  filter: drop-shadow(0 0 8px rgba(124, 92, 255, 0.55));
+}
+
+.ai-drawflow-canvas .drawflow .connection.connection-active .main-path-overlay,
+.ai-drawflow-canvas .drawflow .connection.conn-node-selected .main-path-overlay,
+.ai-drawflow-canvas .drawflow .connection.conn-type-frame.connection-active .main-path-overlay,
+.ai-drawflow-canvas .drawflow .connection.conn-type-frame.conn-node-selected .main-path-overlay,
+.ai-drawflow-canvas .drawflow .connection.conn-type-text.connection-active .main-path-overlay,
+.ai-drawflow-canvas .drawflow .connection.conn-type-text.conn-node-selected .main-path-overlay,
+.ai-drawflow-canvas .drawflow .connection.conn-type-image.connection-active .main-path-overlay,
+.ai-drawflow-canvas .drawflow .connection.conn-type-image.conn-node-selected .main-path-overlay,
+.ai-drawflow-canvas .drawflow .connection.conn-type-any.connection-active .main-path-overlay,
+.ai-drawflow-canvas .drawflow .connection.conn-type-any.conn-node-selected .main-path-overlay {
+  stroke: rgba(255, 255, 255, 0.78);
+}
+
+.ai-drawflow-canvas .drawflow svg.connection:not([class*="node_in_"]) .main-path {
+  stroke: rgba(124, 92, 255, 0.65) !important;
 }

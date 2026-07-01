@@ -264,6 +264,7 @@ export type MessageAction =
   | 'STORAGE_GET'
   | 'STORAGE_SET'
   | 'NOTIFICATION'
+  | 'OPEN_WORKFLOW_EDITOR_WINDOW'
   | 'CHECK_FLOW_TAB'
   | 'RUN_FLOW_PROMPT'
   | 'FLOW_STATUS'

@@ -15,6 +15,14 @@ function readBgDebugFlag(): boolean {
   return false
 }
 var BG_DEBUG = readBgDebugFlag()
+var workflowEditorWindowId: number | null = null
+
+chrome.windows.onRemoved.addListener((windowId) => {
+  if (workflowEditorWindowId === windowId) {
+    workflowEditorWindowId = null
+    chrome.storage.session?.remove?.('workflowEditorWindowId').catch(() => {})
+  }
+})
 
 chrome.runtime.onMessage.addListener((message: ChromeMessage, sender, sendResponse) => {
   if (BG_DEBUG) console.log('[Background] received action:', message?.action)
@@ -70,6 +78,9 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
     case 'NOTIFICATION':
       return showNotification(message.payload as { title: string; message: string; type?: string })
 
+    case 'OPEN_WORKFLOW_EDITOR_WINDOW':
+      return openWorkflowEditorWindow(message.payload as { workflowId?: string } | undefined)
+
     case 'RUN_FLOW_PROMPT':
       return runFlowPrompt(message.payload as RunFlowPromptPayload, sender.tab?.id)
 
@@ -119,6 +130,75 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
   }
 
   return { success: false }
+}
+
+async function openWorkflowEditorWindow(
+  payload?: { workflowId?: string }
+): Promise<{ success: boolean; windowId?: number; error?: string }> {
+  const workflowId = payload?.workflowId || ''
+  const query = workflowId ? `?workflowId=${encodeURIComponent(workflowId)}` : ''
+  const url = chrome.runtime.getURL(`tabs/workflow-editor.html${query}`)
+
+  const focusExisting = async (windowId: number) => {
+    const win = await chrome.windows.get(windowId, { populate: true })
+    const tab = win.tabs?.[0]
+    if (tab?.id) {
+      await chrome.tabs.update(tab.id, { url, active: true }).catch(() => {})
+    }
+    await chrome.windows.update(windowId, { focused: true }).catch(() => {})
+    workflowEditorWindowId = windowId
+    await chrome.storage.session?.set?.({ workflowEditorWindowId: windowId }).catch(() => {})
+    return { success: true, windowId }
+  }
+
+  if (workflowEditorWindowId !== null) {
+    try {
+      return await focusExisting(workflowEditorWindowId)
+    } catch {
+      workflowEditorWindowId = null
+    }
+  }
+
+  try {
+    const stored = await chrome.storage.session?.get?.('workflowEditorWindowId').catch(() => null)
+    const storedWindowId = stored?.workflowEditorWindowId as number | undefined
+    if (storedWindowId) {
+      return await focusExisting(storedWindowId)
+    }
+  } catch {
+    workflowEditorWindowId = null
+  }
+
+  try {
+    const current = await chrome.windows.getLastFocused().catch(() => null)
+    const width = Math.max(1180, Math.min(1500, Math.round((current?.width || 1440) * 0.92)))
+    const height = Math.max(760, Math.min(980, Math.round((current?.height || 900) * 0.92)))
+    const left = current?.left !== undefined && current?.width
+      ? current.left + Math.max(0, Math.round((current.width - width) / 2))
+      : undefined
+    const top = current?.top !== undefined && current?.height
+      ? current.top + Math.max(0, Math.round((current.height - height) / 2))
+      : undefined
+
+    const win = await chrome.windows.create({
+      url,
+      type: 'popup',
+      width,
+      height,
+      left,
+      top,
+      focused: true
+    })
+
+    workflowEditorWindowId = win.id ?? null
+    if (workflowEditorWindowId !== null) {
+      await chrome.storage.session?.set?.({ workflowEditorWindowId }).catch(() => {})
+    }
+
+    return { success: true, windowId: workflowEditorWindowId ?? undefined }
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) }
+  }
 }
 
 // Per-provider tab configuration.

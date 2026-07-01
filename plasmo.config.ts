@@ -12,7 +12,8 @@ export default defineConfig({
       "storage",
       "activeTab",
       "scripting",
-      "notifications"
+      "notifications",
+      "windows"
     ],
     // content_scripts is auto-discovered by Plasmo from src/contents/*.ts.
     // src/contents/content-script.ts is the shared ChatGPT / flow.google /
@@ -20,7 +21,6 @@ export default defineConfig({
     // here — Plasmo will emit the hashed bundle and manifest entry itself.
   },
   commonDependencies: {
-    "@xyflow/react": "^12.10.2",
     "zustand": "^5.0.3",
     "framer-motion": "^11.15.0"
   },

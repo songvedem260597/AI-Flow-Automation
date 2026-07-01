@@ -35,6 +35,7 @@ interface WorkflowState {
   selectedNodeId: string | null
   selectedEdgeId: string | null
   isDirty: boolean
+  hydrateFromStorage: () => Promise<void>
 
   createWorkflow: (name?: string) => Workflow
   updateWorkflow: (id: string, updates: Partial<Workflow>) => void
@@ -94,6 +95,27 @@ export const useWorkflowStore = create<WorkflowState>()(
       selectedEdgeId: null,
       isDirty: false,
 
+      hydrateFromStorage: async () => {
+        const result = await chrome.storage.local.get('ai-flow-workflows')
+        const saved = result['ai-flow-workflows']
+        if (!saved) return
+
+        try {
+          const parsed = JSON.parse(saved)
+          const state = parsed.state as Partial<WorkflowState> | undefined
+          if (!state?.workflows) return
+
+          set({
+            workflows: state.workflows,
+            activeWorkflowId: state.activeWorkflowId ?? state.workflows[0]?.id ?? null,
+            selectedNodeId: state.selectedNodeId ?? null,
+            selectedEdgeId: state.selectedEdgeId ?? null
+          })
+        } catch {
+          // Ignore corrupt persisted state.
+        }
+      },
+
       createWorkflow: (name) => {
         const workflow: Workflow = {
           id: uuid(),
@@ -137,7 +159,7 @@ export const useWorkflowStore = create<WorkflowState>()(
           createdAt: Date.now(),
           updatedAt: Date.now()
         }
-        set((state) => ({ workflows: [...state.workflows, duplicate], isDirty: true }))
+        set((state) => ({ workflows: [...state.workflows, duplicate], activeWorkflowId: duplicate.id, isDirty: true }))
         return duplicate
       },
 
@@ -228,7 +250,18 @@ export const useWorkflowStore = create<WorkflowState>()(
         set((state) => ({
           workflows: state.workflows.map((w) =>
             w.id === state.activeWorkflowId
-              ? { ...w, edges: [...w.edges, { ...edge, id: uuid() }], updatedAt: Date.now() }
+              ? {
+                  ...w,
+                  edges: w.edges.some((existing) =>
+                    existing.source === edge.source &&
+                    existing.target === edge.target &&
+                    existing.sourceHandle === edge.sourceHandle &&
+                    existing.targetHandle === edge.targetHandle
+                  )
+                    ? w.edges
+                    : [...w.edges, { ...edge, id: uuid() }],
+                  updatedAt: Date.now()
+                }
               : w
           ),
           isDirty: true
@@ -274,6 +307,7 @@ export const useWorkflowStore = create<WorkflowState>()(
             workflows: idx !== -1
               ? state.workflows.map((w, i) => (i === idx ? updated : w))
               : [...state.workflows, updated],
+            activeWorkflowId: updated.id,
             isDirty: true
           }
         })
