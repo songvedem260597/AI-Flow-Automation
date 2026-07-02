@@ -12,6 +12,8 @@ export interface ProviderAdapter {
   downloadResult?(): Promise<string>
   setModel?(modelId: string): Promise<void>
   setAspectRatio?(ratio: string): Promise<void>
+  setMediaType?(mediaType: 'image' | 'video'): Promise<void>
+  setDuration?(duration: string): Promise<void>
   getModels(): Promise<string[]>
   cleanup(): Promise<void>
 }
@@ -61,6 +63,9 @@ export interface ImageNodeData extends BaseNodeData {
 export interface GenerateNodeData extends BaseNodeData {
   provider: AIProvider
   model?: string
+  mediaType?: 'image' | 'video'
+  aspectRatio?: '1:1' | '16:9' | '9:16' | '4:3' | '3:4' | 'custom'
+  videoDuration?: string
   autoGenerate?: boolean
   waitForCompletion?: boolean
   timeout?: number

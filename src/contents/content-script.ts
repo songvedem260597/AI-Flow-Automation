@@ -39,6 +39,10 @@ const AIFlowContentScript = {
         return this.setModel(message.payload.model)
       case 'SET_ASPECT_RATIO':
         return this.setAspectRatio(message.payload.ratio)
+      case 'SET_MEDIA_TYPE':
+        return this.setMediaType(message.payload.mediaType)
+      case 'SET_DURATION':
+        return this.setDuration(message.payload.duration)
       case 'GET_STATUS':
         return this.getStatus()
       case 'CHATGPT_SUBMIT_AND_WAIT':
@@ -166,6 +170,65 @@ const AIFlowContentScript = {
     }
 
     return { success: false, error: 'Aspect ratio selector not found' }
+  },
+
+  setMediaType(mediaType) {
+    const normalized = String(mediaType || 'image').toLowerCase() === 'video' ? 'video' : 'image'
+    const labels = normalized === 'video' ? ['video'] : ['image', 'ảnh', 'hình']
+    const selectors = [
+      `[data-value="${normalized}"]`,
+      `[data-media-type="${normalized}"]`,
+      `button[aria-label*="${normalized}"]`
+    ]
+
+    for (const selector of selectors) {
+      const el = document.querySelector(selector)
+      if (el) {
+        el.click()
+        return { success: true }
+      }
+    }
+
+    const controls = document.querySelectorAll('button, [role="button"], [role="option"], [role="menuitem"]')
+    for (const control of controls) {
+      const text = control.textContent?.trim().toLowerCase() || ''
+      if (labels.some((label) => text === label || text.includes(label))) {
+        control.click()
+        return { success: true }
+      }
+    }
+
+    return { success: false, error: 'Media type selector not found' }
+  },
+
+  setDuration(duration) {
+    const value = String(duration || '').trim()
+    if (!value) return { success: true, skipped: true }
+    const numeric = value.replace(/s$/i, '')
+    const selectors = [
+      `[data-value="${value}"]`,
+      `[data-duration="${value}"]`,
+      `button[aria-label*="${value}"]`
+    ]
+
+    for (const selector of selectors) {
+      const el = document.querySelector(selector)
+      if (el) {
+        el.click()
+        return { success: true }
+      }
+    }
+
+    const controls = document.querySelectorAll('button, [role="button"], [role="option"], [role="menuitem"]')
+    for (const control of controls) {
+      const text = control.textContent?.trim().toLowerCase() || ''
+      if (text === value.toLowerCase() || text === numeric || text === `${numeric}s`) {
+        control.click()
+        return { success: true }
+      }
+    }
+
+    return { success: false, error: 'Duration selector not found' }
   },
 
   getStatus() {

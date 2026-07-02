@@ -36,7 +36,7 @@ var GP_DEBUG = readDebugFlag()
 const FLOW_IMAGE_MODELS: FlowModelOption[] = [
   { label: 'Nano Banana Pro', value: 'Nano Banana Pro', aliases: ['nano-banana-pro', '🍌 Nano Banana Pro'] },
   { label: 'Nano Banana 2',   value: 'Nano Banana 2',   aliases: ['nano-banana-2', '🍌 Nano Banana 2'] },
-  { label: 'Imagen 3',        value: 'Imagen 3',        aliases: ['imagen-3'] },
+  { label: 'Nano Banana 2 Lite', value: 'Nano Banana 2 Lite', aliases: ['nano-banana-2-lite'] },
 ]
 
 const FLOW_VIDEO_MODELS: FlowModelOption[] = [
@@ -308,8 +308,13 @@ export const GenPanel: React.FC<{
     setMode(nextMode)
   }
 
-  const FLOW_VIDEO_DURATIONS = ['4s', '6s', '8s', '10s'] as const
-  const [videoDuration, setVideoDuration] = useState<'4s' | '6s' | '8s' | '10s'>('8s')
+  type FlowVideoDuration = '4s' | '6s' | '8s' | '10s'
+  const FLOW_VIDEO_DURATIONS: readonly FlowVideoDuration[] = ['4s', '6s', '8s']
+  const OMNI_FLASH_VIDEO_DURATIONS: readonly FlowVideoDuration[] = ['4s', '6s', '8s', '10s']
+  const [videoDuration, setVideoDuration] = useState<FlowVideoDuration>('8s')
+  const activeVideoDurationOptions = videoModel === 'Omni Flash'
+    ? OMNI_FLASH_VIDEO_DURATIONS
+    : FLOW_VIDEO_DURATIONS
 
   const [aspectRatio, setAspectRatio] = useState<AspectRatio>('16:9')
   const [quantity, setQuantity] = useState(1)
@@ -325,6 +330,12 @@ export const GenPanel: React.FC<{
   // Pending upload store: maps upload_xxx key → real File object
   const [pendingUploads, setPendingUploads] = useState<Record<string, File>>({})
   const [isDragging, setIsDragging] = useState(false)
+
+  useEffect(() => {
+    if (!activeVideoDurationOptions.includes(videoDuration)) {
+      setVideoDuration('8s')
+    }
+  }, [videoModel, videoDuration])
   const [isGenerating, setIsGenerating] = useState(false)
   const [genStatus, setGenStatus] = useState<'idle' | 'generating' | 'done'>('idle')
   const [flowStep, setFlowStep] = useState('')
@@ -1309,7 +1320,7 @@ const handleGenerate = useCallback(async () => {
                   onChange={(e) => setVideoDuration(e.target.value as typeof videoDuration)}
                   className="appearance-none pl-2.5 pr-6 py-1.5 bg-[#141414] rounded-lg text-[11px] text-white/60 outline-none focus:ring-1 focus:ring-white/10 border border-white/5 cursor-pointer hover:border-white/10"
                 >
-                  {FLOW_VIDEO_DURATIONS.map((d) => (
+                  {activeVideoDurationOptions.map((d) => (
                     <option key={d} value={d}>{d}</option>
                   ))}
                 </select>

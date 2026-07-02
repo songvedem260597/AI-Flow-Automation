@@ -183,13 +183,44 @@ export class PipelineRunner {
       }
 
       case 'generate': {
-        const genData = data as { autoGenerate?: boolean; waitForCompletion?: boolean }
+        const genData = data as {
+          provider?: AIProvider
+          model?: string
+          mediaType?: 'image' | 'video'
+          aspectRatio?: string
+          videoDuration?: string
+          autoGenerate?: boolean
+          waitForCompletion?: boolean
+        }
+        if (genData.provider && genData.provider !== this.adapter.name) {
+          this.adapter = getAdapter(genData.provider)
+          await this.adapter.open()
+        }
+
+        const mediaType = genData.provider === 'google-flow' && genData.mediaType === 'video' ? 'video' : 'image'
+        await this.adapter.setMediaType?.(mediaType)
+        if (genData.aspectRatio) await this.adapter.setAspectRatio?.(genData.aspectRatio)
+        if (genData.provider === 'google-flow' && genData.model) await this.adapter.setModel?.(genData.model)
+        if (mediaType === 'video' && genData.videoDuration) await this.adapter.setDuration?.(genData.videoDuration)
+
         if (genData.autoGenerate !== false) await this.adapter.clickGenerate()
         if (genData.waitForCompletion !== false) {
           const result = await this.adapter.waitForResult()
-          return { result }
+          return {
+            result,
+            mediaType,
+            aspectRatio: genData.aspectRatio,
+            model: genData.provider === 'google-flow' ? genData.model : undefined,
+            videoDuration: mediaType === 'video' ? genData.videoDuration : undefined
+          }
         }
-        return { triggered: true }
+        return {
+          triggered: true,
+          mediaType,
+          aspectRatio: genData.aspectRatio,
+          model: genData.provider === 'google-flow' ? genData.model : undefined,
+          videoDuration: mediaType === 'video' ? genData.videoDuration : undefined
+        }
       }
 
       case 'delay': {

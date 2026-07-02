@@ -4,7 +4,7 @@ An AI Workflow Automation Tool for Google Flow, ChatGPT, Grok and other AI platf
 
 ## Features
 
-- **Workflow Editor**: Visual node-graph editor using @xyflow/react (React Flow)
+- **Workflow Editor**: Visual node-graph editor using Drawflow
 - **AI Provider Adapters**: Google Flow, ChatGPT, Grok (extensible)
 - **Pipeline Runner**: Sequential execution with state management (pending/running/completed/failed)
 - **Prompt Manager**: Save, organize, and reuse prompts
@@ -22,7 +22,7 @@ An AI Workflow Automation Tool for Google Flow, ChatGPT, Grok and other AI platf
 - Plasmo Framework (Chrome Extension SDK)
 - React 18 + TypeScript
 - Tailwind CSS v3
-- @xyflow/react v12 (React Flow)
+- Drawflow canvas editor
 - Zustand v5 (State Management)
 - Framer Motion (Animations)
 - Chrome Side Panel API
@@ -34,8 +34,7 @@ An AI Workflow Automation Tool for Google Flow, ChatGPT, Grok and other AI platf
 ai-workflow-automation/
 ├── src/
 │   ├── components/
-│   │   ├── workflow/
-│   │   │   └── nodes/         # React Flow nodes
+│   │   ├── workflow/           # Workflow hub + Drawflow editor
 │   │   ├── prompt/            # Prompt Manager
 │   │   ├── queue/             # Task Queue
 │   │   ├── history/            # History Panel
@@ -48,7 +47,8 @@ ai-workflow-automation/
 │   ├── stores/                # Zustand stores
 │   ├── types/                 # TypeScript types
 │   ├── constants/             # App constants
-│   ├── lib/                   # Utilities
+│   ├── lib/                   # Utilities and Drawflow assets
+│   ├── tabs/                  # Extension tab pages
 │   ├── content-scripts/       # Content scripts
 │   ├── background/            # Service worker
 │   └── sidepanel.tsx          # Side Panel entry

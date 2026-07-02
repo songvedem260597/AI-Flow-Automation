@@ -85,7 +85,16 @@ export class GoogleFlowAdapter implements ProviderAdapter {
   }
 
   async getModels(): Promise<string[]> {
-    return [' Imagen 3', ' Imagen 3 Fast', ' Veo 2', ' Veo 3']
+    return [
+      'Nano Banana Pro',
+      'Nano Banana 2',
+      'Nano Banana 2 Lite',
+      'Omni Flash',
+      'Veo 3.1 - Lite',
+      'Veo 3.1 - Fast',
+      'Veo 3.1 - Quality',
+      'Veo 3.1 - Lite [Lower Priority]'
+    ]
   }
 
   async setModel(modelId: string): Promise<void> {
@@ -101,6 +110,22 @@ export class GoogleFlowAdapter implements ProviderAdapter {
     await chrome.tabs.sendMessage(this.tabId!, {
       action: 'SET_ASPECT_RATIO',
       payload: { ratio }
+    })
+  }
+
+  async setMediaType(mediaType: 'image' | 'video'): Promise<void> {
+    await this.injectScript()
+    await chrome.tabs.sendMessage(this.tabId!, {
+      action: 'SET_MEDIA_TYPE',
+      payload: { mediaType }
+    })
+  }
+
+  async setDuration(duration: string): Promise<void> {
+    await this.injectScript()
+    await chrome.tabs.sendMessage(this.tabId!, {
+      action: 'SET_DURATION',
+      payload: { duration }
     })
   }
 

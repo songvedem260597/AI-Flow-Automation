@@ -70,7 +70,16 @@ const createDefaultNodeData = (type: FlowNodeType): Record<string, unknown> => {
     case 'image':
       return { ...base, imageUrl: '', imageData: '', aspectRatio: '1:1', provider: 'chatgpt' }
     case 'generate':
-      return { ...base, provider: 'chatgpt', model: '', autoGenerate: true, waitForCompletion: true, timeout: 60000 }
+      return {
+        ...base,
+        provider: 'chatgpt',
+        mediaType: 'image',
+        aspectRatio: '1:1',
+        model: '',
+        autoGenerate: true,
+        waitForCompletion: true,
+        timeout: 60000
+      }
     case 'delay':
       return { ...base, duration: 1000 }
     case 'download':

@@ -106,8 +106,27 @@ const PROVIDER_OPTIONS: Array<{ value: AIProvider; label: string }> = [
 ]
 
 const ASPECT_RATIO_OPTIONS = ['1:1', '16:9', '9:16', '4:3', '3:4', 'custom']
+const GENERATE_IMAGE_RATIO_OPTIONS = ['1:1', '16:9', '9:16', '4:3', '3:4']
+const GENERATE_VIDEO_RATIO_OPTIONS = ['16:9', '9:16']
+const GENERATE_MEDIA_TYPE_OPTIONS = [
+  { value: 'image', label: 'Image' },
+  { value: 'video', label: 'Video' }
+]
+const GOOGLE_FLOW_IMAGE_MODEL_OPTIONS = ['Nano Banana Pro', 'Nano Banana 2', 'Nano Banana 2 Lite']
+const GOOGLE_FLOW_VIDEO_MODEL_OPTIONS = [
+  'Omni Flash',
+  'Veo 3.1 - Lite',
+  'Veo 3.1 - Fast',
+  'Veo 3.1 - Quality',
+  'Veo 3.1 - Lite [Lower Priority]'
+]
+const GOOGLE_FLOW_DEFAULT_IMAGE_MODEL = 'Nano Banana 2'
+const GOOGLE_FLOW_DEFAULT_VIDEO_MODEL = 'Omni Flash'
+const VIDEO_DURATION_OPTIONS = ['4s', '6s', '8s']
+const OMNI_FLASH_VIDEO_DURATION_OPTIONS = ['4s', '6s', '8s', '10s']
 
-type NodePillField = 'provider' | 'aspectRatio'
+type GenerateMediaType = 'image' | 'video'
+type NodePillField = 'provider' | 'aspectRatio' | 'mediaType' | 'model' | 'videoDuration'
 
 interface NodePillOption {
   value: string
@@ -122,6 +141,11 @@ interface NodePillMenuState {
   options: NodePillOption[]
 }
 
+interface ImagePreviewState {
+  src: string
+  name: string
+}
+
 function normalizePillOptions(options: Array<{ value: string; label: string }> | string[]): NodePillOption[] {
   return options.map((option) => (
     typeof option === 'string'
@@ -130,10 +154,94 @@ function normalizePillOptions(options: Array<{ value: string; label: string }> |
   ))
 }
 
-function getPillOptions(field: NodePillField): NodePillOption[] {
-  return field === 'provider'
-    ? normalizePillOptions(PROVIDER_OPTIONS)
-    : normalizePillOptions(ASPECT_RATIO_OPTIONS)
+function generateProviderSupportsVideo(provider: unknown) {
+  return provider === 'google-flow'
+}
+
+function getGenerateMediaType(data: Record<string, unknown>): GenerateMediaType {
+  const provider = data.provider || 'chatgpt'
+  const raw = String(data.mediaType || data.media_type || 'image').toLowerCase()
+  return raw === 'video' && generateProviderSupportsVideo(provider) ? 'video' : 'image'
+}
+
+function getGenerateAspectRatioOptions(data: Record<string, unknown>) {
+  return getGenerateMediaType(data) === 'video' ? GENERATE_VIDEO_RATIO_OPTIONS : GENERATE_IMAGE_RATIO_OPTIONS
+}
+
+function getGenerateModelOptions(data: Record<string, unknown>) {
+  const provider = data.provider || 'chatgpt'
+  if (provider === 'google-flow') {
+    return getGenerateMediaType(data) === 'video'
+      ? GOOGLE_FLOW_VIDEO_MODEL_OPTIONS
+      : GOOGLE_FLOW_IMAGE_MODEL_OPTIONS
+  }
+  return []
+}
+
+function getGenerateDefaultModel(data: Record<string, unknown>) {
+  return getGenerateMediaType(data) === 'video'
+    ? GOOGLE_FLOW_DEFAULT_VIDEO_MODEL
+    : GOOGLE_FLOW_DEFAULT_IMAGE_MODEL
+}
+
+function getGenerateVideoDurationOptions(data: Record<string, unknown>) {
+  if (getGenerateMediaType(data) !== 'video') return []
+  return data.model === 'Omni Flash' ? OMNI_FLASH_VIDEO_DURATION_OPTIONS : VIDEO_DURATION_OPTIONS
+}
+
+function sanitizeGenerateDataPatch(currentData: Record<string, unknown>, patch: Record<string, unknown>) {
+  const next = { ...currentData, ...patch }
+  const provider = String(next.provider || 'chatgpt')
+  const mediaType = getGenerateMediaType(next)
+  const ratioOptions = getGenerateAspectRatioOptions({ ...next, mediaType })
+  const modelOptions = getGenerateModelOptions({ ...next, provider, mediaType })
+  const sanitized: Record<string, unknown> = { ...patch, provider, mediaType }
+
+  if (!generateProviderSupportsVideo(provider)) {
+    sanitized.mediaType = 'image'
+    sanitized.model = ''
+    sanitized.videoDuration = undefined
+  } else {
+    const defaultModel = getGenerateDefaultModel({ ...next, provider, mediaType })
+    sanitized.model = modelOptions.includes(String(next.model))
+      ? String(next.model)
+      : modelOptions.includes(defaultModel)
+        ? defaultModel
+        : modelOptions[0]
+    const durationOptions = getGenerateVideoDurationOptions({ ...next, ...sanitized, mediaType })
+    const nextDuration = String(next.videoDuration || next.video_duration || VIDEO_DURATION_OPTIONS[1])
+    sanitized.videoDuration = mediaType === 'video'
+      ? durationOptions.includes(nextDuration)
+        ? nextDuration
+        : durationOptions.includes('8s')
+          ? '8s'
+          : durationOptions[0]
+      : undefined
+  }
+
+  if (!ratioOptions.includes(String(next.aspectRatio))) {
+    sanitized.aspectRatio = ratioOptions[0]
+  }
+
+  return sanitized
+}
+
+function getPillOptions(field: NodePillField, data: Record<string, unknown> = {}): NodePillOption[] {
+  if (field === 'provider') return normalizePillOptions(PROVIDER_OPTIONS)
+  if (field === 'mediaType') return normalizePillOptions(GENERATE_MEDIA_TYPE_OPTIONS)
+  if (field === 'model') return normalizePillOptions(getGenerateModelOptions(data))
+  if (field === 'videoDuration') return normalizePillOptions(getGenerateVideoDurationOptions(data))
+  return normalizePillOptions(
+    data && Object.keys(data).length > 0 ? getGenerateAspectRatioOptions(data) : ASPECT_RATIO_OPTIONS
+  )
+}
+
+function pillFieldLabel(field: NodePillField) {
+  if (field === 'provider') return 'Provider'
+  if (field === 'mediaType') return 'Media type'
+  if (field === 'model') return 'Model'
+  if (field === 'videoDuration') return 'Duration'
+  return 'Aspect ratio'
 }
 
 const NODE_PICKER_ITEMS = NODE_CATEGORIES.flatMap((category) =>
@@ -254,7 +362,6 @@ const BUILT_IN_TEMPLATES: WorkflowTemplate[] = [
         data: {
           label: 'Generate',
           provider: 'chatgpt',
-          model: 'Instant',
           autoGenerate: true,
           waitForCompletion: true,
           timeout: 90000
@@ -473,15 +580,24 @@ function coerceNodeData(type: FlowNodeType, raw: Record<string, unknown>): FlowN
   }
 
   if (type === 'generate') {
-    return {
+    const mediaType = String(raw.mediaType || raw.media_type || 'image').toLowerCase() === 'video' ? 'video' : 'image'
+    const nodeData: Record<string, unknown> = {
       label,
       provider,
       model: typeof raw.model === 'string' ? raw.model : undefined,
+      mediaType,
+      aspectRatio: String(raw.aspectRatio || raw.ratio || (mediaType === 'video' ? '16:9' : '1:1')) as FlowNodeData['aspectRatio'],
+      videoDuration: typeof raw.videoDuration === 'string'
+        ? raw.videoDuration
+        : typeof raw.video_duration === 'string'
+          ? raw.video_duration
+          : undefined,
       autoGenerate: raw.autoGenerate !== false,
       waitForCompletion: raw.waitForCompletion !== false,
       timeout: Number(raw.timeout || 90000),
       prompt: raw.prompt || ''
-    } as FlowNodeData
+    }
+    return { ...nodeData, ...sanitizeGenerateDataPatch(nodeData, {}) } as FlowNodeData
   }
 
   if (type === 'delay') {
@@ -653,6 +769,14 @@ interface DrawflowConnection {
   input_class: string
 }
 
+interface DrawflowPortDragInfo {
+  nodeId: string
+  handle: string
+  side: 'in' | 'out'
+  type: DrawflowPortType
+  element: HTMLElement
+}
+
 interface DrawflowNodeRecord {
   id: string
   name: string
@@ -682,6 +806,7 @@ interface DrawflowInstance {
   canvas_x: number
   canvas_y: number
   precanvas: HTMLElement
+  node_selected: HTMLElement | null
   start: () => void
   clear: () => void
   import: (data: unknown, notify?: boolean) => void
@@ -699,8 +824,10 @@ interface DrawflowInstance {
   getNodeFromId: (id: string | number) => { pos_x: number; pos_y: number; data: FlowNodeData }
   updateNodeDataFromId: (id: string | number, data: FlowNodeData) => void
   updateConnectionNodes: (nodeId: string) => void
+  addConnection: (source: string, target: string, sourceHandle: string, targetHandle: string) => void
   removeNodeId: (id: string) => void
   removeSingleConnection: (source: string, target: string, sourceHandle: string, targetHandle: string) => void
+  contextmenu: (event: Event) => boolean | void
   zoom_in: () => void
   zoom_out: () => void
   zoom_reset: () => void
@@ -740,6 +867,8 @@ const DF_ICONS = {
   delay: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
   prompt: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l2.39 5.26L20 10l-4.5 4.13L17 20l-5-3-5 3 1.5-5.87L4 10l5.61-1.74L12 3z"/></svg>',
   wait: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/></svg>',
+  trash: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>',
+  zoom: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M11 8v6"/><path d="M8 11h6"/></svg>',
   brandFlow: '<svg width="16" height="16" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M20.616 10.835a14.147 14.147 0 0 1-4.45-3.001 14.111 14.111 0 0 1-3.678-6.452.503.503 0 0 0-.975 0 14.134 14.134 0 0 1-3.679 6.452 14.155 14.155 0 0 1-4.45 3.001c-.65.28-1.318.505-2.002.678a.502.502 0 0 0 0 .975c.684.172 1.35.397 2.002.677a14.147 14.147 0 0 1 4.45 3.001 14.112 14.112 0 0 1 3.679 6.453.502.502 0 0 0 .975 0c.172-.685.397-1.351.677-2.003a14.145 14.145 0 0 1 3.001-4.45 14.113 14.113 0 0 1 6.453-3.678.503.503 0 0 0 0-.975 13.245 13.245 0 0 1-2.003-.678z" fill="#3186FF"/></svg>',
   brandOpenAI: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M22.282 9.821a5.985 5.985 0 0 0-.516-4.91 6.046 6.046 0 0 0-6.51-2.9A6.065 6.065 0 0 0 4.981 4.18a5.985 5.985 0 0 0-3.998 2.9 6.046 6.046 0 0 0 .743 7.097 5.98 5.98 0 0 0 .51 4.911 6.051 6.051 0 0 0 6.515 2.9A5.985 5.985 0 0 0 13.26 24a6.056 6.056 0 0 0 5.772-4.206 5.99 5.99 0 0 0 3.997-2.9 6.056 6.056 0 0 0-.747-7.073zM13.26 22.43a4.476 4.476 0 0 1-2.876-1.04l.141-.081 4.779-2.758a.795.795 0 0 0 .392-.681v-6.737l2.02 1.168a.071.071 0 0 1 .038.052v5.583a4.504 4.504 0 0 1-4.494 4.494zM3.6 18.304a4.47 4.47 0 0 1-.535-3.014l.142.085 4.783 2.759a.771.771 0 0 0 .78 0l5.843-3.369v2.332a.08.08 0 0 1-.033.062L9.74 19.95a4.5 4.5 0 0 1-6.14-1.646zM2.34 7.896a4.485 4.485 0 0 1 2.366-1.973V11.6a.766.766 0 0 0 .388.676l5.815 3.355-2.02 1.168a.076.076 0 0 1-.071 0l-4.83-2.786A4.504 4.504 0 0 1 2.34 7.872zm16.597 3.855-5.833-3.387L15.119 7.2a.076.076 0 0 1 .071 0l4.83 2.791a4.494 4.494 0 0 1-.676 8.105v-5.678a.79.79 0 0 0-.407-.667zm2.01-3.023-.141-.085-4.774-2.782a.776.776 0 0 0-.785 0L9.409 9.23V6.897a.066.066 0 0 1 .028-.061l4.83-2.787a4.5 4.5 0 0 1 6.68 4.66zm-12.64 4.135-2.02-1.164a.08.08 0 0 1-.038-.057V6.075a4.5 4.5 0 0 1 7.375-3.453l-.142.08L8.704 5.46a.795.795 0 0 0-.393.681zm1.097-2.365 2.602-1.5 2.607 1.5v2.999l-2.597 1.5-2.607-1.5z"/></svg>',
   brandGrok: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M9.27 15.29l7.978-5.897c.391-.29.95-.177 1.137.272.98 2.369.542 5.215-1.41 7.169-1.951 1.954-4.667 2.382-7.149 1.406l-2.711 1.257c3.889 2.661 8.611 2.003 11.562-.953 2.341-2.344 3.066-5.539 2.388-8.42l.006.007c-.983-4.232.242-5.924 2.75-9.383.06-.082.12-.164.179-.248l-3.301 3.305v-.01L9.267 15.292M7.623 16.723c-2.792-2.67-2.31-6.801.071-9.184 1.761-1.763 4.647-2.483 7.166-1.425l2.705-1.25a7.808 7.808 0 0 0-1.829-1A8.975 8.975 0 0 0 5.984 5.83c-2.533 2.536-3.33 6.436-1.962 9.764 1.022 2.487-.653 4.246-2.34 6.022-.599.63-1.199 1.259-1.682 1.925l7.62-6.815"/></svg>'
@@ -794,12 +923,14 @@ function drawflowPortGroupsForNode(node: WorkflowNode): { in: DrawflowPortMeta[]
   }
 
   if (node.type === 'generate') {
+    const generateData = { ...(node.data as Record<string, unknown>), ...sanitizeGenerateDataPatch(node.data as Record<string, unknown>, {}) }
+    const outputType: DrawflowPortType = getGenerateMediaType(generateData) === 'video' ? 'video' : 'image'
     return {
       in: [
         { type: 'image', name: 'image', label: 'Image' },
         { type: 'text', name: 'prompt', label: 'Prompt', required: true }
       ],
-      out: [{ type: 'image', name: 'image', label: 'Image' }]
+      out: [{ type: outputType, name: outputType, label: outputType === 'video' ? 'Video' : 'Image' }]
     }
   }
 
@@ -839,6 +970,9 @@ function createOutputConnections(count: number) {
 
 function nodeConnectionType(node: WorkflowNode | undefined) {
   if (!node) return 'any'
+  if (node.type === 'generate') {
+    return getGenerateMediaType(node.data as Record<string, unknown>) === 'video' ? 'video' : 'image'
+  }
   return nodeMeta(node.type).portType
 }
 
@@ -863,9 +997,10 @@ function providerBadge(provider: unknown) {
 function nodeHoverToolbar() {
   return `
     <div class="df-hover-toolbar">
-      <button type="button" class="df-hover-btn" title="Run node">${DF_ICONS.generate}</button>
-      <button type="button" class="df-hover-btn" title="Duplicate"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
-      <button type="button" class="df-hover-btn" title="Settings"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.17a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68 1.65 1.65 0 0 0 10 3.17V3a2 2 0 0 1 4 0v.17a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.32 9c.23.61.81 1 1.51 1H21a2 2 0 0 1 0 4h-.17a1.65 1.65 0 0 0-1.43 1z"/></svg></button>
+      <button type="button" class="df-hover-btn" data-node-action="run" title="Run node">${DF_ICONS.generate}</button>
+      <button type="button" class="df-hover-btn" data-node-action="duplicate" title="Duplicate"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+      <button type="button" class="df-hover-btn" data-node-action="settings" title="Settings"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.17a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68 1.65 1.65 0 0 0 10 3.17V3a2 2 0 0 1 4 0v.17a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.32 9c.23.61.81 1 1.51 1H21a2 2 0 0 1 0 4h-.17a1.65 1.65 0 0 0-1.43 1z"/></svg></button>
+      <button type="button" class="df-hover-btn df-hover-btn-danger" data-node-action="delete" title="Delete node">${DF_ICONS.trash}</button>
     </div>
   `
 }
@@ -886,7 +1021,7 @@ function renderPillTrigger(
       data-node-field="${field}"
       data-node-value="${escapeHtml(value)}"
       aria-haspopup="listbox"
-      aria-label="${field === 'provider' ? 'Provider' : 'Aspect ratio'}"
+      aria-label="${pillFieldLabel(field)}"
     >
       <span class="df-node-pill-label">${escapeHtml(label)}</span>
       <span class="df-node-select-chevron" aria-hidden="true">
@@ -900,20 +1035,23 @@ function renderPillTrigger(
 
 function renderDrawflowNode(node: WorkflowNode) {
   const data = node.data as Record<string, unknown>
+  const generateData = node.type === 'generate'
+    ? { ...data, ...sanitizeGenerateDataPatch(data, {}) }
+    : data
   const meta = nodeMeta(node.type)
   const label = escapeHtml(data.label || meta.title)
-  const provider = providerSlug(data.provider)
+  const provider = providerSlug(generateData.provider)
   const prompt = escapeHtml(String(data.prompt || '').slice(0, 150))
   const enabled = data.enabled !== false
-  const providerPill = node.type === 'generate' ? providerBadge(data.provider) : ''
+  const providerPill = node.type === 'generate' ? providerBadge(generateData.provider) : ''
   const aspectRatio = String(data.aspectRatio || '1:1')
   const ratioClass = `ratio-${aspectRatio.replace(':', '-')}`
 
   let body = ''
   if (node.type === 'prompt') {
     body = prompt
-      ? `<div class="df-node-prompt">${prompt}</div>`
-      : '<div class="df-node-prompt df-node-prompt-empty">Empty prompt</div>'
+      ? `<div class="df-node-prompt df-node-prompt-inline" data-prompt-editable="true">${prompt}</div>`
+      : '<div class="df-node-prompt df-node-prompt-inline df-node-prompt-empty" data-prompt-editable="true">Empty prompt</div>'
     body += `
       <div class="df-node-settings-bar">
         ${renderPillTrigger('provider', String(data.provider || 'chatgpt'), PROVIDER_OPTIONS)}
@@ -921,29 +1059,50 @@ function renderDrawflowNode(node: WorkflowNode) {
       </div>
     `
   } else if (node.type === 'image') {
+    const imageSrc = String(data.imageData || data.imageUrl || '')
     body = `
-      <div class="df-node-preview ${ratioClass}">
-        <div class="df-node-preview-placeholder">${DF_ICONS.image}</div>
+      <div class="df-node-preview df-node-image-upload-target ${imageSrc ? 'has-image' : ''} ${ratioClass}" data-image-upload-target="true">
+        ${
+          imageSrc
+            ? `
+              <img class="df-node-preview-image" src="${escapeHtml(imageSrc)}" alt="">
+              <button type="button" class="df-node-image-preview-button nodrag" data-node-action="preview-image" title="Preview image" aria-label="Preview image">
+                ${DF_ICONS.zoom}
+              </button>
+            `
+            : `<div class="df-node-preview-placeholder">${DF_ICONS.image}</div>`
+        }
       </div>
       <div class="df-node-settings-bar">
         ${renderPillTrigger('provider', String(data.provider || 'chatgpt'), PROVIDER_OPTIONS)}
-        <span class="df-node-tag">${data.imageUrl ? 'Image linked' : 'No images'}</span>
+        <span class="df-node-tag">${imageSrc ? escapeHtml(data.imageName || 'Image loaded') : 'No images'}</span>
         ${renderPillTrigger('aspectRatio', aspectRatio, ASPECT_RATIO_OPTIONS)}
       </div>
     `
   } else if (node.type === 'generate') {
-    const ratio = escapeHtml(aspectRatio)
+    const mediaType = getGenerateMediaType(generateData)
+    const ratioOptions = getGenerateAspectRatioOptions(generateData)
+    const modelOptions = getGenerateModelOptions(generateData)
+    const durationOptions = getGenerateVideoDurationOptions(generateData)
+    const generateAspectRatio = String(generateData.aspectRatio || ratioOptions[0] || '1:1')
+    const generateRatioClass = `ratio-${generateAspectRatio.replace(':', '-')}`
+    const generateModel = String(generateData.model || modelOptions[0] || '')
+    const generateDuration = String(generateData.videoDuration || durationOptions[0] || VIDEO_DURATION_OPTIONS[1])
+    const supportsVideo = generateProviderSupportsVideo(generateData.provider)
     const mode = data.autoGenerate === false ? 'Manual' : 'Auto'
     body = `
       <div class="df-node-preview-wrap">
-        <div class="df-node-preview ${ratioClass}">
-          <div class="df-node-preview-placeholder">${DF_ICONS.image}</div>
+        <div class="df-node-preview ${generateRatioClass}">
+          <div class="df-node-preview-placeholder">${mediaType === 'video' ? DF_ICONS.generate : DF_ICONS.image}</div>
         </div>
         ${prompt ? `<div class="df-node-prompt df-node-prompt-overlay nodrag">${prompt}</div>` : ''}
       </div>
       <div class="df-node-settings-bar">
-        ${renderPillTrigger('provider', String(data.provider || 'chatgpt'), PROVIDER_OPTIONS)}
-        ${renderPillTrigger('aspectRatio', ratio, ASPECT_RATIO_OPTIONS)}
+        ${renderPillTrigger('provider', String(generateData.provider || 'chatgpt'), PROVIDER_OPTIONS)}
+        ${supportsVideo ? renderPillTrigger('mediaType', mediaType, GENERATE_MEDIA_TYPE_OPTIONS) : ''}
+        ${modelOptions.length ? renderPillTrigger('model', generateModel, modelOptions) : ''}
+        ${mediaType === 'video' ? renderPillTrigger('videoDuration', generateDuration, durationOptions) : ''}
+        ${renderPillTrigger('aspectRatio', generateAspectRatio, ratioOptions)}
         <button type="button" class="df-node-tag df-node-tag-editable"><span>${mode}</span></button>
       </div>
     `
@@ -1030,7 +1189,7 @@ function buildDrawflowData(workflow: Workflow) {
 
 function getWorkflowStructureSignature(workflow: Workflow) {
   const nodes = workflow.nodes
-    .map((node) => `${node.id}:${node.type}:${Math.round(node.position.x)}:${Math.round(node.position.y)}`)
+    .map((node) => `${node.id}:${node.type}`)
     .join('|')
   const edges = workflow.edges
     .map((edge) => `${edge.source}:${edge.target}:${edge.sourceHandle || ''}:${edge.targetHandle || ''}`)
@@ -1061,6 +1220,23 @@ const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, onClose }) => {
 
   const data = node.data as Record<string, unknown>
   const update = (field: string, value: unknown) => updateNode(node.id, { [field]: value } as Partial<FlowNodeData>)
+  const updateGenerate = (patch: Record<string, unknown>) => {
+    updateNode(node.id, sanitizeGenerateDataPatch(data, patch) as Partial<FlowNodeData>)
+  }
+  const generateData = node.type === 'generate'
+    ? { ...data, ...sanitizeGenerateDataPatch(data, {}) }
+    : data
+  const generateProvider = String(generateData.provider || 'chatgpt')
+  const generateSupportsVideo = node.type === 'generate' && generateProviderSupportsVideo(generateProvider)
+  const generateMediaType = node.type === 'generate' ? getGenerateMediaType(generateData) : 'image'
+  const generateModelOptions = node.type === 'generate' ? getGenerateModelOptions(generateData) : []
+  const generateDurationOptions = node.type === 'generate' ? getGenerateVideoDurationOptions(generateData) : []
+  const aspectRatioOptions = node.type === 'generate' ? getGenerateAspectRatioOptions(generateData) : ASPECT_RATIO_OPTIONS
+  const aspectRatioValue = node.type === 'generate'
+    ? String(generateData.aspectRatio || aspectRatioOptions[0] || '1:1')
+    : String(data.aspectRatio || '1:1')
+  const generateModelValue = String(generateData.model || generateModelOptions[0] || '')
+  const generateDurationValue = String(generateData.videoDuration || generateDurationOptions[0] || VIDEO_DURATION_OPTIONS[1])
   const fieldLabelClass = 'mb-1.5 block text-[11px] font-medium text-white/50'
   const fieldControlClass = 'h-8 w-full rounded-lg border border-white/5 bg-[#141414] px-2.5 text-[11px] text-white/60 outline-none transition-colors placeholder:text-white/25 focus:border-white/10 focus:ring-1 focus:ring-white/10'
   const fieldSelectClass = cn(fieldControlClass, 'appearance-none pr-8 [background-image:none]')
@@ -1111,11 +1287,33 @@ const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, onClose }) => {
             <span className={fieldLabelClass}>Provider</span>
             <div className="relative">
               <select
-                value={String(data.provider || 'chatgpt')}
-                onChange={(event) => update('provider', event.target.value as AIProvider)}
+                value={node.type === 'generate' ? generateProvider : String(data.provider || 'chatgpt')}
+                onChange={(event) => (
+                  node.type === 'generate'
+                    ? updateGenerate({ provider: event.target.value as AIProvider })
+                    : update('provider', event.target.value as AIProvider)
+                )}
                 className={fieldSelectClass}
               >
                 {PROVIDER_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+              <ChevronDown className={selectIconClass} />
+            </div>
+          </label>
+        )}
+
+        {generateSupportsVideo && (
+          <label className="block">
+            <span className={fieldLabelClass}>Media Type</span>
+            <div className="relative">
+              <select
+                value={generateMediaType}
+                onChange={(event) => updateGenerate({ mediaType: event.target.value })}
+                className={fieldSelectClass}
+              >
+                {GENERATE_MEDIA_TYPE_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>{option.label}</option>
                 ))}
               </select>
@@ -1136,7 +1334,7 @@ const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, onClose }) => {
           </label>
         )}
 
-        {(node.type === 'prompt' || node.type === 'generate') && (
+        {node.type === 'prompt' && (
           <label className="block">
             <span className={fieldLabelClass}>Model</span>
             <input
@@ -1148,16 +1346,56 @@ const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, onClose }) => {
           </label>
         )}
 
+        {node.type === 'generate' && generateModelOptions.length > 0 && (
+          <label className="block">
+            <span className={fieldLabelClass}>Model</span>
+            <div className="relative">
+              <select
+                value={generateModelValue}
+                onChange={(event) => updateGenerate({ model: event.target.value })}
+                className={fieldSelectClass}
+              >
+                {generateModelOptions.map((model) => (
+                  <option key={model} value={model}>{model}</option>
+                ))}
+              </select>
+              <ChevronDown className={selectIconClass} />
+            </div>
+          </label>
+        )}
+
+        {node.type === 'generate' && generateMediaType === 'video' && (
+          <label className="block">
+            <span className={fieldLabelClass}>Duration</span>
+            <div className="relative">
+              <select
+                value={generateDurationValue}
+                onChange={(event) => updateGenerate({ videoDuration: event.target.value })}
+                className={fieldSelectClass}
+              >
+                {generateDurationOptions.map((duration) => (
+                  <option key={duration} value={duration}>{duration}</option>
+                ))}
+              </select>
+              <ChevronDown className={selectIconClass} />
+            </div>
+          </label>
+        )}
+
         {(node.type === 'image' || node.type === 'generate') && (
           <label className="block">
             <span className={fieldLabelClass}>Aspect Ratio</span>
             <div className="relative">
               <select
-                value={String(data.aspectRatio || '1:1')}
-                onChange={(event) => update('aspectRatio', event.target.value)}
+                value={aspectRatioValue}
+                onChange={(event) => (
+                  node.type === 'generate'
+                    ? updateGenerate({ aspectRatio: event.target.value })
+                    : update('aspectRatio', event.target.value)
+                )}
                 className={fieldSelectClass}
               >
-                {ASPECT_RATIO_OPTIONS.map((ratio) => (
+                {aspectRatioOptions.map((ratio) => (
                   <option key={ratio} value={ratio}>{ratio}</option>
                 ))}
               </select>
@@ -1319,6 +1557,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const nodePickerSpawnRef = useRef<{ x: number; y: number } | null>(null)
   const nodePickerRef = useRef<HTMLDivElement | null>(null)
   const nodePillMenuRef = useRef<HTMLDivElement | null>(null)
+  const selectionMouseDownRef = useRef<{ nodeId: string | null; clearOnUnselect: boolean } | null>(null)
+  const portDragCleanupRef = useRef<(() => void) | null>(null)
 
   const [isPaletteOpen, setIsPaletteOpen] = useState(false)
   const [nodePickerSearch, setNodePickerSearch] = useState('')
@@ -1327,6 +1567,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const [nodePillMenu, setNodePillMenu] = useState<NodePillMenuState | null>(null)
   const [showLogs, setShowLogs] = useState(false)
   const [zoomLevel, setZoomLevel] = useState(100)
+  const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null)
 
   const activeTask = tasks.find((task) => task.id === activeTaskId)
   const taskLogs = logs.filter((log) => log.pipelineId === activeTaskId).slice(0, 24)
@@ -1448,6 +1689,19 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     }
   }, [nodePillMenu])
 
+  useEffect(() => {
+    if (!imagePreview) return
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setImagePreview(null)
+    }
+
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [imagePreview])
+
   const handleCanvasContextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement | null
     if (target?.closest('.tobyflow-node-picker, .tobyflow-wf-toolbar, button, input, textarea, select')) return
@@ -1516,6 +1770,86 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     }
   }
 
+  const rerenderDrawflowNode = (nodeId: string) => {
+    const editor = editorRef.current
+    const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
+    if (!editor || !node) return
+
+    const content = canvasRef.current?.querySelector(`#node-${CSS.escape(node.id)} .drawflow_content_node`)
+    if (content) content.innerHTML = renderDrawflowNode(node)
+    applyPortAttributesForNode(node)
+    editor.updateConnectionNodes(`node-${node.id}`)
+    scheduleConnectionSync()
+  }
+
+  const getPortDragInfo = (target: EventTarget | null): DrawflowPortDragInfo | null => {
+    const element = target instanceof Element
+      ? target.closest<HTMLElement>('.input[data-port-type], .output[data-port-type]')
+      : null
+    const nodeEl = element?.closest<HTMLElement>('.drawflow-node')
+    if (!element || !nodeEl) return null
+
+    const side = element.classList.contains('output') ? 'out' : 'in'
+    const handle = Array.from(element.classList).find((className) =>
+      side === 'out' ? className.startsWith('output_') : className.startsWith('input_')
+    )
+    const type = element.dataset.portType as DrawflowPortType | undefined
+    if (!handle || !type) return null
+
+    return {
+      nodeId: nodeEl.id.replace(/^node-/, ''),
+      handle,
+      side,
+      type,
+      element
+    }
+  }
+
+  const getPortInfoByHandle = (nodeId: string, side: 'in' | 'out', handle: string): DrawflowPortDragInfo | null => {
+    const selector = `#node-${CSS.escape(nodeId)} .${side === 'out' ? 'output' : 'input'}.${CSS.escape(handle)}`
+    return getPortDragInfo(canvasRef.current?.querySelector(selector) || null)
+  }
+
+  const normalizePortConnection = (first: DrawflowPortDragInfo | null, second: DrawflowPortDragInfo | null) => {
+    if (!first || !second) return null
+    if (first.nodeId === second.nodeId) return null
+    if (first.side === second.side) return null
+    if (first.type !== second.type) return null
+
+    return first.side === 'out'
+      ? { source: first, target: second }
+      : { source: second, target: first }
+  }
+
+  const hasWorkflowEdge = (sourceId: string, targetId: string, sourceHandle: string, targetHandle: string) => {
+    return workflowRef.current.edges.some((edge) =>
+      edge.source === sourceId &&
+      edge.target === targetId &&
+      (edge.sourceHandle || 'output_1') === sourceHandle &&
+      (edge.targetHandle || 'input_1') === targetHandle
+    )
+  }
+
+  const addPortConnection = (first: DrawflowPortDragInfo | null, second: DrawflowPortDragInfo | null) => {
+    const normalized = normalizePortConnection(first, second)
+    const editor = editorRef.current
+    if (!normalized || !editor) return false
+
+    const { source, target } = normalized
+    if (hasWorkflowEdge(source.nodeId, target.nodeId, source.handle, target.handle)) return false
+
+    editor.addConnection(source.nodeId, target.nodeId, source.handle, target.handle)
+    requestAnimationFrame(applyPortAttributes)
+    scheduleConnectionSync()
+    return true
+  }
+
+  const isConnectionCompatible = (connection: DrawflowConnection) => {
+    const source = getPortInfoByHandle(String(connection.output_id), 'out', connection.output_class || 'output_1')
+    const target = getPortInfoByHandle(String(connection.input_id), 'in', connection.input_class || 'input_1')
+    return Boolean(normalizePortConnection(source, target))
+  }
+
   const syncConnectionOverlays = () => {
     const canvas = canvasRef.current
     if (!canvas) return
@@ -1530,7 +1864,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
 
       if (isPendingConnection) {
         connection.querySelector<SVGPathElement>('path.main-path-overlay')?.remove()
-        connection.classList.remove('conn-type-frame', 'conn-type-text', 'conn-type-image', 'conn-type-any', 'conn-node-selected')
+        connection.classList.remove('conn-type-frame', 'conn-type-text', 'conn-type-image', 'conn-type-video', 'conn-type-any', 'conn-node-selected')
         return
       }
 
@@ -1551,7 +1885,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         overlayObserversRef.current.set(mainPath, observer)
       }
 
-      connection.classList.remove('conn-type-frame', 'conn-type-text', 'conn-type-image', 'conn-type-any')
+      connection.classList.remove('conn-type-frame', 'conn-type-text', 'conn-type-image', 'conn-type-video', 'conn-type-any')
       const sourceClass = classNames.find((className) => className.startsWith('node_out_node-'))
       const targetClass = classNames.find((className) => className.startsWith('node_in_node-'))
       const inputClass = classNames.find((className) => className.startsWith('input_'))
@@ -1562,7 +1896,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         : null
       const sourceNode = workflowRef.current.nodes.find((node) => node.id === sourceId)
       const connectionType = targetPortType === 'frame' || targetPortType === 'video'
-        ? 'frame'
+        ? targetPortType
         : targetPortType === 'text' || targetPortType === 'image'
           ? targetPortType
           : nodeConnectionType(sourceNode)
@@ -1583,6 +1917,25 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       connectionSyncFrameRef.current = null
       syncConnectionOverlays()
     })
+  }
+
+  const syncSelectedNodeDom = (selectedId = useWorkflowStore.getState().selectedNodeId) => {
+    const canvas = canvasRef.current
+    const editor = editorRef.current
+    if (!canvas) return
+
+    let selectedEl: HTMLElement | null = null
+    canvas.querySelectorAll<HTMLElement>('.drawflow-node.selected').forEach((el) => {
+      if (!selectedId || el.id !== `node-${selectedId}`) el.classList.remove('selected')
+    })
+
+    if (selectedId) {
+      selectedEl = canvas.querySelector<HTMLElement>(`#node-${CSS.escape(selectedId)}`)
+      selectedEl?.classList.add('selected')
+    }
+
+    if (editor) editor.node_selected = selectedEl
+    scheduleConnectionSync()
   }
 
   const applyCanvasZoom = (nextZoom: number, anchor?: { x: number; y: number }) => {
@@ -1621,6 +1974,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       for (const node of workflowRef.current.nodes) {
         editor.updateConnectionNodes(`node-${node.id}`)
       }
+      syncSelectedNodeDom()
       scheduleConnectionSync()
       refreshZoom()
     })
@@ -1642,14 +1996,27 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     editor.zoom_min = 0.35
     editor.zoom_max = 1.6
     editor.zoom_value = 0.1
+    editor.contextmenu = (event: Event) => {
+      event.preventDefault()
+      return false
+    }
     editor.start()
 
     editor.on('nodeSelected', (id: string | number) => {
       setSelectedNode(String(id))
+      requestAnimationFrame(() => syncSelectedNodeDom(String(id)))
     })
 
     editor.on('nodeUnselected', () => {
-      setSelectedNode(null)
+      const selectionIntent = selectionMouseDownRef.current
+      if (selectionIntent?.nodeId) {
+        requestAnimationFrame(() => syncSelectedNodeDom(selectionIntent.nodeId))
+        return
+      }
+
+      if (!selectionIntent || selectionIntent.clearOnUnselect) {
+        setSelectedNode(null)
+      }
     })
 
     editor.on('nodeMoved', (id: string | number) => {
@@ -1664,6 +2031,20 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
 
     editor.on('connectionCreated', (connection: DrawflowConnection) => {
       if (suppressEdgeEventRef.current) return
+      if (!isConnectionCompatible(connection)) {
+        suppressEdgeEventRef.current = true
+        editor.removeSingleConnection(
+          String(connection.output_id),
+          String(connection.input_id),
+          connection.output_class || 'output_1',
+          connection.input_class || 'input_1'
+        )
+        suppressEdgeEventRef.current = false
+        requestAnimationFrame(applyPortAttributes)
+        scheduleConnectionSync()
+        return
+      }
+
       addEdgeToStore({
         source: String(connection.output_id),
         target: String(connection.input_id),
@@ -1698,15 +2079,243 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     editor.on('translate', scheduleConnectionSync)
     editor.on('connectionStart', scheduleConnectionSync)
     editor.on('connectionCancel', scheduleConnectionSync)
-    editor.on('mouseUp', scheduleConnectionSync)
+    editor.on('mouseUp', () => {
+      selectionMouseDownRef.current = null
+      scheduleConnectionSync()
+    })
     editor.on('rerouteMoved', scheduleConnectionSync)
     editor.on('addReroute', scheduleConnectionSync)
     editor.on('removeReroute', scheduleConnectionSync)
 
     const syncOnPointerMove = () => scheduleConnectionSync()
+    const canvasPointFromClient = (clientX: number, clientY: number) => {
+      const rect = editor.precanvas.getBoundingClientRect()
+      const zoom = editor.zoom || 1
+      return {
+        x: (clientX - rect.left) / zoom,
+        y: (clientY - rect.top) / zoom
+      }
+    }
+    const portCenterPoint = (element: HTMLElement) => {
+      const rect = element.getBoundingClientRect()
+      return canvasPointFromClient(rect.left + rect.width / 2, rect.top + rect.height / 2)
+    }
+    const portDragPath = (start: { x: number; y: number }, end: { x: number; y: number }, startSide: 'in' | 'out') => {
+      const direction = startSide === 'out' ? 1 : -1
+      const distance = Math.max(80, Math.abs(end.x - start.x) * 0.5)
+      return `M ${start.x} ${start.y} C ${start.x + direction * distance} ${start.y} ${end.x - direction * distance} ${end.y} ${end.x} ${end.y}`
+    }
+    const startInputPortDrag = (startPort: DrawflowPortDragInfo, event: MouseEvent) => {
+      portDragCleanupRef.current?.()
+
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path')
+      const start = portCenterPoint(startPort.element)
+      svg.classList.add('connection', 'df-port-drag-connection', `conn-type-${startPort.type}`)
+      svg.style.pointerEvents = 'none'
+      path.classList.add('main-path')
+      path.setAttribute('fill', 'none')
+      svg.appendChild(path)
+      editor.precanvas.appendChild(svg)
+
+      const updatePath = (moveEvent: MouseEvent) => {
+        const end = canvasPointFromClient(moveEvent.clientX, moveEvent.clientY)
+        path.setAttribute('d', portDragPath(start, end, startPort.side))
+      }
+      const cleanup = () => {
+        document.removeEventListener('mousemove', updatePath, true)
+        document.removeEventListener('mouseup', handleMouseUp, true)
+        svg.remove()
+        if (portDragCleanupRef.current === cleanup) portDragCleanupRef.current = null
+        scheduleConnectionSync()
+      }
+      const handleMouseUp = (upEvent: MouseEvent) => {
+        const target = document.elementFromPoint(upEvent.clientX, upEvent.clientY)
+        const endPort = getPortDragInfo(target)
+        addPortConnection(startPort, endPort)
+        cleanup()
+      }
+
+      updatePath(event)
+      portDragCleanupRef.current = cleanup
+      document.addEventListener('mousemove', updatePath, true)
+      document.addEventListener('mouseup', handleMouseUp, true)
+    }
+    const handleBidirectionalPortMouseDown = (event: MouseEvent) => {
+      if (event.button !== 0) return
+
+      const port = getPortDragInfo(event.target)
+      if (!port || port.side !== 'in') return
+
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      selectionMouseDownRef.current = { nodeId: null, clearOnUnselect: false }
+      startInputPortDrag(port, event)
+    }
+    const handleSelectionMouseDown = (event: MouseEvent) => {
+      if (event.button !== 0) return
+
+      const target = event.target as HTMLElement | null
+      if (!target) return
+
+      const nodeEl = target.closest<HTMLElement>('.drawflow-node')
+      const outputPort = target.closest('.output')
+      const inputPort = target.closest('.input')
+      const connectionPath = target.closest('.main-path, svg.connection')
+      const canvasSurface = !nodeEl && Boolean(target.closest('.drawflow, .parent-drawflow'))
+      const nodeId = nodeEl && !outputPort && !inputPort ? nodeEl.id.replace(/^node-/, '') : null
+
+      selectionMouseDownRef.current = {
+        nodeId,
+        clearOnUnselect: Boolean(outputPort || connectionPath || canvasSurface)
+      }
+
+      if (nodeId) {
+        setSelectedNode(nodeId)
+        requestAnimationFrame(() => syncSelectedNodeDom(nodeId))
+      } else if (canvasSurface || connectionPath) {
+        setSelectedNode(null)
+      }
+    }
+    const handlePromptInlineEdit = (event: MouseEvent) => {
+      const target = event.target instanceof Element ? event.target : null
+      if (!target || target.closest('.df-node-prompt-editor')) return
+
+      const promptEl = target.closest<HTMLElement>('[data-prompt-editable="true"]')
+      const nodeEl = promptEl?.closest<HTMLElement>('.df-node[data-workflow-node-id]')
+      const nodeId = nodeEl?.dataset.workflowNodeId
+      if (!promptEl || !nodeId) return
+
+      const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
+      if (!node || node.type !== 'prompt') return
+
+      event.preventDefault()
+      event.stopPropagation()
+      closeNodePillMenu()
+      setSelectedNode(nodeId)
+
+      const currentPrompt = String((node.data as Record<string, unknown>).prompt || '')
+      let finished = false
+      const textarea = document.createElement('textarea')
+      textarea.className = 'df-node-prompt-editor nodrag'
+      textarea.value = currentPrompt
+      textarea.placeholder = 'Enter prompt...'
+      textarea.spellcheck = true
+
+      const resize = () => {
+        textarea.style.height = '0px'
+        textarea.style.height = `${Math.min(170, Math.max(74, textarea.scrollHeight))}px`
+        editor.updateConnectionNodes(`node-${nodeId}`)
+        scheduleConnectionSync()
+      }
+      const finish = (commit: boolean) => {
+        if (finished) return
+        finished = true
+        textarea.removeEventListener('input', resize)
+        textarea.removeEventListener('blur', commitEdit)
+        textarea.removeEventListener('keydown', handleEditorKeyDown)
+        textarea.removeEventListener('mousedown', stopEditorEvent)
+        textarea.removeEventListener('click', stopEditorEvent)
+        textarea.removeEventListener('dblclick', stopEditorEvent)
+
+        if (commit) {
+          updateNode(nodeId, { prompt: textarea.value } as Partial<FlowNodeData>)
+        } else {
+          rerenderDrawflowNode(nodeId)
+        }
+      }
+      const commitEdit = () => finish(true)
+      const stopEditorEvent = (editorEvent: Event) => {
+        editorEvent.stopPropagation()
+      }
+      const handleEditorKeyDown = (keyboardEvent: KeyboardEvent) => {
+        keyboardEvent.stopPropagation()
+        if (keyboardEvent.key === 'Escape') {
+          keyboardEvent.preventDefault()
+          finish(false)
+          return
+        }
+        if (keyboardEvent.key === 'Enter' && (keyboardEvent.ctrlKey || keyboardEvent.metaKey)) {
+          keyboardEvent.preventDefault()
+          finish(true)
+        }
+      }
+
+      promptEl.classList.remove('df-node-prompt-empty')
+      promptEl.classList.add('editing')
+      promptEl.textContent = ''
+      promptEl.appendChild(textarea)
+
+      textarea.addEventListener('input', resize)
+      textarea.addEventListener('blur', commitEdit)
+      textarea.addEventListener('keydown', handleEditorKeyDown)
+      textarea.addEventListener('mousedown', stopEditorEvent)
+      textarea.addEventListener('click', stopEditorEvent)
+      textarea.addEventListener('dblclick', stopEditorEvent)
+
+      requestAnimationFrame(() => {
+        textarea.focus()
+        textarea.selectionStart = textarea.value.length
+        textarea.selectionEnd = textarea.value.length
+        resize()
+      })
+    }
+    const handleImageNodeUpload = (event: MouseEvent) => {
+      const target = event.target instanceof Element ? event.target : null
+      if (!target) return
+      if (target.closest('.df-node-pill-trigger, .df-hover-btn, button, input, textarea, select, .input, .output')) return
+
+      const uploadTarget = target.closest<HTMLElement>('[data-image-upload-target="true"]')
+      const nodeEl = (uploadTarget || target).closest<HTMLElement>('.df-node[data-workflow-node-id][data-node-type="image"]')
+      const nodeId = nodeEl?.dataset.workflowNodeId
+      if (!nodeId) return
+
+      const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
+      if (!node || node.type !== 'image') return
+
+      event.preventDefault()
+      event.stopPropagation()
+      closeNodePillMenu()
+      setSelectedNode(nodeId)
+
+      const input = document.createElement('input')
+      input.type = 'file'
+      input.accept = 'image/*'
+      input.style.display = 'none'
+
+      const cleanup = () => {
+        input.remove()
+      }
+
+      input.addEventListener('change', () => {
+        const file = input.files?.[0]
+        if (!file || !file.type.startsWith('image/')) {
+          cleanup()
+          return
+        }
+
+        const reader = new FileReader()
+        reader.onload = () => {
+          const imageData = typeof reader.result === 'string' ? reader.result : ''
+          if (imageData) {
+            updateNode(nodeId, {
+              imageData,
+              imageUrl: '',
+              imageName: file.name
+            } as Partial<FlowNodeData>)
+          }
+          cleanup()
+        }
+        reader.onerror = cleanup
+        reader.readAsDataURL(file)
+      }, { once: true })
+
+      document.body.appendChild(input)
+      input.click()
+    }
     const stopNodePillDragStart = (event: MouseEvent) => {
       const target = event.target as HTMLElement | null
-      if (!target?.closest('.df-node-pill-trigger')) return
+      if (!target?.closest('.df-node-pill-trigger, .df-hover-btn, .df-node-prompt-editor, .df-node-image-upload-target')) return
       event.stopPropagation()
     }
     const handleNodePillClick = (event: MouseEvent) => {
@@ -1720,6 +2329,24 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       const nodeId = nodeEl?.dataset.workflowNodeId
       const field = trigger.dataset.nodeField as NodePillField | undefined
       if (!nodeId || !field) return
+      const currentNode = workflowRef.current.nodes.find((item) => item.id === nodeId)
+      const currentData = currentNode?.type === 'generate'
+        ? {
+            ...(currentNode.data as Record<string, unknown>),
+            ...sanitizeGenerateDataPatch(currentNode.data as Record<string, unknown>, {})
+          }
+        : ((currentNode?.data || {}) as Record<string, unknown>)
+      const options = getPillOptions(field, currentData)
+      if (options.length === 0) return
+      const value = field === 'mediaType'
+        ? getGenerateMediaType(currentData)
+        : field === 'model'
+          ? String(currentData.model || options[0]?.value || '')
+          : field === 'videoDuration'
+            ? String(currentData.videoDuration || options[0]?.value || '')
+            : field === 'aspectRatio'
+              ? String(currentData.aspectRatio || options[0]?.value || '')
+              : String(currentData.provider || trigger.dataset.nodeValue || '')
 
       setSelectedNode(nodeId)
       setNodePillMenu((current) => (
@@ -1728,11 +2355,53 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
           : {
               nodeId,
               field,
-              value: trigger.dataset.nodeValue || '',
+              value,
               trigger,
-              options: getPillOptions(field)
+              options
             }
       ))
+    }
+    const handleNodeToolbarClick = (event: MouseEvent) => {
+      const button = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('.df-hover-btn[data-node-action]')
+      if (!button) return
+
+      event.preventDefault()
+      event.stopPropagation()
+
+      const nodeEl = button.closest<HTMLElement>('.df-node[data-workflow-node-id]')
+      const nodeId = nodeEl?.dataset.workflowNodeId
+      if (!nodeId) return
+
+      const action = button.dataset.nodeAction
+      setSelectedNode(nodeId)
+      if (action === 'delete') {
+        closeNodePillMenu()
+        deleteNode(nodeId)
+      }
+    }
+    const handleImagePreviewClick = (event: MouseEvent) => {
+      const target = event.target instanceof Element ? event.target : null
+      const button = target?.closest<HTMLButtonElement>('.df-node-image-preview-button[data-node-action="preview-image"]')
+      if (!button) return
+
+      event.preventDefault()
+      event.stopPropagation()
+
+      const nodeEl = button.closest<HTMLElement>('.df-node[data-workflow-node-id][data-node-type="image"]')
+      const nodeId = nodeEl?.dataset.workflowNodeId
+      if (!nodeId) return
+
+      const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
+      const data = (node?.data || {}) as Record<string, unknown>
+      const imageSrc = String(data.imageData || data.imageUrl || '')
+      if (!node || node.type !== 'image' || !imageSrc) return
+
+      closeNodePillMenu()
+      setSelectedNode(nodeId)
+      setImagePreview({
+        src: imageSrc,
+        name: String(data.imageName || data.label || 'Image')
+      })
     }
     const zoomOnWheel = (event: WheelEvent) => {
       const target = event.target as HTMLElement | null
@@ -1757,8 +2426,14 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     canvasEl.addEventListener('mousemove', syncOnPointerMove)
     canvasEl.addEventListener('pointermove', syncOnPointerMove)
     canvasEl.addEventListener('touchmove', syncOnPointerMove)
+    canvasEl.addEventListener('mousedown', handleBidirectionalPortMouseDown, true)
+    canvasEl.addEventListener('mousedown', handleSelectionMouseDown, true)
     canvasEl.addEventListener('mousedown', stopNodePillDragStart, true)
+    canvasEl.addEventListener('dblclick', handlePromptInlineEdit)
+    canvasEl.addEventListener('dblclick', handleImageNodeUpload)
     canvasEl.addEventListener('click', handleNodePillClick)
+    canvasEl.addEventListener('click', handleNodeToolbarClick)
+    canvasEl.addEventListener('click', handleImagePreviewClick)
     canvasEl.addEventListener('wheel', zoomOnWheel, { passive: false })
 
     editorRef.current = editor
@@ -1772,10 +2447,17 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       canvasEl.removeEventListener('mousemove', syncOnPointerMove)
       canvasEl.removeEventListener('pointermove', syncOnPointerMove)
       canvasEl.removeEventListener('touchmove', syncOnPointerMove)
+      canvasEl.removeEventListener('mousedown', handleBidirectionalPortMouseDown, true)
+      canvasEl.removeEventListener('mousedown', handleSelectionMouseDown, true)
       canvasEl.removeEventListener('mousedown', stopNodePillDragStart, true)
+      canvasEl.removeEventListener('dblclick', handlePromptInlineEdit)
+      canvasEl.removeEventListener('dblclick', handleImageNodeUpload)
       canvasEl.removeEventListener('click', handleNodePillClick)
+      canvasEl.removeEventListener('click', handleNodeToolbarClick)
+      canvasEl.removeEventListener('click', handleImagePreviewClick)
       canvasEl.removeEventListener('wheel', zoomOnWheel)
       editorRef.current = null
+      portDragCleanupRef.current?.()
       canvasEl.replaceChildren()
     }
   }, [addEdgeToStore, deleteEdge, deleteNode, setSelectedNode, updateNode, updateNodePosition])
@@ -1803,16 +2485,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   }, [dataSignature, workflow.nodes])
 
   useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-    canvas.querySelectorAll('.drawflow-node.selected').forEach((el) => {
-      el.classList.remove('selected')
-    })
-    if (selectedNodeId) {
-      const nodeEl = canvas.querySelector(`#node-${CSS.escape(selectedNodeId)}`)
-      nodeEl?.classList.add('selected')
-    }
-    scheduleConnectionSync()
+    syncSelectedNodeDom(selectedNodeId)
   }, [selectedNodeId])
 
   const handleAddNode = (type: FlowNodeType) => {
@@ -1921,9 +2594,23 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const handleNodePillOptionSelect = (option: NodePillOption) => {
     if (!nodePillMenu) return
 
-    if (nodePillMenu.field === 'provider') {
+    const currentNode = workflowRef.current.nodes.find((node) => node.id === nodePillMenu.nodeId)
+    const currentData = (currentNode?.data || {}) as Record<string, unknown>
+    if (currentNode?.type === 'generate') {
+      const patchByField: Record<NodePillField, Record<string, unknown>> = {
+        provider: { provider: option.value as AIProvider },
+        mediaType: { mediaType: option.value },
+        model: { model: option.value },
+        videoDuration: { videoDuration: option.value },
+        aspectRatio: { aspectRatio: option.value }
+      }
+      updateNode(
+        nodePillMenu.nodeId,
+        sanitizeGenerateDataPatch(currentData, patchByField[nodePillMenu.field]) as Partial<FlowNodeData>
+      )
+    } else if (nodePillMenu.field === 'provider') {
       updateNode(nodePillMenu.nodeId, { provider: option.value as AIProvider } as Partial<FlowNodeData>)
-    } else {
+    } else if (nodePillMenu.field === 'aspectRatio') {
       updateNode(nodePillMenu.nodeId, { aspectRatio: option.value } as Partial<FlowNodeData>)
     }
 
@@ -2140,10 +2827,10 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
               className="df-node-pill-menu"
               style={{ '--df-pill-menu-scale': String(nodePillMenuScale) } as React.CSSProperties}
               role="listbox"
-              aria-label={nodePillMenu.field === 'provider' ? 'Provider' : 'Aspect ratio'}
+              aria-label={pillFieldLabel(nodePillMenu.field)}
             >
               <div className="df-node-pill-menu-title">
-                {nodePillMenu.field === 'provider' ? 'Provider' : 'Aspect ratio'}
+                {pillFieldLabel(nodePillMenu.field)}
               </div>
               <div className="df-node-pill-menu-list">
                 {nodePillMenu.options.map((option) => {
@@ -2162,6 +2849,41 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
                     </button>
                   )
                 })}
+              </div>
+            </div>
+          )}
+
+          {imagePreview && (
+            <div
+              className="absolute inset-0 z-[70] flex flex-col bg-black/85 backdrop-blur-sm"
+              onMouseDown={(event) => {
+                if (event.target === event.currentTarget) setImagePreview(null)
+              }}
+            >
+              <div className="flex h-12 shrink-0 items-center justify-between border-b border-white/[0.08] bg-[#111111]/92 px-4">
+                <div className="min-w-0 text-[11px] font-medium text-white/62">
+                  <span className="block truncate">{imagePreview.name}</span>
+                </div>
+                <button
+                  type="button"
+                  title="Close preview"
+                  onClick={() => setImagePreview(null)}
+                  className="flex h-8 w-8 items-center justify-center rounded-lg text-white/45 transition-colors hover:bg-white/[0.07] hover:text-white"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              <div
+                className="flex min-h-0 flex-1 items-center justify-center p-5"
+                onMouseDown={(event) => {
+                  if (event.target === event.currentTarget) setImagePreview(null)
+                }}
+              >
+                <img
+                  src={imagePreview.src}
+                  alt={imagePreview.name}
+                  className="max-h-full max-w-full rounded-lg border border-white/[0.08] object-contain shadow-2xl"
+                />
               </div>
             </div>
           )}

@@ -18,7 +18,7 @@ Reliability is more important than code elegance. Google Flow changes frequently
 - **Plasmo** Framework (Chrome Extension SDK, v0.90.5)
 - **React** 18 + **TypeScript**
 - **Tailwind CSS** v3
-- **@xyflow/react** v12 (React Flow) — for the Workflow Editor
+- **Drawflow** canvas editor — for the Workflow Editor
 - **Zustand** v4 / v5 (State Management)
 - **Framer Motion** (Animations)
 - **lucide-react** (Icons)
@@ -43,8 +43,7 @@ ai-workflow-automation/
 │   ├── components/
 │   │   ├── gen/GenPanel.tsx          # Google Flow Gen tab UI
 │   │   ├── layout/TopNavigation.tsx   # Nav tabs
-│   │   ├── workflow/WorkflowEditor.tsx # React Flow editor
-│   │   ├── workflow/nodes/            # Node types (Prompt, Image, Generate, etc.)
+│   │   ├── workflow/WorkflowEditor.tsx # Workflow hub + Drawflow editor
 │   │   ├── pipeline/PipelineProgress.tsx
 │   │   ├── prompt/PromptManager.tsx
 │   │   ├── queue/TaskQueue.tsx

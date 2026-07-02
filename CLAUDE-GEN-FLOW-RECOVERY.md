@@ -36,7 +36,7 @@ Allowed files:
 Do not touch:
 
 - Workflow Editor
-- React Flow nodes/edges
+- Workflow nodes/edges
 - ChatGPT image pipeline
 - auto-download pipeline unless the build error is directly inside imported code
 - styling/design refactors
