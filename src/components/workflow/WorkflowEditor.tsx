@@ -59,7 +59,8 @@ const NODE_CATEGORIES = [
     label: 'Input',
     color: 'text-[#B8A8FF]',
     nodes: [
-      { type: 'prompt' as FlowNodeType, label: 'Prompt', icon: <FileText className="h-4 w-4" />, color: 'sky' }
+      { type: 'prompt' as FlowNodeType, label: 'Prompt', icon: <FileText className="h-4 w-4" />, color: 'sky' },
+      { type: 'image' as FlowNodeType, label: 'Media', icon: <Image className="h-4 w-4" />, color: 'sky' }
     ]
   },
   {
@@ -75,8 +76,7 @@ const NODE_CATEGORIES = [
     color: 'text-white/45',
     nodes: [
       { type: 'delay' as FlowNodeType, label: 'Delay', icon: <Clock className="h-4 w-4" />, color: 'amber' },
-      { type: 'wait' as FlowNodeType, label: 'Wait', icon: <Pause className="h-4 w-4" />, color: 'amber' },
-      { type: 'image' as FlowNodeType, label: 'Image', icon: <Image className="h-4 w-4" />, color: 'amber' }
+      { type: 'wait' as FlowNodeType, label: 'Wait', icon: <Pause className="h-4 w-4" />, color: 'amber' }
     ]
   }
 ]
@@ -90,7 +90,7 @@ const NODE_COLORS: Record<string, { bg: string; border: string; text: string }> 
 
 const NODE_DESCRIPTIONS: Partial<Record<FlowNodeType, string>> = {
   prompt: 'Write or reuse prompt text',
-  image: 'Add a reference image input',
+  image: 'Upload image or video media',
   generate: 'Generate media from inputs',
   download: 'Save generated output',
   delay: 'Pause before next step',
@@ -124,8 +124,17 @@ const GOOGLE_FLOW_DEFAULT_IMAGE_MODEL = 'Nano Banana 2'
 const GOOGLE_FLOW_DEFAULT_VIDEO_MODEL = 'Omni Flash'
 const VIDEO_DURATION_OPTIONS = ['4s', '6s', '8s']
 const OMNI_FLASH_VIDEO_DURATION_OPTIONS = ['4s', '6s', '8s', '10s']
+const IMAGE_ASPECT_RATIO_VALUES = {
+  '1:1': 1,
+  '16:9': 16 / 9,
+  '9:16': 9 / 16,
+  '4:3': 4 / 3,
+  '3:4': 3 / 4
+} as const
 
 type GenerateMediaType = 'image' | 'video'
+type MediaNodeType = 'image' | 'video'
+type ImageAspectRatioOption = keyof typeof IMAGE_ASPECT_RATIO_VALUES
 type NodePillField = 'provider' | 'aspectRatio' | 'mediaType' | 'model' | 'videoDuration'
 
 interface NodePillOption {
@@ -144,6 +153,7 @@ interface NodePillMenuState {
 interface ImagePreviewState {
   src: string
   name: string
+  mediaType: MediaNodeType
 }
 
 function normalizePillOptions(options: Array<{ value: string; label: string }> | string[]): NodePillOption[] {
@@ -187,6 +197,14 @@ function getGenerateDefaultModel(data: Record<string, unknown>) {
 function getGenerateVideoDurationOptions(data: Record<string, unknown>) {
   if (getGenerateMediaType(data) !== 'video') return []
   return data.model === 'Omni Flash' ? OMNI_FLASH_VIDEO_DURATION_OPTIONS : VIDEO_DURATION_OPTIONS
+}
+
+function generateNodeSupportsVideoInput(data: Record<string, unknown>) {
+  return (
+    data.provider === 'google-flow' &&
+    getGenerateMediaType(data) === 'video' &&
+    String(data.model || '') === 'Omni Flash'
+  )
 }
 
 function sanitizeGenerateDataPatch(currentData: Record<string, unknown>, patch: Record<string, unknown>) {
@@ -242,6 +260,120 @@ function pillFieldLabel(field: NodePillField) {
   if (field === 'model') return 'Model'
   if (field === 'videoDuration') return 'Duration'
   return 'Aspect ratio'
+}
+
+function closestImageAspectRatio(width: number, height: number): ImageAspectRatioOption {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return '1:1'
+
+  const imageRatio = width / height
+  return (Object.entries(IMAGE_ASPECT_RATIO_VALUES) as Array<[ImageAspectRatioOption, number]>).reduce(
+    (best, [ratio, value]) => {
+      const score = Math.abs(Math.log(imageRatio / value))
+      return score < best.score ? { ratio, score } : best
+    },
+    { ratio: '1:1' as ImageAspectRatioOption, score: Infinity }
+  ).ratio
+}
+
+function getMediaNodeType(data: Record<string, unknown>): MediaNodeType {
+  const raw = String(data.mediaType || '').toLowerCase()
+  const videoSource = String(data.videoData || data.videoUrl || '')
+  if (raw === 'video' || videoSource.length > 0) return 'video'
+  return 'image'
+}
+
+function getMediaNodeSource(data: Record<string, unknown>) {
+  const mediaType = getMediaNodeType(data)
+  if (mediaType === 'video') {
+    return String(data.videoData || data.videoUrl || data.mediaData || data.mediaUrl || '')
+  }
+  return String(data.imageData || data.imageUrl || data.mediaData || data.mediaUrl || '')
+}
+
+function getMediaNodePoster(data: Record<string, unknown>) {
+  return String(data.videoPoster || data.mediaPoster || '')
+}
+
+function captureVideoPoster(videoSrc: string): Promise<{ width?: number; height?: number; poster?: string }> {
+  return new Promise((resolve) => {
+    const video = document.createElement('video')
+    let settled = false
+    let waitingForSeek = false
+
+    const finish = (poster?: string) => {
+      if (settled) return
+      settled = true
+      const width = video.videoWidth || undefined
+      const height = video.videoHeight || undefined
+      video.removeAttribute('src')
+      video.load()
+      resolve({
+        width,
+        height,
+        poster
+      })
+    }
+
+    const capture = () => {
+      if (settled) return
+      const width = video.videoWidth
+      const height = video.videoHeight
+      if (!width || !height) {
+        finish()
+        return
+      }
+
+      try {
+        const canvas = document.createElement('canvas')
+        canvas.width = width
+        canvas.height = height
+        const context = canvas.getContext('2d')
+        if (!context) {
+          finish()
+          return
+        }
+        context.drawImage(video, 0, 0, width, height)
+        finish(canvas.toDataURL('image/jpeg', 0.86))
+      } catch {
+        finish()
+      }
+    }
+
+    const captureNextFrame = () => {
+      requestAnimationFrame(capture)
+    }
+
+    video.muted = true
+    video.playsInline = true
+    video.preload = 'metadata'
+    video.onloadedmetadata = () => {
+      const duration = Number.isFinite(video.duration) ? video.duration : 0
+      const seekTime = duration > 0.2 ? Math.min(0.15, Math.max(0, duration - 0.05)) : 0
+      if (seekTime > 0) {
+        waitingForSeek = true
+        try {
+          video.currentTime = seekTime
+        } catch {
+          waitingForSeek = false
+          captureNextFrame()
+        }
+        return
+      }
+      captureNextFrame()
+    }
+    video.onloadeddata = () => {
+      if (!waitingForSeek) captureNextFrame()
+    }
+    video.onseeked = () => {
+      waitingForSeek = false
+      captureNextFrame()
+    }
+    video.onerror = () => finish()
+
+    window.setTimeout(() => finish(), 3000)
+    video.src = videoSrc
+    video.load()
+  })
 }
 
 const NODE_PICKER_ITEMS = NODE_CATEGORIES.flatMap((category) =>
@@ -569,11 +701,26 @@ function coerceNodeData(type: FlowNodeType, raw: Record<string, unknown>): FlowN
         : typeof refUrls[0] === 'string'
           ? refUrls[0]
           : undefined
+    const videoUrl = typeof raw.videoUrl === 'string'
+      ? raw.videoUrl
+      : typeof raw.result_video_url === 'string'
+        ? raw.result_video_url
+        : undefined
+    const hasVideo = Boolean(videoUrl || raw.videoData)
+    const mediaType = String(raw.mediaType || raw.media_type || '').toLowerCase() === 'video' || hasVideo ? 'video' : 'image'
 
     return {
       label,
+      mediaType,
+      mediaUrl: typeof raw.mediaUrl === 'string' ? raw.mediaUrl : undefined,
+      mediaData: typeof raw.mediaData === 'string' ? raw.mediaData : undefined,
+      mediaName: typeof raw.mediaName === 'string' ? raw.mediaName : undefined,
+      mediaPoster: typeof raw.mediaPoster === 'string' ? raw.mediaPoster : undefined,
       imageUrl,
       imageData: typeof raw.imageData === 'string' ? raw.imageData : undefined,
+      videoUrl,
+      videoData: typeof raw.videoData === 'string' ? raw.videoData : undefined,
+      videoPoster: typeof raw.videoPoster === 'string' ? raw.videoPoster : undefined,
       aspectRatio: String(raw.aspectRatio || raw.ratio || '1:1') as FlowNodeData['aspectRatio'],
       provider
     }
@@ -894,7 +1041,7 @@ const DF_PORT_ICONS: Record<DrawflowPortType, string> = {
 function nodeMeta(type: FlowNodeType) {
   const meta: Record<string, { icon: string; color: string; title: string; portType: DrawflowPortType }> = {
     prompt: { icon: DF_ICONS.prompt, color: 'prompt', title: 'Prompt', portType: 'text' },
-    image: { icon: DF_ICONS.image, color: 'image', title: 'Image', portType: 'image' },
+    image: { icon: DF_ICONS.image, color: 'image', title: 'Media', portType: 'image' },
     generate: { icon: DF_ICONS.generate, color: 'generate', title: 'Generate', portType: 'image' },
     delay: { icon: DF_ICONS.delay, color: 'delay', title: 'Wait', portType: 'any' },
     download: { icon: DF_ICONS.download, color: 'download', title: 'Download', portType: 'any' },
@@ -916,20 +1063,26 @@ function drawflowPortGroupsForNode(node: WorkflowNode): { in: DrawflowPortMeta[]
   }
 
   if (node.type === 'image') {
+    const mediaType = getMediaNodeType(node.data as Record<string, unknown>)
     return {
       in: [],
-      out: [{ type: 'image', name: 'image', label: 'Image' }]
+      out: [{ type: mediaType, name: mediaType, label: mediaType === 'video' ? 'Video' : 'Image' }]
     }
   }
 
   if (node.type === 'generate') {
     const generateData = { ...(node.data as Record<string, unknown>), ...sanitizeGenerateDataPatch(node.data as Record<string, unknown>, {}) }
     const outputType: DrawflowPortType = getGenerateMediaType(generateData) === 'video' ? 'video' : 'image'
+    const inputs: DrawflowPortMeta[] = [
+      { type: 'image', name: 'image', label: 'Image' },
+      { type: 'text', name: 'prompt', label: 'Prompt', required: true }
+    ]
+    if (generateNodeSupportsVideoInput(generateData)) {
+      inputs.push({ type: 'video', name: 'video', label: 'Video' })
+    }
+
     return {
-      in: [
-        { type: 'image', name: 'image', label: 'Image' },
-        { type: 'text', name: 'prompt', label: 'Prompt', required: true }
-      ],
+      in: inputs,
       out: [{ type: outputType, name: outputType, label: outputType === 'video' ? 'Video' : 'Image' }]
     }
   }
@@ -970,6 +1123,9 @@ function createOutputConnections(count: number) {
 
 function nodeConnectionType(node: WorkflowNode | undefined) {
   if (!node) return 'any'
+  if (node.type === 'image') {
+    return getMediaNodeType(node.data as Record<string, unknown>)
+  }
   if (node.type === 'generate') {
     return getGenerateMediaType(node.data as Record<string, unknown>) === 'video' ? 'video' : 'image'
   }
@@ -1039,7 +1195,10 @@ function renderDrawflowNode(node: WorkflowNode) {
     ? { ...data, ...sanitizeGenerateDataPatch(data, {}) }
     : data
   const meta = nodeMeta(node.type)
-  const label = escapeHtml(data.label || meta.title)
+  const rawLabel = node.type === 'image' && (!data.label || data.label === 'New Image Node' || data.label === 'image')
+    ? 'New Media Node'
+    : data.label || meta.title
+  const label = escapeHtml(rawLabel)
   const provider = providerSlug(generateData.provider)
   const prompt = escapeHtml(String(data.prompt || '').slice(0, 150))
   const enabled = data.enabled !== false
@@ -1059,14 +1218,22 @@ function renderDrawflowNode(node: WorkflowNode) {
       </div>
     `
   } else if (node.type === 'image') {
-    const imageSrc = String(data.imageData || data.imageUrl || '')
+    const mediaType = getMediaNodeType(data)
+    const mediaSrc = getMediaNodeSource(data)
+    const mediaPoster = getMediaNodePoster(data)
     body = `
-      <div class="df-node-preview df-node-image-upload-target ${imageSrc ? 'has-image' : ''} ${ratioClass}" data-image-upload-target="true">
+      <div class="df-node-preview df-node-image-upload-target ${mediaSrc ? 'has-image' : ''} ${ratioClass}" data-image-upload-target="true">
         ${
-          imageSrc
+          mediaSrc
             ? `
-              <img class="df-node-preview-image" src="${escapeHtml(imageSrc)}" alt="">
-              <button type="button" class="df-node-image-preview-button nodrag" data-node-action="preview-image" title="Preview image" aria-label="Preview image">
+              ${
+                mediaType === 'video'
+                  ? mediaPoster
+                    ? `<img class="df-node-preview-media" src="${escapeHtml(mediaPoster)}" alt="" draggable="false">`
+                    : `<div class="df-node-preview-placeholder">${DF_PORT_ICONS.video}</div>`
+                  : `<img class="df-node-preview-media" src="${escapeHtml(mediaSrc)}" alt="" draggable="false">`
+              }
+              <button type="button" class="df-node-image-preview-button nodrag" data-node-action="preview-image" title="Preview media" aria-label="Preview media">
                 ${DF_ICONS.zoom}
               </button>
             `
@@ -1074,8 +1241,6 @@ function renderDrawflowNode(node: WorkflowNode) {
         }
       </div>
       <div class="df-node-settings-bar">
-        ${renderPillTrigger('provider', String(data.provider || 'chatgpt'), PROVIDER_OPTIONS)}
-        <span class="df-node-tag">${imageSrc ? escapeHtml(data.imageName || 'Image loaded') : 'No images'}</span>
         ${renderPillTrigger('aspectRatio', aspectRatio, ASPECT_RATIO_OPTIONS)}
       </div>
     `
@@ -1187,9 +1352,16 @@ function buildDrawflowData(workflow: Workflow) {
   return { drawflow: { Home: { data } } }
 }
 
+function getNodePortSignature(node: WorkflowNode) {
+  const ports = drawflowPortGroupsForNode(node)
+  const inputSignature = ports.in.map((port) => `${port.name}:${port.type}`).join(',')
+  const outputSignature = ports.out.map((port) => `${port.name}:${port.type}`).join(',')
+  return `in(${inputSignature})|out(${outputSignature})`
+}
+
 function getWorkflowStructureSignature(workflow: Workflow) {
   const nodes = workflow.nodes
-    .map((node) => `${node.id}:${node.type}`)
+    .map((node) => `${node.id}:${node.type}:${getNodePortSignature(node)}`)
     .join('|')
   const edges = workflow.edges
     .map((edge) => `${edge.source}:${edge.target}:${edge.sourceHandle || ''}:${edge.targetHandle || ''}`)
@@ -1205,14 +1377,14 @@ function getWorkflowDataSignature(workflow: Workflow) {
 
 interface NodeInspectorProps {
   workflow: Workflow
+  nodeId: string
   onClose: () => void
 }
 
-const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, onClose }) => {
-  const selectedNodeId = useWorkflowStore((s) => s.selectedNodeId)
+const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, nodeId, onClose }) => {
   const updateNode = useWorkflowStore((s) => s.updateNode)
   const deleteNode = useWorkflowStore((s) => s.deleteNode)
-  const node = workflow.nodes.find((item) => item.id === selectedNodeId)
+  const node = workflow.nodes.find((item) => item.id === nodeId)
 
   if (!node) {
     return null
@@ -1249,8 +1421,10 @@ const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, onClose }) => {
     <aside className="flex w-[340px] shrink-0 flex-col border-l border-white/[0.06] bg-[#111111]">
       <div className="flex h-14 items-center justify-between border-b border-white/[0.06] px-4">
         <div className="min-w-0">
-          <p className="truncate text-[12px] font-medium text-white/80">{String(data.label || node.type)}</p>
-          <p className="text-[10px] text-white/30">{node.type}</p>
+          <p className="truncate text-[12px] font-medium text-white/80">
+            {String(node.type === 'image' && (!data.label || data.label === 'New Image Node') ? 'New Media Node' : data.label || node.type)}
+          </p>
+          <p className="text-[10px] text-white/30">{node.type === 'image' ? 'media' : node.type}</p>
         </div>
         <div className="flex items-center gap-1">
           <button
@@ -1276,13 +1450,13 @@ const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, onClose }) => {
         <label className="block">
           <span className={fieldLabelClass}>Name</span>
           <input
-            value={String(data.label || '')}
+            value={String(node.type === 'image' && (!data.label || data.label === 'New Image Node') ? 'New Media Node' : data.label || '')}
             onChange={(event) => update('label', event.target.value)}
             className={fieldControlClass}
           />
         </label>
 
-        {(node.type === 'prompt' || node.type === 'image' || node.type === 'generate') && (
+        {(node.type === 'prompt' || node.type === 'generate') && (
           <label className="block">
             <span className={fieldLabelClass}>Provider</span>
             <div className="relative">
@@ -1407,10 +1581,17 @@ const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, onClose }) => {
         {node.type === 'image' && (
           <>
             <label className="block">
-              <span className={fieldLabelClass}>Image URL</span>
+              <span className={fieldLabelClass}>Media URL</span>
               <input
-                value={String(data.imageUrl || '')}
-                onChange={(event) => update('imageUrl', event.target.value)}
+                value={String(getMediaNodeType(data) === 'video' ? data.videoUrl || data.mediaUrl || '' : data.imageUrl || data.mediaUrl || '')}
+                onChange={(event) => {
+                  const mediaType = getMediaNodeType(data)
+                  updateNode(node.id, {
+                    mediaUrl: event.target.value,
+                    imageUrl: mediaType === 'image' ? event.target.value : '',
+                    videoUrl: mediaType === 'video' ? event.target.value : ''
+                  } as Partial<FlowNodeData>)
+                }}
                 className={fieldControlClass}
               />
             </label>
@@ -1568,6 +1749,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const [showLogs, setShowLogs] = useState(false)
   const [zoomLevel, setZoomLevel] = useState(100)
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null)
+  const [inspectorNodeId, setInspectorNodeId] = useState<string | null>(null)
 
   const activeTask = tasks.find((task) => task.id === activeTaskId)
   const taskLogs = logs.filter((log) => log.pipelineId === activeTaskId).slice(0, 24)
@@ -1584,6 +1766,12 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   useEffect(() => {
     workflowRef.current = workflow
   }, [workflow])
+
+  useEffect(() => {
+    if (inspectorNodeId && !workflow.nodes.some((node) => node.id === inspectorNodeId)) {
+      setInspectorNodeId(null)
+    }
+  }, [inspectorNodeId, workflow.nodes])
 
   useEffect(() => {
     setSelectedPickerIndex(0)
@@ -2280,7 +2468,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
 
       const input = document.createElement('input')
       input.type = 'file'
-      input.accept = 'image/*'
+      input.accept = 'image/*,video/*'
       input.style.display = 'none'
 
       const cleanup = () => {
@@ -2289,7 +2477,12 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
 
       input.addEventListener('change', () => {
         const file = input.files?.[0]
-        if (!file || !file.type.startsWith('image/')) {
+        const fileMediaType: MediaNodeType | null = file?.type.startsWith('video/')
+          ? 'video'
+          : file?.type.startsWith('image/')
+            ? 'image'
+            : null
+        if (!file || !fileMediaType) {
           cleanup()
           return
         }
@@ -2297,14 +2490,55 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         const reader = new FileReader()
         reader.onload = () => {
           const imageData = typeof reader.result === 'string' ? reader.result : ''
-          if (imageData) {
-            updateNode(nodeId, {
-              imageData,
-              imageUrl: '',
-              imageName: file.name
-            } as Partial<FlowNodeData>)
+          if (!imageData) {
+            cleanup()
+            return
           }
-          cleanup()
+
+          const finishUpload = (width?: number, height?: number, poster?: string) => {
+            const aspectRatio = width && height ? closestImageAspectRatio(width, height) : fileMediaType === 'video' ? '16:9' : '1:1'
+            const basePatch: Record<string, unknown> = {
+              mediaType: fileMediaType,
+              mediaData: imageData,
+              mediaUrl: '',
+              mediaName: file.name,
+              mediaMimeType: file.type,
+              mediaWidth: width,
+              mediaHeight: height,
+              mediaPoster: fileMediaType === 'video' ? poster || '' : '',
+              aspectRatio
+            }
+
+            updateNode(nodeId, {
+              ...basePatch,
+              imageData: fileMediaType === 'image' ? imageData : '',
+              imageUrl: '',
+              imageName: fileMediaType === 'image' ? file.name : '',
+              imageWidth: fileMediaType === 'image' ? width : undefined,
+              imageHeight: fileMediaType === 'image' ? height : undefined,
+              videoData: fileMediaType === 'video' ? imageData : '',
+              videoUrl: '',
+              videoName: fileMediaType === 'video' ? file.name : '',
+              videoWidth: fileMediaType === 'video' ? width : undefined,
+              videoHeight: fileMediaType === 'video' ? height : undefined,
+              videoPoster: fileMediaType === 'video' ? poster || '' : ''
+            } as Partial<FlowNodeData>)
+            cleanup()
+          }
+
+          if (fileMediaType === 'video') {
+            captureVideoPoster(imageData)
+              .then(({ width, height, poster }) => finishUpload(width, height, poster))
+              .catch(() => finishUpload())
+            return
+          }
+
+          const uploadedImage = document.createElement('img')
+          uploadedImage.onload = () => {
+            finishUpload(uploadedImage.naturalWidth, uploadedImage.naturalHeight)
+          }
+          uploadedImage.onerror = () => finishUpload()
+          uploadedImage.src = imageData
         }
         reader.onerror = cleanup
         reader.readAsDataURL(file)
@@ -2315,7 +2549,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     }
     const stopNodePillDragStart = (event: MouseEvent) => {
       const target = event.target as HTMLElement | null
-      if (!target?.closest('.df-node-pill-trigger, .df-hover-btn, .df-node-prompt-editor, .df-node-image-upload-target')) return
+      if (!target?.closest('.df-node-pill-trigger, .df-hover-btn, .df-node-prompt-editor, .df-node-image-preview-button')) return
       event.stopPropagation()
     }
     const handleNodePillClick = (event: MouseEvent) => {
@@ -2377,6 +2611,10 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       if (action === 'delete') {
         closeNodePillMenu()
         deleteNode(nodeId)
+        setInspectorNodeId((current) => (current === nodeId ? null : current))
+      } else if (action === 'settings') {
+        closeNodePillMenu()
+        setInspectorNodeId(nodeId)
       }
     }
     const handleImagePreviewClick = (event: MouseEvent) => {
@@ -2393,15 +2631,23 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
 
       const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
       const data = (node?.data || {}) as Record<string, unknown>
-      const imageSrc = String(data.imageData || data.imageUrl || '')
-      if (!node || node.type !== 'image' || !imageSrc) return
+      const mediaSrc = getMediaNodeSource(data)
+      if (!node || node.type !== 'image' || !mediaSrc) return
 
       closeNodePillMenu()
       setSelectedNode(nodeId)
       setImagePreview({
-        src: imageSrc,
-        name: String(data.imageName || data.label || 'Image')
+        src: mediaSrc,
+        name: String(data.mediaName || data.videoName || data.imageName || data.label || 'Media'),
+        mediaType: getMediaNodeType(data)
       })
+    }
+    const preventNativeMediaDrag = (event: DragEvent) => {
+      const target = event.target instanceof Element ? event.target : null
+      if (!target?.closest('.df-node-preview-media, .df-node-preview-image, .df-node-image-upload-target')) return
+
+      event.preventDefault()
+      event.stopPropagation()
     }
     const zoomOnWheel = (event: WheelEvent) => {
       const target = event.target as HTMLElement | null
@@ -2434,6 +2680,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     canvasEl.addEventListener('click', handleNodePillClick)
     canvasEl.addEventListener('click', handleNodeToolbarClick)
     canvasEl.addEventListener('click', handleImagePreviewClick)
+    canvasEl.addEventListener('dragstart', preventNativeMediaDrag, true)
     canvasEl.addEventListener('wheel', zoomOnWheel, { passive: false })
 
     editorRef.current = editor
@@ -2455,6 +2702,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       canvasEl.removeEventListener('click', handleNodePillClick)
       canvasEl.removeEventListener('click', handleNodeToolbarClick)
       canvasEl.removeEventListener('click', handleImagePreviewClick)
+      canvasEl.removeEventListener('dragstart', preventNativeMediaDrag, true)
       canvasEl.removeEventListener('wheel', zoomOnWheel)
       editorRef.current = null
       portDragCleanupRef.current?.()
@@ -2879,11 +3127,20 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
                   if (event.target === event.currentTarget) setImagePreview(null)
                 }}
               >
-                <img
-                  src={imagePreview.src}
-                  alt={imagePreview.name}
-                  className="max-h-full max-w-full rounded-lg border border-white/[0.08] object-contain shadow-2xl"
-                />
+                {imagePreview.mediaType === 'video' ? (
+                  <video
+                    src={imagePreview.src}
+                    controls
+                    autoPlay
+                    className="max-h-full max-w-full rounded-lg border border-white/[0.08] object-contain shadow-2xl"
+                  />
+                ) : (
+                  <img
+                    src={imagePreview.src}
+                    alt={imagePreview.name}
+                    className="max-h-full max-w-full rounded-lg border border-white/[0.08] object-contain shadow-2xl"
+                  />
+                )}
               </div>
             </div>
           )}
@@ -2969,7 +3226,13 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
             </div>
           )}
         </div>
-        {windowMode && selectedNodeId && <NodeInspector workflow={workflow} onClose={() => setSelectedNode(null)} />}
+        {windowMode && inspectorNodeId && (
+          <NodeInspector
+            workflow={workflow}
+            nodeId={inspectorNodeId}
+            onClose={() => setInspectorNodeId(null)}
+          />
+        )}
       </div>
     </div>
   )

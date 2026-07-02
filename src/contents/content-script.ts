@@ -78,9 +78,19 @@ const AIFlowContentScript = {
     const ia = new Uint8Array(ab)
     for (let i = 0; i < byteString.length; i++) ia[i] = byteString.charCodeAt(i)
     const blob = new Blob([ab], { type: mimeType })
+    const extension = mimeType.includes('mp4')
+      ? 'mp4'
+      : mimeType.includes('webm')
+        ? 'webm'
+        : mimeType.includes('quicktime')
+          ? 'mov'
+          : mimeType.includes('jpeg')
+            ? 'jpg'
+            : mimeType.split('/')[1] || 'png'
+    const filePrefix = mimeType.startsWith('video/') ? 'video' : 'image'
 
     const dataTransfer = new DataTransfer()
-    dataTransfer.items.add(new File([blob], 'image.png', { type: mimeType }))
+    dataTransfer.items.add(new File([blob], `${filePrefix}.${extension}`, { type: mimeType }))
     fileInput.files = dataTransfer.files
     fileInput.dispatchEvent(new Event('change', { bubbles: true }))
 

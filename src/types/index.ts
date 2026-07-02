@@ -53,8 +53,17 @@ export interface PromptNodeData extends BaseNodeData {
 }
 
 export interface ImageNodeData extends BaseNodeData {
+  mediaType?: 'image' | 'video'
+  mediaUrl?: string
+  mediaData?: string
+  mediaName?: string
+  mediaMimeType?: string
+  mediaPoster?: string
   imageUrl?: string
   imageData?: string
+  videoUrl?: string
+  videoData?: string
+  videoPoster?: string
   aspectRatio: '1:1' | '16:9' | '9:16' | '4:3' | '3:4' | 'custom'
   customRatio?: string
   provider: AIProvider

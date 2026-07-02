@@ -17,6 +17,29 @@ function readBgDebugFlag(): boolean {
 var BG_DEBUG = readBgDebugFlag()
 var workflowEditorWindowId: number | null = null
 
+async function closeWorkflowEditorTabsOnExtensionReload() {
+  const editorUrl = chrome.runtime.getURL('tabs/workflow-editor.html')
+  try {
+    const tabs = await chrome.tabs.query({})
+    const editorTabIds = tabs
+      .filter((tab) => tab.id !== undefined && typeof tab.url === 'string' && tab.url.startsWith(editorUrl))
+      .map((tab) => tab.id as number)
+
+    if (editorTabIds.length > 0) {
+      await chrome.tabs.remove(editorTabIds).catch(() => {})
+    }
+  } finally {
+    workflowEditorWindowId = null
+    await chrome.storage.session?.remove?.('workflowEditorWindowId').catch(() => {})
+  }
+}
+
+chrome.runtime.onInstalled.addListener(() => {
+  closeWorkflowEditorTabsOnExtensionReload().catch((error) => {
+    console.warn('[Background] failed to close stale workflow editor tabs:', error)
+  })
+})
+
 chrome.windows.onRemoved.addListener((windowId) => {
   if (workflowEditorWindowId === windowId) {
     workflowEditorWindowId = null

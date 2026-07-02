@@ -68,7 +68,22 @@ const createDefaultNodeData = (type: FlowNodeType): Record<string, unknown> => {
     case 'prompt':
       return { ...base, prompt: '', provider: 'chatgpt', model: '' }
     case 'image':
-      return { ...base, imageUrl: '', imageData: '', aspectRatio: '1:1', provider: 'chatgpt' }
+      return {
+        ...base,
+        label: 'New Media Node',
+        mediaType: 'image',
+        mediaUrl: '',
+        mediaData: '',
+        mediaName: '',
+        mediaPoster: '',
+        imageUrl: '',
+        imageData: '',
+        videoUrl: '',
+        videoData: '',
+        videoPoster: '',
+        aspectRatio: '1:1',
+        provider: 'chatgpt'
+      }
     case 'generate':
       return {
         ...base,
