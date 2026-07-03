@@ -1,3 +1,21 @@
+/**
+ * SHARED BACKGROUND DISPATCHER
+ *
+ * WARNING:
+ * This file routes multiple providers.
+ * Do not reuse ChatGPT bridge logic for Google Flow.
+ *
+ * Google Flow route:
+ *   background -> flow-content.ts (ISOLATED world) -> flow-slate-bridge.ts (MAIN world, postMessage bridge)
+ *
+ * ChatGPT route:
+ *   background -> chatgpt-content.ts / chatgpt-bridge.ts via chrome.storage.session job state
+ *
+ * Any shared helper must be guarded by provider/action. Do not collapse Google
+ * Flow's two-tier bridge into a single helper that ChatGPT might also call.
+ * See CLAUDE.md → "Shared Files Guard — Provider Boundary Rules".
+ */
+
 import type { ChromeMessage } from '@/types'
 import { PROVIDER_TABS } from '@/constants'
 import { DEBUG_FLAGS, debugLog } from '@/lib/debug'

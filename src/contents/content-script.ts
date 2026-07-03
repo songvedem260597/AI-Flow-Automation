@@ -1,3 +1,24 @@
+/**
+ * SHARED GENERIC CONTENT SCRIPT
+ *
+ * WARNING:
+ * This file is loaded broadly and may run before provider-specific scripts.
+ * Do NOT respond with "Unknown action" for provider-specific actions.
+ *
+ * Flow actions must be deferred to flow-content.ts:
+ *   - FLOW_*
+ *   - RUN_FLOW_PROMPT
+ *
+ * ChatGPT actions must be handled only by ChatGPT-specific logic
+ *   - CHATGPT_*
+ *   - RUN_CHATGPT_PROMPT
+ *
+ * If this listener does not own an action, return false and do not call sendResponse.
+ * Returning {success:false, error:"Unknown action: <x>"} for an action you do not
+ * own will beat any provider-specific handler in the listener race and break that
+ * provider silently. See CLAUDE.md → "Shared Files Guard — Provider Boundary Rules".
+ */
+
 // ── Safe sendMessage helpers ─────────────────────────────────────────────────
 // After extension reload, the previous content script bundle stays alive in
 // the page; subsequent chrome.runtime.sendMessage / chrome.storage calls

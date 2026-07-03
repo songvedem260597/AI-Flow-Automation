@@ -281,6 +281,130 @@ ai-workflow-automation/
 - **ChatGPT tab focus**: workflow callers (`runner.ts`) MUST pass `focus: false` to `RUN_CHATGPT_PROMPT`. GenPanel direct calls default to `focus: true`. The user's tab (Workflow Editor / Side Panel) stays visible during workflow runs.
 - **ChatGPT quantity**: ChatGPT does not accept a quantity field. `quantity?: number` on `GenerateNodeData` is Google Flow only and is never sent via `RUN_CHATGPT_PROMPT`.
 
+## Shared Files Guard — Provider Boundary Rules
+
+Một số file đóng vai trò shared dispatcher / router. Sửa nhầm có thể làm hỏng provider khác mà không thấy triệu chứng ở provider đang fix. Phần này là Hard Rule bắt buộc tôn trọng khi chạm vào bất kỳ file nào dưới đây.
+
+### High-risk shared files
+
+- `src/background/index.ts` — router trung tâm: nhận message, route tới `RUN_FLOW_PROMPT` / `RUN_CHATGPT_PROMPT` / `INJECT_SCRIPT` / download pipeline, v.v.
+- `src/contents/content-script.ts` — generic content script shared (`<all_urls>`), đăng ký `chrome.runtime.onMessage` listener trên MỌI page bao gồm `labs.google/*`, `chatgpt.com/*`, v.v.
+- `src/components/gen/GenPanel.tsx` — UI trigger duy nhất gửi `RUN_FLOW_PROMPT` và `RUN_CHATGPT_PROMPT`, quản lý pendingUploads, ref resolution, auto-download đường dẫn cho cả 2 provider.
+
+Các file này không thuộc riêng Google Flow hay ChatGPT. Trước khi sửa, bắt buộc xác định rõ action / provider nào bị ảnh hưởng.
+
+### Provider-specific files
+
+**Google Flow** (sửa thoải mái theo Flow logic, không ảnh hưởng ChatGPT):
+
+- `src/contents/flow-content.ts` — ISOLATED-world orchestration cho Flow.
+- `src/contents/flow-slate-bridge.ts` — MAIN-world bridge, React Fiber + Slate + DOM. **Không rewrite** trừ khi task yêu cầu rõ.
+- `public/slate-bridge.main.js` — build artifact do `postbuild.js` copy từ `flow-slate-bridge.ts`. Đừng sửa tay; nếu thay đổi source, build sẽ tự refresh.
+
+**ChatGPT** (sửa thoải mái theo ChatGPT logic, không ảnh hưởng Flow):
+
+- `src/contents/chatgpt-content.ts`
+- `src/contents/chatgpt-bridge.ts`
+
+### Hard rules
+
+1. **Fix Google Flow mà không có bằng chứng lỗi ở ChatGPT thì KHÔNG được sửa ChatGPT files.**
+2. **Fix ChatGPT mà không có bằng chứng lỗi ở Google Flow thì KHÔNG được sửa Google Flow files.**
+3. **Sửa shared files (`background/index.ts`, `content-script.ts`, `GenPanel.tsx`) bắt buộc phải guard theo `provider` hoặc `action` prefix.** Không làm một đoạn code ảnh hưởng cả 2 provider.
+4. **Generic `content-script.ts` KHÔNG được trả `"Unknown action"` cho action không thuộc nó**, nếu action đó có thể thuộc provider khác.
+   - Với `FLOW_*` và `RUN_FLOW_PROMPT`: phải `return false` để `flow-content.ts` xử lý. `flow-content.ts` được đăng ký sau trong manifest order nhưng sẽ là responder duy nhất cho các action này (vì content-script.ts đã thoát ra).
+   - Với `CHATGPT_*` và `RUN_CHATGPT_PROMPT`: phải để ChatGPT-specific handler xử lý. Hiện tại ChatGPT logic nằm cùng file này, nhưng cần gate rõ ràng theo action prefix để không lan sang Flow.
+5. **Không dùng helper chung nếu contract của từng provider khác nhau.**
+   Google Flow có 2 tầng:
+     `background` → `flow-content.ts` (ISOLATED world) → `flow-slate-bridge.ts` (MAIN world, postMessage bridge)
+   ChatGPT có contract riêng dùng `jobId` với `chrome.storage.session` để sống sót qua MV3 SW suspension. Hai contract này không gom nhầm được.
+6. **Mọi action mới phải được ghi rõ `owner` trong commit message và trong code gần switch/handler:**
+   - `owner: google-flow`
+   - `owner: chatgpt`
+   - `owner: shared`
+7. **Nếu chạm vào shared dispatcher, báo cáo phải có:**
+   - Vì sao shared file cần sửa.
+   - Action nào bị ảnh hưởng.
+   - Guard provider/action nào đã thêm.
+   - Test provider nào đã chạy (Flow Generate, ChatGPT Generate, hoặc cả 2).
+8. **Không được `restore` / `push` / `git checkout` nhầm các file unrelated khi đang fix một provider.** Trước khi commit, chạy `git status` + `git diff --stat` và đối chiếu với danh sách provider-specific files ở trên.
+9. **Listener race guard:** Nếu một listener không xử lý action, nó phải `return false` và không được `sendResponse` lỗi. Sendresponse lỗi với `{success:false, error: 'Unknown action: ...'}` từ listener đăng ký trước sẽ thắng race với listener provider-specific đăng ký sau, làm provider-specific handler không bao giờ được gọi.
+
+### Known incident — `Unknown action: FLOW_INJECT_BRIDGE`
+
+Google Flow từng fail với:
+
+```
+PING_BRIDGE_RAW {"success":false,"error":"Unknown action: FLOW_INJECT_BRIDGE"}
+FLOW_BRIDGE_NOT_READY
+```
+
+**Root cause:**
+`src/contents/content-script.ts` là generic listener (matches `<all_urls>`) và được đăng ký trước `flow-content.ts` trong manifest order. Nó nhận `FLOW_INJECT_BRIDGE` (và bất kỳ `FLOW_*` / `RUN_FLOW_PROMPT` nào) trước, không biết action → `throw new Error("Unknown action: FLOW_INJECT_BRIDGE")` → `.catch` handler gọi `sendResponse({success:false, error:"Unknown action: FLOW_INJECT_BRIDGE"})` ngay trong microtask.
+Listener này luôn thắng race với `flow-content.ts`'s response (vì `flow-content.ts` await nội bộ rồi mới `sendResponse`), nên background thấy `success: false` mỗi lần ping, reinject 10 lần, abort.
+
+**Fix:**
+`content-script.ts` phải defer `FLOW_*` và `RUN_FLOW_PROMPT` cho `flow-content.ts`:
+
+```ts
+if (typeof msgAction === 'string' && (
+  msgAction.indexOf('FLOW_') === 0 ||
+  msgAction === 'RUN_FLOW_PROMPT'
+)) {
+  // Do not return true — this listener does not own the message channel.
+  // The Flow-specific content script will respond.
+  return false
+}
+```
+
+`background/index.ts` không được ping Google Flow bridge bằng contract của ChatGPT. Google Flow bridge readiness phải dùng Flow-specific logic (MAIN-world probe qua `chrome.scripting.executeScript`, đọc `window.__FLOW_BRIDGE_BUILD_TIME__` / `window.__FLOW_SLATE_BRIDGE_READY__` / `window.__FLOW_BRIDGE__` / `window.__flowSlateBridgeCleanup`, hoặc ping qua `flow-content.ts` sau khi deferral guard đã chặn listener race).
+
+### Required source-level comments
+
+Ngoài CLAUDE.md, các file nguy hiểm **bắt buộc** có comment ngay đầu file:
+
+`src/contents/content-script.ts` phải có block comment:
+
+```js
+/**
+ * SHARED GENERIC CONTENT SCRIPT
+ *
+ * WARNING:
+ * This file is loaded broadly and may run before provider-specific scripts.
+ * Do NOT respond with "Unknown action" for provider-specific actions.
+ *
+ * Flow actions must be deferred to flow-content.ts:
+ *   - FLOW_*
+ *   - RUN_FLOW_PROMPT
+ *
+ * ChatGPT actions must be handled only by ChatGPT-specific logic.
+ *
+ * If this listener does not own an action, return false and do not call sendResponse.
+ */
+```
+
+`src/background/index.ts` phải có block comment:
+
+```js
+/**
+ * SHARED BACKGROUND DISPATCHER
+ *
+ * WARNING:
+ * This file routes multiple providers.
+ * Do not reuse ChatGPT bridge logic for Google Flow.
+ *
+ * Google Flow route:
+ *   background -> flow-content.ts -> flow-slate-bridge.ts MAIN world
+ *
+ * ChatGPT route:
+ *   background -> ChatGPT content/bridge contract
+ *
+ * Any shared helper must be guarded by provider/action.
+ */
+```
+
+Nếu một trong hai block comment bị xoá / bị rewrite không giữ lại phần "WARNING", tác giả phải được ping trong PR review và phải khôi phục.
+
 ## Reloading After Changes
 
 - Dev mode (`npm run dev`): Plasmo hot reloads most extension UI changes, but Flow page may still need reload for content scripts.
