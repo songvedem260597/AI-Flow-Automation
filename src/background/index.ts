@@ -1,5 +1,6 @@
 import type { ChromeMessage } from '@/types'
 import { PROVIDER_TABS } from '@/constants'
+import { DEBUG_FLAGS, debugLog } from '@/lib/debug'
 
 console.log('[Background] index.ts loaded')
 
@@ -473,7 +474,7 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
       const jobs = await chatgptReadJobs()
       const existing = jobs[jobId]
       if (!existing) {
-        console.log('[ChatGPT][Background] job heartbeat for unknown jobId:', jobId)
+        console.warn('[ChatGPT][Background] job heartbeat for unknown jobId:', jobId)
         return { success: false, error: 'unknown jobId' }
       }
 
@@ -508,7 +509,11 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
       }
 
       const merged = await chatgptUpdateJob(jobId, patch)
-      console.log('[ChatGPT][Background] job heartbeat', {
+      // Per-poll heartbeat log is gated by DEBUG_FLAGS.chatgptHeartbeat.
+      // The unconditional lifecycle logs above (job done, persisted,
+      // submit sent, etc.) stay visible — only the per-poll heartbeat
+      // dump is silenced in default mode to avoid console spam.
+      debugLog('chatgptHeartbeat', '[ChatGPT][Background] job heartbeat', {
         jobId,
         phase: payload.phase,
         progressChanged,
@@ -723,6 +728,7 @@ interface ChatGPTJobState {
   autoDownload: boolean
   outputFolder?: string
   imageUrls: string[]
+  images?: ChatGPTGeneratedImage[]
   downloaded: number
   error: string
   message?: string
@@ -746,6 +752,16 @@ interface ChatGPTJobState {
   hasPendingImage?: boolean
 }
 
+interface ChatGPTGeneratedImage {
+  mediaType?: 'image'
+  data?: string
+  url?: string
+  name?: string
+  mimeType?: string
+  source?: string
+  aspectRatio?: string
+}
+
 interface ChatGPTJobProgress {
   phase?: 'pre_upload' | 'uploading' | 'submitting' | 'waiting_result' | 'generating' | 'rendering' | 'done' | 'failed'
   generating?: boolean
@@ -766,6 +782,7 @@ interface ChatGPTJobProgress {
 interface ChatGPTPromptPayload {
   prompt: string
   ratio?: string
+  fallbackPrefix?: string
   autoDownload: boolean
   outputFolder?: string
   timeoutMs?: number
@@ -822,6 +839,7 @@ function chatgptBuildRequestFingerprint(payload: ChatGPTPromptPayload): string {
   const signature = JSON.stringify({
     prompt: typeof payload.prompt === 'string' ? payload.prompt.trim() : '',
     ratio: payload.ratio || '',
+    fallbackPrefix: payload.fallbackPrefix || '',
     autoDownload: !!payload.autoDownload,
     outputFolder: payload.outputFolder || '',
     mediaUploads: mediaSignatures,
@@ -975,7 +993,15 @@ chrome.runtime.onMessage.addListener((msg: Record<string, unknown>, _sender, sen
 })
 
 async function handleChatGPTJobDone(jobId: string, msg: Record<string, unknown>): Promise<void> {
-  const payload = (msg as { payload?: { success: boolean; imageUrls?: string[]; error?: string; message?: string } }).payload
+  const payload = (msg as {
+    payload?: {
+      success: boolean
+      imageUrls?: string[]
+      images?: ChatGPTGeneratedImage[]
+      error?: string
+      message?: string
+    }
+  }).payload
   const jobs = await chatgptReadJobs()
   const job = jobs[jobId]
   if (!job) {
@@ -984,6 +1010,19 @@ async function handleChatGPTJobDone(jobId: string, msg: Record<string, unknown>)
   }
 
   if (!payload || !payload.success) {
+    // [SeqDebug][BG] job done (failure path) — gated by DEBUG_FLAGS.seq.
+    // Lets us see the exact error string (e.g. "CHATGPT_SUBMIT_FAILED:
+    // duplicate attachments detected") reaching the BG so we can
+    // correlate with content-script logs.
+    try {
+      debugLog('seq', '[SeqDebug][BG] job done (failure path)', {
+        jobId,
+        success: false,
+        imageUrlsCount: 0,
+        imagesCount: 0,
+        error: payload?.error || 'ChatGPT job failed',
+      })
+    } catch (_) {}
     await chatgptUpdateJob(jobId, {
       status: 'failed',
       error: payload?.error || 'ChatGPT job failed',
@@ -994,7 +1033,29 @@ async function handleChatGPTJobDone(jobId: string, msg: Record<string, unknown>)
   }
 
   const imageUrls = payload.imageUrls || []
+  const images = Array.isArray(payload.images)
+    ? payload.images.filter((image) => image && (image.data || image.url))
+    : imageUrls.map((url) => ({
+        mediaType: 'image' as const,
+        url,
+        source: 'chatgpt',
+        mimeType: 'image/png',
+      }))
   console.log('[ChatGPT][Background] job done — image count:', imageUrls.length)
+
+  // [SeqDebug][BG] job done — gated by DEBUG_FLAGS.seq.
+  // Captures the exact terminal state of the job (success/failure +
+  // imageUrls count + error string) so we can correlate content-script
+  // duplicate-detected failures back to the BG-side payload.
+  try {
+    debugLog('seq', '[SeqDebug][BG] job done', {
+      jobId,
+      success: !!(payload && payload.success),
+      imageUrlsCount: imageUrls.length,
+      imagesCount: images.length,
+      error: payload?.error || '',
+    })
+  } catch (_) {}
 
   let downloaded = 0
   if (job.autoDownload && imageUrls.length > 0) {
@@ -1018,6 +1079,7 @@ async function handleChatGPTJobDone(jobId: string, msg: Record<string, unknown>)
   await chatgptUpdateJob(jobId, {
     status: 'done',
     imageUrls,
+    images,
     downloaded,
     finishedAt: Date.now(),
     error: '',
@@ -1216,6 +1278,25 @@ async function runChatGPTPromptLocked(
 ): Promise<ChatGPTPromptStartResult> {
   console.log('[ChatGPT][Background] runChatGPTPrompt called, prompt len:', payload.prompt?.length)
 
+  // [SeqDebug][BG] chatgpt prompt payload — gated by DEBUG_FLAGS.seq.
+  // Surfaces the count + fingerprints of mediaUploads at the BG
+  // boundary, plus the set of already-stored jobIds, so we can verify
+  // nothing leaks across jobs.
+  try {
+    const existingJobs = await chatgptReadJobs()
+    const mediaUploads = Array.isArray(payload.mediaUploads) ? payload.mediaUploads : []
+    const fingerprints = mediaUploads.map((m) => {
+      const base64 = typeof m?.base64 === 'string' ? m.base64 : ''
+      return 'd[' + base64.length + ']:' + base64.slice(0, 64)
+    })
+    debugLog('seq', '[SeqDebug][BG] chatgpt prompt payload', {
+      requestFingerprint,
+      mediaUploadsCount: mediaUploads.length,
+      fingerprints,
+      previousJobIdsInStore: Object.keys(existingJobs),
+    })
+  } catch (_) {}
+
   const runningDuplicate = await chatgptFindRunningJobByFingerprint(requestFingerprint)
   if (runningDuplicate) {
     console.warn('[ChatGPT][Background] duplicate submit reused running job:', runningDuplicate.jobId)
@@ -1260,6 +1341,7 @@ async function runChatGPTPromptLocked(
     autoDownload: !!payload.autoDownload,
     outputFolder: payload.outputFolder,
     imageUrls: [],
+    images: [],
     downloaded: 0,
     error: '',
     tabId,
@@ -1279,6 +1361,7 @@ async function runChatGPTPromptLocked(
       payload: {
         prompt: payload.prompt,
         ratio: payload.ratio,
+        fallbackPrefix: payload.fallbackPrefix,
         autoDownload: payload.autoDownload,
         timeoutMs,
         jobId,

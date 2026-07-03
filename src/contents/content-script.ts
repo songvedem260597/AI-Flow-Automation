@@ -65,6 +65,69 @@ function safeSendAwait(message) {
   })
 }
 
+// ── Debug flag (verbose). ────────────────────────────────────────────────
+// Enable with:
+//   localStorage.setItem('FLOW_DEBUG_VERBOSE', '1')
+//   window.__FLOW_DEBUG_VERBOSE__ = true
+//
+// When false (default), the following prefixes are silenced in this file
+// (gated at every call site, not stripped, so the devtools stay quiet
+// during normal runs but can be re-enabled without rebuilding):
+//   [SeqDebug]                — TEMPORARY diagnostics we accumulated
+//                               while investigating the sequential
+//                               multi-generate duplicate attachments
+//                               bug.
+//   [ChatGPT][UploadDiag]     — verbose per-strategy trace inside
+//                               uploadImage (composer probe, paste
+//                               dispatch, etc.).
+//   [ChatGPT][CountDiag]      — broad-counter verbose dump (used by
+//                               the legacy chatgptCountComposerAttachments
+//                               path; we now also have the
+//                               composer-scoped visual counter).
+//   [ChatGPT][Collect] rejected / rejected#…  — per-reason rejection
+//                                 log from chatgptCollectGeneratedImages.
+//
+// The unconditional "important short" log lines below stay always-on:
+//
+//   [ChatGPT][BatchUpload] start / done / failed
+//   [ChatGPT][Job] submit verified / result detected
+//   [ChatGPT][Job] send click attempted / send button found|enabled
+//   [ChatGPT][Job] prompt insert verified
+//   [ChatGPT][Job] hard-fail (multi-image batch failed)
+//
+// Read once at bundle evaluation time. Mirrors the pattern used by
+// flow-content.ts (FLOW_DEBUG_VERBOSE). Safe in the chatgpt.com tab
+// because content scripts run in the ISOLATED world with `window` and
+// `localStorage` available.
+var FLOW_DEBUG_VERBOSE = (() => {
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage.getItem('FLOW_DEBUG_VERBOSE') === '1') {
+      return true
+    }
+  } catch (_) {}
+  try {
+    if (typeof window !== 'undefined' && window.__FLOW_DEBUG_VERBOSE__ === true) {
+      return true
+    }
+  } catch (_) {}
+  return false
+})()
+
+// [SeqDebug] prefix accepts BOTH the legacy FLOW_DEBUG_VERBOSE gate
+// AND the new shared DEBUG_FLAGS.seq gate. Read lazily so a user can
+// set localStorage.AI_FLOW_DEBUG_SEQ = '1' without rebuilding.
+function seqDebugOn(): boolean {
+  try {
+    if (FLOW_DEBUG_VERBOSE) return true
+    if (typeof localStorage !== 'undefined' && localStorage.getItem('AI_FLOW_DEBUG_SEQ') === '1') return true
+    if (typeof localStorage !== 'undefined' && localStorage.getItem('AI_FLOW_DEBUG') === '1') return true
+  } catch (_) {}
+  return false
+}
+
+// Direct `if (FLOW_DEBUG_VERBOSE) console.log(...)` is used at every
+// gated call site (matches the pattern in flow-content.ts).
+
 // Fire-and-forget heartbeat to the background. Used by the
 // runChatGPTJob polling loop to signal that the job is alive and what
 // state it is in. The background stores lastProgressAt + progress
@@ -73,15 +136,17 @@ function safeSendAwait(message) {
 function chatgptSendProgress(jobId, payload) {
   if (!jobId) return
   try {
-    console.log('[ChatGPT][Progress] heartbeat', {
-      jobId,
-      phase: payload.phase,
-      generating: payload.generating,
-      candidateImages: payload.candidateImages,
-      acceptedImages: payload.acceptedImages,
-      hasPendingImage: payload.hasPendingImage,
-      elapsedMs: payload.elapsedMs,
-    })
+    if (FLOW_DEBUG_VERBOSE) {
+      console.log('[ChatGPT][Progress] heartbeat', {
+        jobId,
+        phase: payload.phase,
+        generating: payload.generating,
+        candidateImages: payload.candidateImages,
+        acceptedImages: payload.acceptedImages,
+        hasPendingImage: payload.hasPendingImage,
+        elapsedMs: payload.elapsedMs,
+      })
+    }
   } catch (_) {}
   safeSendFireAndForget({
     action: 'CHATGPT_JOB_PROGRESS',
@@ -188,15 +253,53 @@ const AIFlowContentScript = {
     throw new Error('Prompt input not found')
   },
 
-  async uploadImage(imageData) {
-    // Capture `this` once — the method body uses many arrow
-    // functions and nested `new Promise((resolve) => { … })`
-    // callbacks whose lexical `this` would otherwise resolve to
-    // the enclosing `function`'s `this` (undefined in strict mode),
-    // not the host object. We want to call `this.chatgptCountComposerAttachments`
-    // and `this.chatgptSleep` reliably regardless of nesting depth.
+  async uploadImage(imageData, uploadContext) {
+    // uploadContext (optional):
+    //   beforeCount        — composer attachment count captured BEFORE
+    //                        dispatching this upload. Combined with
+    //                        `expectedTotalCount`, it lets each strategy
+    //                        decide whether a "duplicate" is genuine
+    //                        (we caused 2 tiles from 1 upload) or just
+    //                        a late attach from a previous strategy
+    //                        (target already reached).
+    //   expectedTotalCount — the final composer count expected after
+    //                        ALL items in this batch land. Used as an
+    //                        upper bound: any count above this is a
+    //                        real duplicate and we must abort.
     const self = this
+    const ctx = uploadContext || {}
+    const ctxBeforeCount = (typeof ctx.beforeCount === 'number') ? ctx.beforeCount : null
+    const ctxExpectedTotal = (typeof ctx.expectedTotalCount === 'number' && ctx.expectedTotalCount > 0)
+      ? ctx.expectedTotalCount
+      : null
+    // HARD GUARD: multi-image runs must NEVER fall through this
+    // function. The P1/P2 paste strategy (and its late-attach
+    // acceptance gate) was empirically observed to attach twice for
+    // the same File in a multi-item batch — ChatGPT's paste handler
+    // is queued, so a second item's P1 paste would land alongside
+    // the previous item's still-pending P1 dispatch, producing
+    // `before: 1, expectedTotal: 2, final: 4`. Single-item runs
+    // (expectedTotalCount === 1) are still allowed because the race
+    // only manifests when 2+ items are in flight.
+    if (ctxExpectedTotal !== null && ctxExpectedTotal > 1) {
+      console.warn('[ChatGPT][Upload] legacy paste upload disabled for multi-image', {
+        expectedTotal: ctxExpectedTotal,
+        jobId: ctx.jobId || null,
+        index: ctx.index || null,
+      })
+      return {
+        success: false,
+        error: 'legacy paste upload disabled for multi-image',
+      }
+    }
+    const ctxTargetCount = (ctxBeforeCount !== null && ctxExpectedTotal !== null)
+      ? Math.min(ctxBeforeCount + 1, ctxExpectedTotal)
+      : (ctxBeforeCount !== null ? ctxBeforeCount + 1 : null)
     const diagLog = (label, extra) => {
+      // [UploadDiag] — gated by FLOW_DEBUG_VERBOSE. Per-strategy
+      // verbose trace inside uploadImage: composer probe, paste
+      // dispatch, file input enumeration, etc. Silenced by default.
+      if (!FLOW_DEBUG_VERBOSE) return
       if (extra !== undefined) console.log('[ChatGPT][UploadDiag] ' + label, extra)
       else console.log('[ChatGPT][UploadDiag] ' + label)
     }
@@ -208,6 +311,9 @@ const AIFlowContentScript = {
       url: location.href,
       mediaStartsWithDataColon: typeof imageData === 'string' && imageData.indexOf('data:') === 0,
       mediaLength: typeof imageData === 'string' ? imageData.length : 0,
+      ctxBeforeCount,
+      ctxTargetCount,
+      ctxExpectedTotal,
     })
 
     // ── Decode the media payload (data URL). Done synchronously and
@@ -618,6 +724,49 @@ const AIFlowContentScript = {
       })
     }
 
+    // ── Idempotent late-attach guard. ────────────────────────────────
+    //
+    // ChatGPT's paste / file-input handlers are asynchronous and
+    // queued: a previous strategy's dispatch may still be processing
+    // when we move on. Reading the count BEFORE each strategy lets us
+    // accept a previously-enqueued attach instead of dispatching
+    // another paste/file-input event that would attach twice.
+    //
+    // Returns:
+    //   { accepted: true,  currentCount }   — composer already at or
+    //                                         above target AND not
+    //                                         above expectedTotal. The
+    //                                         caller should treat the
+    //                                         upload as a success.
+    //   { accepted: false, currentCount }   — keep going.
+    //   { accepted: false, currentCount, duplicate: true, reason }
+    //                                      — composer exceeds
+    //                                         expectedTotal: real
+    //                                         duplicate, abort.
+    function checkLateAttach(stageLabel) {
+      const current = self.chatgptCountComposerAttachments()
+      const target = ctxTargetCount
+      const expected = ctxExpectedTotal
+      if (target === null) {
+        return { accepted: false, currentCount: current }
+      }
+      // Real duplicate: we exceeded the upper bound. Abort.
+      if (expected !== null && current > expected) {
+        return {
+          accepted: false,
+          currentCount: current,
+          duplicate: true,
+          reason: 'current(' + current + ') > expectedTotal(' + expected + ')',
+          stage: stageLabel,
+        }
+      }
+      // Already at or above target but not above expected — accept.
+      if (current >= target) {
+        return { accepted: true, currentCount: current }
+      }
+      return { accepted: false, currentCount: current }
+    }
+
     // ── Strategy execution with per-strategy polling. ─────────────────
     const maxStepMs = 100
     const pollMaxMs = 5000
@@ -634,19 +783,80 @@ const AIFlowContentScript = {
     }
 
     // Helper: extract an actionable outcome from a poll result.
-    function classifyDelta(delta) {
-      if (delta >= 2) return 'duplicate'
-      if (delta === 1) return 'ok'
-      return 'none'
+    //
+    // Idle-target semantics:
+    //   * target  = ctxTargetCount   (where we want to land after this item)
+    //   * ceiling = ctxExpectedTotal (where the whole batch expects to land)
+    //
+    // Outcomes:
+    //   'late'       — composer already at-or-above target. The attach
+    //                   came from a previous strategy's still-pending
+    //                   dispatch; treat as success.
+    //   'ok'         — delta >= 1 AND final count ≤ ceiling.
+    //   'duplicate'  — final count > ceiling. This is a real duplicate.
+    //   'none'       — no delta, keep trying next strategy.
+    function classifyDelta(pollResult) {
+      const final = pollResult.finalCount
+      const target = ctxTargetCount
+      const ceiling = ctxExpectedTotal
+      // Late attach: target reached by previous strategy's pending work.
+      if (target !== null && final >= target && final <= (ceiling === null ? final : ceiling)) {
+        return { kind: 'late', finalCount: final, peak: pollResult.peak }
+      }
+      // Real duplicate: ceiling exceeded.
+      if (ceiling !== null && final > ceiling) {
+        return { kind: 'duplicate', finalCount: final, peak: pollResult.peak }
+      }
+      // Single attach (or, when no context, delta === 1).
+      if (target !== null) {
+        if (final > pollResult.before) {
+          return { kind: 'ok', finalCount: final, peak: pollResult.peak }
+        }
+        return { kind: 'none', finalCount: final, peak: pollResult.peak }
+      }
+      // Context-free fallback (kept for safety if uploadContext was omitted).
+      if (pollResult.delta >= 2) return { kind: 'duplicate', finalCount: final, peak: pollResult.peak }
+      if (pollResult.delta === 1) return { kind: 'ok', finalCount: final, peak: pollResult.peak }
+      return { kind: 'none', finalCount: final, peak: pollResult.peak }
     }
 
     // ── Strategy P: synthetic paste on the composer (primary path).
     //    Real browser diagnostics showed that ChatGPT accepts a
     //    `ClipboardEvent('paste', { clipboardData })` (P1) on the
     //    composer. If P1 fires but produces no attachment delta in
-    //    the short poll window, we try the Event('paste') +
+    //    the (longer) poll window, we try the Event('paste') +
     //    clipboardData getter (P2). Only after P1 AND P2 both fail
     //    do we fall through to A/B/C. ──
+    //
+    // Late-attach guard: BEFORE dispatching the first paste event,
+    // re-read the composer count. If a previous strategy's pending
+    // dispatch has already attached (or another item in the batch
+    // raced ahead), accept the upload without dispatching anything
+    // new — otherwise we'd attach twice.
+    {
+      const lateCheck = checkLateAttach('P-before-dispatch')
+      if (lateCheck.duplicate) {
+        log('duplicate detected via late check', {
+          stage: lateCheck.stage,
+          currentCount: lateCheck.currentCount,
+          expectedTotal: ctxExpectedTotal,
+          target: ctxTargetCount,
+          reason: lateCheck.reason,
+        })
+        return {
+          success: false,
+          error: 'CHATGPT_SUBMIT_FAILED: duplicate attachments detected',
+        }
+      }
+      if (lateCheck.accepted) {
+        log('previous strategy attached late — accepting', {
+          stage: lateCheck.stage,
+          currentCount: lateCheck.currentCount,
+          target: ctxTargetCount,
+        })
+        return { success: true, strategy: 'late-attach' }
+      }
+    }
     log('strategy=P paste start')
     {
       const pasteTarget = pickPasteTarget()
@@ -670,22 +880,37 @@ const AIFlowContentScript = {
         // ── P1: ClipboardEvent constructor. ──
         log('strategy=P1 ClipboardEvent start')
         const dispatchedP1 = dispatchPasteOn(pasteTarget, dtP, 'P1')
+        let afterP1Count = beforeP
         if (dispatchedP1) {
-          // Short poll — 1.5s — for the typical ~500ms commit. If
+          // Longer poll window — paste processing in ChatGPT is queued
+          // and may take several seconds to commit. 8s is the minimum
+          // the chatgpt paste pipeline reliably settles within. If
           // delta > 0 here, we return success immediately without
           // touching A/B/C.
-          const pollP1 = await pollOnce(beforeP, 1500, maxStepMs)
-          const classP1 = classifyDelta(pollP1.delta)
-          if (classP1 === 'duplicate') {
-            log('strategy=P1 duplicate attachments detected', { before: beforeP, peak: pollP1.peak })
+          const pollP1 = await pollOnce(beforeP, 8000, maxStepMs)
+          const classP1 = classifyDelta(pollP1)
+          afterP1Count = pollP1.finalCount
+          if (classP1.kind === 'duplicate') {
+            log('strategy=P1 duplicate attachments detected', {
+              before: beforeP,
+              peak: pollP1.peak,
+              final: pollP1.finalCount,
+              expectedTotal: ctxExpectedTotal,
+            })
             return {
               success: false,
               error: 'CHATGPT_SUBMIT_FAILED: duplicate attachments detected',
             }
           }
-          if (classP1 === 'ok') {
-            log('attachment detected', { strategy: 'P1', before: beforeP, after: pollP1.peak })
-            return { success: true, strategy: 'P1' }
+          if (classP1.kind === 'late' || classP1.kind === 'ok') {
+            const acceptedLateAttach = classP1.kind === 'late' && pollP1.finalCount === beforeP
+            log('attachment detected', {
+              strategy: 'P1',
+              before: beforeP,
+              after: pollP1.peak,
+              kind: classP1.kind,
+            })
+            return { success: true, strategy: 'P1', acceptedLateAttach: !!acceptedLateAttach }
           }
           log('strategy=P1 no attachment delta', { before: beforeP, after: pollP1.peak })
         } else {
@@ -693,33 +918,112 @@ const AIFlowContentScript = {
         }
 
         // ── P2: Event('paste') + clipboardData getter. ──
-        log('strategy=P2 Event getter start')
-        // Re-sample baseline in case the composer state changed.
-        const beforeP2 = self.chatgptCountComposerAttachments()
-        const dispatchedP2 = dispatchPasteOn(pasteTarget, dtP, 'P2')
-        if (!dispatchedP2) {
-          diagLog('strategy=P2 dispatch failed — Event constructor threw')
-        }
-        // Full poll window for P2 (since the diagnostic confirmed
-        // ~500ms typical, 5s ceiling matches A/B/C).
-        const pollP2 = await pollOnce(beforeP2, pollMaxMs, maxStepMs)
-        const classP2 = classifyDelta(pollP2.delta)
-        if (classP2 === 'duplicate') {
-          log('strategy=P2 duplicate attachments detected', { before: beforeP2, peak: pollP2.peak })
+        //
+        // Late-attach guard AGAIN: between P1's poll and P2's dispatch,
+        // the count may have finally caught up. If so, accept.
+        const lateCheckP2 = checkLateAttach('P2-before-dispatch')
+        if (lateCheckP2.duplicate) {
+          log('duplicate detected via late check', {
+            stage: lateCheckP2.stage,
+            currentCount: lateCheckP2.currentCount,
+            expectedTotal: ctxExpectedTotal,
+            target: ctxTargetCount,
+            reason: lateCheckP2.reason,
+          })
           return {
             success: false,
             error: 'CHATGPT_SUBMIT_FAILED: duplicate attachments detected',
           }
         }
-        if (classP2 === 'ok') {
-          log('attachment detected', { strategy: 'P2', before: beforeP2, after: pollP2.peak })
+        if (lateCheckP2.accepted) {
+          log('previous strategy attached late — accepting', {
+            stage: lateCheckP2.stage,
+            currentCount: lateCheckP2.currentCount,
+            target: ctxTargetCount,
+          })
+          return { success: true, strategy: 'late-attach' }
+        }
+        log('strategy=P2 Event getter start')
+        const beforeP2 = self.chatgptCountComposerAttachments()
+        const dispatchedP2 = dispatchPasteOn(pasteTarget, dtP, 'P2')
+        if (!dispatchedP2) {
+          diagLog('strategy=P2 dispatch failed — Event constructor threw')
+        }
+        // Keep P2 poll short; if P1 had a chance to fire (pollOnce waited
+        // 8s), P2 should fall through quickly so we don't keep stacking
+        // paste events on ChatGPT's queue.
+        const pollP2 = await pollOnce(beforeP2, 2000, maxStepMs)
+        const classP2 = classifyDelta(pollP2)
+        const afterP2Count = pollP2.finalCount
+        if (classP2.kind === 'duplicate') {
+          log('strategy=P2 duplicate attachments detected', {
+            before: beforeP2,
+            peak: pollP2.peak,
+            final: pollP2.finalCount,
+            expectedTotal: ctxExpectedTotal,
+          })
+          return {
+            success: false,
+            error: 'CHATGPT_SUBMIT_FAILED: duplicate attachments detected',
+          }
+        }
+        if (classP2.kind === 'late' || classP2.kind === 'ok') {
+          log('attachment detected', {
+            strategy: 'P2',
+            before: beforeP2,
+            after: pollP2.peak,
+            kind: classP2.kind,
+          })
           return { success: true, strategy: 'P2' }
         }
         log('strategy=P2 no attachment delta', { before: beforeP2, after: pollP2.peak })
+        // [SeqDebug][ChatGPT] upload item counts — gated by
+        // seqDebugOn(). Helps correlate whether late-attach
+        // detection closed the race before we fell through to A/B/C.
+        try {
+          if (seqDebugOn()) {
+            console.log('[SeqDebug][ChatGPT] upload item counts', {
+              jobId: ctx.jobId || null,
+              index: ctx.index || null,
+              beforeCount: beforeP,
+              targetCount: ctxTargetCount,
+              expectedTotalCount: ctxExpectedTotal,
+              afterP1Count,
+              afterP2Count,
+              acceptedLateAttach: false,
+            })
+          }
+        } catch (_) {}
       }
     }
 
     // ── Strategy A: 3-tier assignment + dual events. ──────────────────
+    {
+      // Late-attach guard: accept if a previous strategy's pending
+      // dispatch already brought the count up to target.
+      const lateCheckA = checkLateAttach('A-before-dispatch')
+      if (lateCheckA.duplicate) {
+        log('duplicate detected via late check', {
+          stage: lateCheckA.stage,
+          currentCount: lateCheckA.currentCount,
+          expectedTotal: ctxExpectedTotal,
+          target: ctxTargetCount,
+          reason: lateCheckA.reason,
+        })
+        return {
+          success: false,
+          error: 'CHATGPT_SUBMIT_FAILED: duplicate attachments detected',
+        }
+      }
+      if (lateCheckA.accepted) {
+        log('previous strategy attached late — accepting', {
+          stage: lateCheckA.stage,
+          currentCount: lateCheckA.currentCount,
+          target: ctxTargetCount,
+        })
+        return { success: true, strategy: 'late-attach' }
+      }
+    }
     let input = best
     log('strategy=A assign+change start', {
       tagName: input && input.tagName,
@@ -735,22 +1039,51 @@ const AIFlowContentScript = {
       diagLog('strategy=A assignment result', { tier, fileCount })
       dispatchInputAndChange(input)
       const pollA = await pollOnce(beforeA, pollMaxMs, maxStepMs)
-      const classA = classifyDelta(pollA.delta)
-      if (classA === 'duplicate') {
-        log('strategy=A duplicate attachments detected', { before: beforeA, peak: pollA.peak })
+      const classA = classifyDelta(pollA)
+      if (classA.kind === 'duplicate') {
+        log('strategy=A duplicate attachments detected', {
+          before: beforeA,
+          peak: pollA.peak,
+          final: pollA.finalCount,
+          expectedTotal: ctxExpectedTotal,
+        })
         return {
           success: false,
           error: 'CHATGPT_SUBMIT_FAILED: duplicate attachments detected',
         }
       }
-      if (classA === 'ok') {
-        log('attachment detected', { strategy: 'A', before: beforeA, after: pollA.peak, tier })
+      if (classA.kind === 'late' || classA.kind === 'ok') {
+        log('attachment detected', { strategy: 'A', before: beforeA, after: pollA.peak, kind: classA.kind, tier })
         return { success: true, strategy: 'A' }
       }
       log('strategy=A no attachment delta', { before: beforeA, after: pollA.peak, tier })
     }
 
     // ── Strategy B: drop event fallback. ──────────────────────────────
+    {
+      const lateCheckB = checkLateAttach('B-before-dispatch')
+      if (lateCheckB.duplicate) {
+        log('duplicate detected via late check', {
+          stage: lateCheckB.stage,
+          currentCount: lateCheckB.currentCount,
+          expectedTotal: ctxExpectedTotal,
+          target: ctxTargetCount,
+          reason: lateCheckB.reason,
+        })
+        return {
+          success: false,
+          error: 'CHATGPT_SUBMIT_FAILED: duplicate attachments detected',
+        }
+      }
+      if (lateCheckB.accepted) {
+        log('previous strategy attached late — accepting', {
+          stage: lateCheckB.stage,
+          currentCount: lateCheckB.currentCount,
+          target: ctxTargetCount,
+        })
+        return { success: true, strategy: 'late-attach' }
+      }
+    }
     log('strategy=B drop start')
     const dropTarget = pickDropTarget()
     if (dropTarget) {
@@ -758,16 +1091,21 @@ const AIFlowContentScript = {
       const beforeB = self.chatgptCountComposerAttachments()
       dispatchDropOn(dropTarget, dtB)
       const pollB = await pollOnce(beforeB, pollMaxMs, maxStepMs)
-      const classB = classifyDelta(pollB.delta)
-      if (classB === 'duplicate') {
-        log('strategy=B duplicate attachments detected', { before: beforeB, peak: pollB.peak })
+      const classB = classifyDelta(pollB)
+      if (classB.kind === 'duplicate') {
+        log('strategy=B duplicate attachments detected', {
+          before: beforeB,
+          peak: pollB.peak,
+          final: pollB.finalCount,
+          expectedTotal: ctxExpectedTotal,
+        })
         return {
           success: false,
           error: 'CHATGPT_SUBMIT_FAILED: duplicate attachments detected',
         }
       }
-      if (classB === 'ok') {
-        log('attachment detected', { strategy: 'B', before: beforeB, after: pollB.peak })
+      if (classB.kind === 'late' || classB.kind === 'ok') {
+        log('attachment detected', { strategy: 'B', before: beforeB, after: pollB.peak, kind: classB.kind })
         return { success: true, strategy: 'B' }
       }
       log('strategy=B no attachment delta', { before: beforeB, after: pollB.peak })
@@ -776,6 +1114,30 @@ const AIFlowContentScript = {
     }
 
     // ── Strategy C: click attach button + retry. ──────────────────────
+    {
+      const lateCheckC = checkLateAttach('C-before-dispatch')
+      if (lateCheckC.duplicate) {
+        log('duplicate detected via late check', {
+          stage: lateCheckC.stage,
+          currentCount: lateCheckC.currentCount,
+          expectedTotal: ctxExpectedTotal,
+          target: ctxTargetCount,
+          reason: lateCheckC.reason,
+        })
+        return {
+          success: false,
+          error: 'CHATGPT_SUBMIT_FAILED: duplicate attachments detected',
+        }
+      }
+      if (lateCheckC.accepted) {
+        log('previous strategy attached late — accepting', {
+          stage: lateCheckC.stage,
+          currentCount: lateCheckC.currentCount,
+          target: ctxTargetCount,
+        })
+        return { success: true, strategy: 'late-attach' }
+      }
+    }
     log('strategy=C attach button click start')
     const clickResult = clickAttachButton()
     diagLog('strategy=C click result', clickResult)
@@ -790,16 +1152,21 @@ const AIFlowContentScript = {
       diagLog('strategy=C assignment result', { tier: tierC, fileCount: fcC, score: re.score })
       dispatchInputAndChange(retryInput)
       const pollC = await pollOnce(beforeC, pollMaxMs, maxStepMs)
-      const classC = classifyDelta(pollC.delta)
-      if (classC === 'duplicate') {
-        log('strategy=C duplicate attachments detected', { before: beforeC, peak: pollC.peak })
+      const classC = classifyDelta(pollC)
+      if (classC.kind === 'duplicate') {
+        log('strategy=C duplicate attachments detected', {
+          before: beforeC,
+          peak: pollC.peak,
+          final: pollC.finalCount,
+          expectedTotal: ctxExpectedTotal,
+        })
         return {
           success: false,
           error: 'CHATGPT_SUBMIT_FAILED: duplicate attachments detected',
         }
       }
-      if (classC === 'ok') {
-        log('attachment detected', { strategy: 'C', before: beforeC, after: pollC.peak, tier: tierC })
+      if (classC.kind === 'late' || classC.kind === 'ok') {
+        log('attachment detected', { strategy: 'C', before: beforeC, after: pollC.peak, kind: classC.kind, tier: tierC })
         return { success: true, strategy: 'C' }
       }
       log('strategy=C no attachment delta', { before: beforeC, after: pollC.peak, tier: tierC })
@@ -811,6 +1178,289 @@ const AIFlowContentScript = {
     return {
       success: false,
       error: 'CHATGPT_SUBMIT_FAILED: media upload did not attach',
+    }
+  },
+
+  // ── Batch upload helpers (composer-scoped). ─────────────────────────
+  //
+  // These helpers narrow the upload / count / cleanup paths to the
+  // composer DOM subtree only. The earlier broad selectors
+  // (`chatgptCountComposerAttachments`, `chatgptFindComposerAttachmentRoots`)
+  // were over-counting because ChatGPT renders transient overlays
+  // and tooltips outside the composer that incidentally match the
+  // broad attachment selectors. The batch path bypasses that problem
+  // by limiting every read to `[data-testid="composer"]` /
+  // `form:has([data-testid="send-button"])` and counting only tiles
+  // that have a remove button OR an `img[src]` preview ≥ 48px.
+  //
+  // P1/P2/A/B/C remain as a fallback for single-item uploads; the
+  // batch path is the primary entry point for multi-image runs.
+
+  // ── Composer root: locate the actual composer subtree so that all
+  //    visual-count / cleanup / input-lookup operations are scoped to
+  //    it. Returns null if no composer is mounted yet. ──
+  chatgptGetComposerRoot() {
+    return (
+      document.querySelector('[data-testid="composer"]') ||
+      document.querySelector('form:has([data-testid="send-button"])') ||
+      document.querySelector('main form') ||
+      document.querySelector('#prompt-textarea')?.closest('form') ||
+      null
+    )
+  },
+
+  // ── Decode a base64 (data URL or raw) to a File. Used by the batch
+  //    path to build the DataTransfer for input[type=file]. ──
+  chatgptBase64ToFile(base64, name, mimeType = 'image/png') {
+    const clean = base64.includes(',') ? base64.split(',').pop() || '' : base64
+    const bin = atob(clean)
+    const bytes = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) {
+      bytes[i] = bin.charCodeAt(i)
+    }
+    return new File([bytes], name, { type: mimeType })
+  },
+
+  // ── Locate the composer's file input. Heuristic ladder: ──
+  //    1. accept contains image/png/jpeg/jpg
+  //    2. id / name / aria-label contains "upload" / "image" / "photo"
+  //    3. fall back to the first <input type="file"> on the page
+  // ──
+  chatgptFindFileInput() {
+    const inputs = Array.from(document.querySelectorAll('input[type="file"]'))
+    const imageInput =
+      inputs.find((input) => {
+        const accept = (input.getAttribute('accept') || '').toLowerCase()
+        const id = (input.id || '').toLowerCase()
+        const name = (input.name || '').toLowerCase()
+        const aria = (input.getAttribute('aria-label') || '').toLowerCase()
+        return (
+          accept.includes('image') ||
+          accept.includes('png') ||
+          accept.includes('jpeg') ||
+          accept.includes('jpg') ||
+          id.includes('upload') ||
+          name.includes('upload') ||
+          aria.includes('upload') ||
+          aria.includes('image') ||
+          aria.includes('photo')
+        )
+      }) || inputs[0]
+    return imageInput || null
+  },
+
+  // ── Push files into an <input type="file"> via DataTransfer. The
+  //    browser reacts to a synchronous change event with the assigned
+  //    `files` property — ChatGPT's composer file input accepts this
+  //    and renders one tile per file. ──
+  chatgptSetInputFiles(input, files) {
+    const dt = new DataTransfer()
+    for (const file of files) {
+      dt.items.add(file)
+    }
+    input.files = dt.files
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+  },
+
+  // ── Composer-scoped cleanup. Removes only tiles within the composer
+  //    root — leaves chat history untouched. ──
+  chatgptRemoveComposerAttachmentsOnly() {
+    const beforeCount = this.chatgptCountVisualComposerAttachments()
+    const composer = this.chatgptGetComposerRoot()
+    if (!composer) {
+      return { beforeCount, removedCount: 0, afterCount: beforeCount }
+    }
+    const removeButtons = Array.from(
+      composer.querySelectorAll('button')
+    ).filter((btn) => {
+      const label = [
+        btn.getAttribute('aria-label') || '',
+        btn.getAttribute('data-testid') || '',
+        btn.textContent || '',
+        btn.title || '',
+      ].join(' ').toLowerCase()
+      return (
+        label.includes('remove') ||
+        label.includes('delete') ||
+        label.includes('xóa') ||
+        label.includes('xoá') ||
+        label.includes('close') ||
+        label.includes('dismiss')
+      )
+    })
+    let removedCount = 0
+    for (const btn of removeButtons) {
+      try {
+        btn.click()
+        removedCount++
+      } catch (err) {
+        console.warn('[ChatGPT][BatchUpload] remove button click failed', err)
+      }
+    }
+    return { beforeCount, removedCount, afterCount: this.chatgptCountVisualComposerAttachments() }
+  },
+
+  // ── Composer-scoped visual counter. Counts only tiles inside the
+  //    composer root that look like real attachment previews:
+  //      * a button whose accessible name is remove/delete/close/
+  //        dismiss/xóa, OR
+  //      * an <img> with blob:/data: src OR ≥ 48px on either axis
+  //    Skips anything inside `[data-message-author-role]` so that chat
+  //    history replies don't leak into the count. ──
+  chatgptCountVisualComposerAttachments() {
+    const composer = this.chatgptGetComposerRoot()
+    if (!composer) {
+      return 0
+    }
+    const isInMessageHistory = (el) => {
+      return !!el.closest('[data-message-author-role]')
+    }
+    const pickTileRoot = (el) => {
+      return (
+        el.closest('[data-testid*="attachment"]') ||
+        el.closest('[data-testid*="file"]') ||
+        el.closest('[data-testid*="preview"]') ||
+        el.closest('[class*="attachment"]') ||
+        el.closest('[class*="preview"]') ||
+        el.closest('[class*="file"]') ||
+        el.parentElement ||
+        el
+      )
+    }
+    const roots = new Set()
+    const buttons = Array.from(composer.querySelectorAll('button'))
+    for (const btn of buttons) {
+      if (isInMessageHistory(btn)) continue
+      const label = [
+        btn.getAttribute('aria-label') || '',
+        btn.getAttribute('data-testid') || '',
+        btn.textContent || '',
+        btn.title || '',
+      ].join(' ').toLowerCase()
+      const looksLikeRemove =
+        label.includes('remove') ||
+        label.includes('delete') ||
+        label.includes('xóa') ||
+        label.includes('xoá') ||
+        label.includes('close') ||
+        label.includes('dismiss')
+      if (!looksLikeRemove) continue
+      const root = pickTileRoot(btn)
+      if (!isInMessageHistory(root)) {
+        roots.add(root)
+      }
+    }
+    const imgs = Array.from(composer.querySelectorAll('img'))
+    for (const img of imgs) {
+      if (isInMessageHistory(img)) continue
+      const src = img.currentSrc || img.src || ''
+      const rect = img.getBoundingClientRect()
+      const looksLikeAttachmentImage =
+        src.startsWith('blob:') ||
+        src.startsWith('data:') ||
+        (rect && rect.width >= 48) ||
+        (rect && rect.height >= 48)
+      if (!looksLikeAttachmentImage) continue
+      const root = pickTileRoot(img)
+      if (!isInMessageHistory(root)) {
+        roots.add(root)
+      }
+    }
+    // De-dup: if both an img and its parent tile-root got added, keep
+    // the larger container (parent contains the child).
+    const list = Array.from(roots)
+    const deduped = list.filter((root) => {
+      return !list.some((other) => other !== root && other.contains(root))
+    })
+    return deduped.length
+  },
+
+  // ── Batch upload: build a File[] from base64 payloads and push
+  //    them all into one <input type="file"> via DataTransfer. ChatGPT
+  //    renders N tiles in one go, sidestepping the race we kept
+  //    hitting with per-item paste dispatch (P1's deferred commit
+  //    was triggering P2 to paste the same file again). ──
+  async uploadImagesBatchViaFileInput(mediaUploads, jobId) {
+    const expectedTotal = mediaUploads.length
+    console.log('[ChatGPT][BatchUpload] start', {
+      jobId,
+      expectedTotal,
+    })
+    const cleanup = await Promise.resolve(this.chatgptRemoveComposerAttachmentsOnly())
+    console.log('[ChatGPT][BatchUpload] cleanup done', cleanup)
+    if (cleanup.afterCount > 0) {
+      return {
+        success: false,
+        error: 'composer still has stale attachments after cleanup: ' + cleanup.afterCount,
+        visualCount: cleanup.afterCount,
+      }
+    }
+    const input = this.chatgptFindFileInput()
+    if (!input) {
+      return {
+        success: false,
+        error: 'file input not found',
+      }
+    }
+    console.log('[ChatGPT][BatchUpload] file input found', {
+      id: input.id,
+      name: input.name,
+      accept: input.accept,
+      multiple: input.multiple,
+    })
+    const files = mediaUploads.map((item, index) => {
+      const base64 = (item && (item.base64 || item.data)) || ''
+      const type = (item && item.type) || 'image/png'
+      const ext = type.includes('jpeg') || type.includes('jpg') ? 'jpg' : 'png'
+      const name = (item && item.name) || ('ai-flow-image-' + (index + 1) + '.' + ext)
+      return this.chatgptBase64ToFile(base64, name, type)
+    })
+    this.chatgptSetInputFiles(input, files)
+    console.log('[ChatGPT][BatchUpload] change dispatched', {
+      jobId,
+      fileCount: files.length,
+    })
+    const startedAt = Date.now()
+    let visualCount = 0
+    while (Date.now() - startedAt < 10000) {
+      visualCount = this.chatgptCountVisualComposerAttachments()
+      console.log('[ChatGPT][BatchUpload] settle tick', {
+        jobId,
+        expectedTotal,
+        visualCount,
+        elapsedMs: Date.now() - startedAt,
+      })
+      if (visualCount === expectedTotal) {
+        console.log('[ChatGPT][BatchUpload] settle done', {
+          jobId,
+          expectedTotal,
+          visualCount,
+        })
+        return { success: true, visualCount }
+      }
+      if (visualCount > expectedTotal) {
+        return {
+          success: false,
+          error: 'duplicate visual attachments detected: expected=' + expectedTotal + ', actual=' + visualCount,
+          visualCount,
+        }
+      }
+      await this.chatgptSleep(500)
+    }
+    visualCount = this.chatgptCountVisualComposerAttachments()
+    console.log('[ChatGPT][BatchUpload] verify final', {
+      jobId,
+      expectedTotal,
+      visualCount,
+    })
+    if (visualCount === expectedTotal) {
+      return { success: true, visualCount }
+    }
+    return {
+      success: false,
+      error: 'batch upload did not reach expected attachment count: expected=' + expectedTotal + ', actual=' + visualCount,
+      visualCount,
     }
   },
 
@@ -1009,6 +1659,9 @@ const AIFlowContentScript = {
   async chatgptSubmitAndWait(payload) {
     const prompt = payload?.prompt
     const ratio = payload?.ratio
+    const fallbackPrefix = typeof payload?.fallbackPrefix === 'string'
+      ? payload.fallbackPrefix
+      : 'Generate an image of: '
     const timeoutMs = Number(payload?.timeoutMs) || 300000
     const jobId = payload?.jobId
     const mediaUploads = Array.isArray(payload?.mediaUploads) ? payload.mediaUploads : []
@@ -1065,7 +1718,7 @@ const AIFlowContentScript = {
     // channel. The job continues running on this tab.
     // Use setTimeout(..., 0) so the synchronous ack can flush first.
     setTimeout(() => {
-      this.runChatGPTJob({ jobId, prompt, ratio, timeoutMs, mediaUploads }).catch(async (err) => {
+      this.runChatGPTJob({ jobId, prompt, ratio, fallbackPrefix, timeoutMs, mediaUploads }).catch(async (err) => {
         console.error('[ChatGPT] job crashed:', err)
         safeSendFireAndForget({
           action: 'CHATGPT_JOB_DONE',
@@ -1104,7 +1757,7 @@ const AIFlowContentScript = {
   //   7. capture POST-SUBMIT baseline; only count images/results that
   //      appear after the new assistant response — uploaded reference
   //      previews are explicitly excluded.
-  async runChatGPTJob({ jobId, prompt, ratio, timeoutMs, mediaUploads }) {
+  async runChatGPTJob({ jobId, prompt, ratio, fallbackPrefix, timeoutMs, mediaUploads }) {
     const sendDone = (result) => {
       safeSendFireAndForget({ action: 'CHATGPT_JOB_DONE', jobId, payload: result })
     }
@@ -1115,6 +1768,25 @@ const AIFlowContentScript = {
 
     const mediaCount = Array.isArray(mediaUploads) ? mediaUploads.length : 0
     const POLL_INTERVAL_MS = 1000 // preserved verbatim by Plasmo minifier
+
+    // [SeqDebug][ChatGPT] job start — gated by seqDebugOn().
+    // Surfaces the expectedMediaCount + mediaUploads fingerprints so we
+    // can verify the BG forwarded the exact same set we expected to
+    // receive, and spot any drift between expected vs uploaded vs
+    // counted.
+    try {
+      if (seqDebugOn()) {
+        const fingerprints = (mediaUploads || []).map((m) => {
+          const base64 = typeof m?.base64 === 'string' ? m.base64 : ''
+          return 'd[' + base64.length + ']:' + base64.slice(0, 64)
+        })
+        console.log('[SeqDebug][ChatGPT] job start', {
+          jobId,
+          expectedMediaCount: mediaCount,
+          fingerprints,
+        })
+      }
+    } catch (_) {}
 
     // 0. Pre-upload composer cleanup. If a previous attempt left
     //    attachments in the composer (e.g. submit failed and the
@@ -1136,6 +1808,39 @@ const AIFlowContentScript = {
         const removed = this.chatgptRemoveAllComposerAttachments()
         await this.chatgptSleep(300)
         const afterClear = this.chatgptCountComposerAttachments()
+        // [SeqDebug][ChatGPT] cleanup — gated by seqDebugOn().
+        // Captures the exact pre-cleanup, removed, and post-cleanup
+        // attachment counts plus per-root summaries so we can see
+        // whether the cleanup actually emptied the composer (or whether
+        // stale tiles leaked into the post-cleanup count and inflated
+        // mediaCount vs attached later). Skipped when debug is off to
+        // avoid the expensive roots walk.
+        if (seqDebugOn()) {
+          try {
+            const roots = Array.from(this.chatgptFindComposerAttachmentRoots()).slice(0, 5).map((el) => ({
+              tag: el.tagName,
+              className: typeof el.className === 'string' ? el.className.slice(0, 80) : null,
+              testId: el.getAttribute && el.getAttribute('data-testid'),
+              hasImg: !!el.querySelector && !!el.querySelector('img'),
+              hasRemoveButton: !!el.querySelector && !!el.querySelector('button[aria-label*="Remove" i], button[aria-label*="Close" i]'),
+              inComposer: true,
+              inMessage: !!el.closest('[data-message-author-role]'),
+              imgSrcSnippet: (() => {
+                try {
+                  const img = el.querySelector && el.querySelector('img[src]')
+                  return img ? String(img.getAttribute('src') || '').slice(0, 64) : null
+                } catch (_) { return null }
+              })(),
+            }))
+            console.log('[SeqDebug][ChatGPT] cleanup', {
+              jobId,
+              beforeCount: beforeClear,
+              removedCount: removed,
+              afterCount: afterClear,
+              roots,
+            })
+          } catch (_) {}
+        }
         if (removed > 0) {
           log('stale attachments removed', {
             requested: beforeClear,
@@ -1170,6 +1875,7 @@ const AIFlowContentScript = {
           jobId,
           prompt,
           ratio,
+          fallbackPrefix,
           timeoutMs,
           mediaCount,
           alreadyUploadedAttachments: true,
@@ -1179,73 +1885,182 @@ const AIFlowContentScript = {
       }
     }
 
-    // 0b. Upload reference images. Strategy escalation lives
-    //     INSIDE `uploadImage` (A: 3-tier input assignment; B: drop
-    //     event; C: click attach button + retry). The outer loop
-    //     makes a single call per media item. Reasons:
+    // 0b. Upload reference images. PRIMARY PATH: composer-scoped batch
+    //     upload via input[type=file] + DataTransfer. The earlier
+    //     per-item P1/P2/A/B/C path was observed to attach twice for
+    //     the same media (ChatGPT's paste handler is queued, so P1's
+    //     deferred commit + P2's redundant dispatch produced `final: 4
+    //     peak: 4` for an upload of 2 files). The batch path is
+    //     idempotent: it pushes N files in one change event and reads
+    //     a single visual count.
     //
-    //       * Each strategy has its own count-poll gate.
-    //       * Each strategy itself can take ~5 s to settle.
-    //       * Re-running `uploadImage` for the same media is a
-    //         non-idempotent UI side effect — duplicates risk.
+    //     Multi-image (mediaCount > 1): batch path ONLY. If the batch
+    //     fails, the job fails hard. No legacy P1/P2 fallback is
+    //     attempted because it would re-hit the same race we just
+    //     fixed.
     //
-    //     The outer loop's contract is: ONE call to uploadImage per
-    //     media; if it returns success → done; if it returns a
-    //     structured failure (duplicate / did-not-attach) → forward
-    //     the error to the job. We do NOT retry the same media.
+    //     Single-image (mediaCount === 1): batch path primary; if it
+    //     fails, fall back to the legacy per-item uploadImage loop
+    //     after a cleanup pass (single-item pastes never produced the
+    //     queue-stacking race).
     log('media upload start', { count: mediaCount })
     if (mediaCount > 0) {
-      for (let i = 0; i < mediaCount; i++) {
-        const media = mediaUploads[i]
-        if (!media || !media.base64 || !media.type) {
+      const isMultiImage = mediaCount > 1
+      console.log('[ChatGPT][Job] media batch upload start', {
+        jobId,
+        mediaCount,
+        mode: isMultiImage ? 'multi-strict' : 'single-with-fallback',
+      })
+      const batchResult = await this.uploadImagesBatchViaFileInput(mediaUploads, jobId)
+      console.log('[ChatGPT][Job] media batch upload result', {
+        jobId,
+        success: batchResult.success,
+        error: batchResult.error,
+        visualCount: batchResult.visualCount,
+      })
+      if (!batchResult.success) {
+        // [ChatGPT][BatchUpload] failed — emit BEFORE any decision so
+        // it's always visible regardless of fallback policy.
+        console.warn('[ChatGPT][BatchUpload] failed', {
+          jobId,
+          reason: batchResult.error,
+          visualCount: batchResult.visualCount,
+          mediaCount,
+        })
+        if (isMultiImage) {
+          // Multi-image: no legacy fallback. Fail hard. P1/P2/A/B/C
+          // must NOT run for multi-image batches.
+          log('media upload hard-fail (multi-image batch failed)', {
+            jobId,
+            error: batchResult.error,
+            visualCount: batchResult.visualCount,
+          })
           return sendDone({
             success: false,
-            error: 'ChatGPT media upload ' + (i + 1) + '/' + mediaCount +
-              ' skipped: missing base64/type',
+            error: 'CHATGPT_SUBMIT_FAILED: batch upload failed: ' + (batchResult.error || 'unknown'),
           })
         }
-        const dataUrl = 'data:' + media.type + ';base64,' + media.base64
-
-        let uploadResult = null
-        try {
-          uploadResult = await this.uploadImage(dataUrl)
-        } catch (e) {
-          // uploadImage is now an async operation that may either
-          // throw synchronously (decode error) or return a structured
-          // failure with { success: false, error }. Surface both.
-          uploadResult = {
-            success: false,
-            error: 'uploadImage threw: ' + ((e && e.message) || String(e)),
-          }
-        }
-        if (!uploadResult || uploadResult.success !== true) {
-          const errMsg = (uploadResult && uploadResult.error)
-            || 'CHATGPT_SUBMIT_FAILED: media upload did not attach'
-          return sendDone({ success: false, error: errMsg })
-        }
-        log('media upload attached', {
-          index: i + 1,
-          strategy: uploadResult.strategy || 'unknown',
+        // Single-image: legacy fallback allowed. Clean any partial
+        // batch state first so the per-item loop starts from 0
+        // attachments.
+        console.warn('[ChatGPT][Job] batch upload failed (single-image), falling back to legacy per-item upload', {
+          jobId,
+          error: batchResult.error,
+          visualCount: batchResult.visualCount,
         })
-        // Brief settle so the next upload sees a stable composer
-        // DOM. With Strategy C, the click may have caused a
-        // re-render; 200ms is generous.
-        await this.chatgptSleep(200)
+        const fallbackCleanup = await Promise.resolve(this.chatgptRemoveComposerAttachmentsOnly())
+        if (fallbackCleanup.afterCount > 0) {
+          return sendDone({
+            success: false,
+            error: 'CHATGPT_SUBMIT_FAILED: stale attachments after failed batch cleanup: ' + fallbackCleanup.afterCount,
+          })
+        }
+        for (let i = 0; i < mediaCount; i++) {
+          const media = mediaUploads[i]
+          const base64 = (media && (media.base64 || media.data)) || ''
+          const mime = (media && media.type) || 'image/png'
+          if (!base64) {
+            return sendDone({
+              success: false,
+              error: 'ChatGPT media upload ' + (i + 1) + '/' + mediaCount + ' skipped: missing base64',
+            })
+          }
+          const dataUrl = base64.startsWith('data:')
+            ? base64
+            : ('data:' + mime + ';base64,' + base64)
+          const beforeCount = this.chatgptCountVisualComposerAttachments()
+          let uploadResult = null
+          try {
+            uploadResult = await this.uploadImage(dataUrl, {
+              beforeCount,
+              expectedTotalCount: mediaCount,
+              jobId,
+              index: i + 1,
+            })
+          } catch (e) {
+            uploadResult = {
+              success: false,
+              error: 'uploadImage threw: ' + ((e && e.message) || String(e)),
+            }
+          }
+          if (!uploadResult || uploadResult.success !== true) {
+            const errMsg = (uploadResult && uploadResult.error)
+              || 'CHATGPT_SUBMIT_FAILED: media upload did not attach'
+            return sendDone({ success: false, error: errMsg })
+          }
+          log('media upload attached (legacy fallback)', {
+            index: i + 1,
+            strategy: uploadResult.strategy || 'unknown',
+            acceptedLateAttach: !!uploadResult.acceptedLateAttach,
+          })
+        }
       }
     }
     log('media upload done', { count: mediaCount })
 
     // 0c. Post-upload verification. Composer attachment count MUST
-    //     equal mediaCount. If the count is less, an upload silently
-    //     failed; if greater, duplicates slipped in (e.g. ChatGPT
-    //     accidentally attached the file twice to the same prompt).
+    //     equal mediaCount. Use the composer-scoped visual counter so
+    //     transient overlays / chat history are NOT counted. If the
+    //     count is less, an upload silently failed; if greater, the
+    //     file input or paste dispatch double-attached.
     if (mediaCount > 0) {
       // Give ChatGPT a moment to render any straggler previews.
       await this.chatgptSleep(200)
-      const attached = this.chatgptCountComposerAttachments()
+      const attached = this.chatgptCountVisualComposerAttachments()
       log('composer attachments counted', { attached, expected: mediaCount })
+      try {
+        if (seqDebugOn()) {
+          console.log('[SeqDebug][ChatGPT] post-upload visual count', {
+            jobId,
+            expectedMediaCount: mediaCount,
+            actualAttachmentCount: attached,
+          })
+        }
+      } catch (_) {}
       if (attached > mediaCount) {
         log('duplicate attachments detected', { attached, expected: mediaCount })
+        // [SeqDebug][ChatGPT] duplicate detected — gated by
+        // seqDebugOn(). Captures the exact roots the visual
+        // counter thinks are attachments when the post-upload count
+        // exceeds mediaCount. Bounded to 5 short summaries so a
+        // runaway composer overlay does not blow past the devtools'
+        // object-size limit (Datadog Browser SDK discards payloads
+        // > 225KB). The unconditional `log()` line above stays on so
+        // operators always see the failure in production logs.
+        try {
+          if (seqDebugOn()) {
+            const allRoots = Array.from(this.chatgptFindComposerAttachmentRoots())
+            const boundedRoots = allRoots.slice(0, 5)
+            const roots = boundedRoots.map((el) => ({
+              tag: el.tagName,
+              classNameShort: typeof el.className === 'string' ? el.className.slice(0, 60) : null,
+              testId: el.getAttribute && el.getAttribute('data-testid'),
+              hasImg: !!el.querySelector && !!el.querySelector('img'),
+              hasRemoveButton: !!el.querySelector && !!el.querySelector('button[aria-label*="Remove" i], button[aria-label*="Close" i]'),
+              inComposer: true,
+              inMessage: !!el.closest('[data-message-author-role]'),
+              imgSrcKind: (() => {
+                try {
+                  const img = el.querySelector && el.querySelector('img[src]')
+                  if (!img) return null
+                  const src = String(img.getAttribute('src') || '')
+                  if (src.startsWith('data:')) return 'data'
+                  if (src.startsWith('blob:')) return 'blob'
+                  if (src.startsWith('http')) return 'http'
+                  return 'other'
+                } catch (_) { return null }
+              })(),
+            }))
+            console.log('[SeqDebug][ChatGPT] duplicate detected', {
+              jobId,
+              phase: 'post-upload',
+              expectedMediaCount: mediaCount,
+              actualAttachmentCount: attached,
+              totalRoots: allRoots.length,
+              rootSummaries: roots,
+            })
+          }
+        } catch (_) {}
         return sendDone({
           success: false,
           error: 'CHATGPT_SUBMIT_FAILED: duplicate attachments detected',
@@ -1264,6 +2079,7 @@ const AIFlowContentScript = {
       jobId,
       prompt,
       ratio,
+      fallbackPrefix,
       timeoutMs,
       mediaCount,
       alreadyUploadedAttachments: false,
@@ -1279,6 +2095,7 @@ const AIFlowContentScript = {
     jobId,
     prompt,
     ratio,
+    fallbackPrefix,
     timeoutMs,
     mediaCount,
     alreadyUploadedAttachments,
@@ -1286,13 +2103,21 @@ const AIFlowContentScript = {
     log,
   }) {
 
-    // 1. Image-mode + ratio (best-effort; failures are logged, not fatal)
+    // 1. Image-mode + ratio. TobyFlow sends the raw prompt when ChatGPT image
+    //    mode can be activated; only fallback to prefixing the prompt if the
+    //    Create image tool cannot be toggled on.
+    let promptToSubmit = prompt
+    let imageModeReady = false
     try {
-      await this.chatgptEnableImageMode()
+      imageModeReady = await this.chatgptEnableImageMode()
     } catch (e) {
       console.log('[ChatGPT] image-mode toggle skipped:', (e && e.message) || e)
     }
-    if (ratio) {
+    if (!imageModeReady && fallbackPrefix) {
+      promptToSubmit = fallbackPrefix + promptToSubmit
+      log('image-mode fallback prefix applied', { fallbackPrefix })
+    }
+    if (ratio && imageModeReady) {
       try {
         await this.chatgptSetRatio(ratio)
       } catch (e) {
@@ -1324,7 +2149,7 @@ const AIFlowContentScript = {
     }
     // Clear any leftover text from a previous attempt.
     this.chatgptClearEditor(editor)
-    const inserted = this.chatgptInsertPrompt(editor, prompt)
+    const inserted = this.chatgptInsertPrompt(editor, promptToSubmit)
     if (!inserted) {
       return sendDone({
         success: false,
@@ -1334,7 +2159,7 @@ const AIFlowContentScript = {
     // Verify text actually landed in the composer.
     await this.chatgptSleep(150)
     const insertedText = (editor.textContent || editor.value || '')
-    if (!insertedText.includes(prompt.slice(0, 20))) {
+    if (!insertedText.includes(promptToSubmit.slice(0, 20))) {
       return sendDone({
         success: false,
         error: 'CHATGPT_SUBMIT_FAILED: prompt text not visible in composer after insert',
@@ -1346,14 +2171,73 @@ const AIFlowContentScript = {
     //    before submit we only re-check the count to catch any
     //    duplications caused by ChatGPT rendering between upload and
     //    submit. Same `duplicate attachments detected` failure path.)
+    //
+    //    Counted via the composer-scoped VISUAL counter so transient
+    //    overlays / chat history do not inflate the count and trip
+    //    the duplicate guard for a healthy composer.
     if (mediaCount > 0) {
-      const attachedBeforeSubmit = this.chatgptCountComposerAttachments()
+      const attachedBeforeSubmit = this.chatgptCountVisualComposerAttachments()
+      // [SeqDebug][ChatGPT] pre-submit visual count — gated by
+      // seqDebugOn(). Captures actual vs expected so we can see
+      // at a glance whether any UI churn between upload completion
+      // and submit inflated the count above mediaCount.
+      try {
+        if (seqDebugOn()) {
+          console.log('[SeqDebug][ChatGPT] pre-submit visual count', {
+            jobId,
+            expectedMediaCount: mediaCount,
+            actualAttachmentCount: attachedBeforeSubmit,
+          })
+        }
+      } catch (_) {}
       if (attachedBeforeSubmit > mediaCount) {
         log('duplicate attachments detected', {
           attached: attachedBeforeSubmit,
           expected: mediaCount,
           phase: 'pre-submit',
         })
+        // [SeqDebug][ChatGPT] duplicate detected (pre-submit) — gated by
+        // seqDebugOn(). Captures exact counts + per-root summaries
+        // so we can see which DOM roots are responsible for the
+        // over-count (e.g. an unrelated badge/popup counted as an
+        // attachment). Bounded to 5 short summaries + totalRoots count
+        // to avoid devtools payload overflow when ChatGPT renders
+        // transient overlays. The unconditional `log()` line above
+        // stays on so operators always see the failure in production
+        // logs.
+        try {
+          if (seqDebugOn()) {
+            const allRoots = Array.from(this.chatgptFindComposerAttachmentRoots())
+            const roots = allRoots.slice(0, 5).map((el) => ({
+              tag: el.tagName,
+              classNameShort: typeof el.className === 'string' ? el.className.slice(0, 60) : null,
+              testId: el.getAttribute && el.getAttribute('data-testid'),
+              hasImg: !!el.querySelector && !!el.querySelector('img'),
+              hasRemoveButton: !!el.querySelector && !!el.querySelector('button[aria-label*="Remove" i], button[aria-label*="Close" i]'),
+              inComposer: true,
+              inMessage: !!el.closest('[data-message-author-role]'),
+              imgSrcKind: (() => {
+                try {
+                  const img = el.querySelector && el.querySelector('img[src]')
+                  if (!img) return null
+                  const src = String(img.getAttribute('src') || '')
+                  if (src.startsWith('data:')) return 'data'
+                  if (src.startsWith('blob:')) return 'blob'
+                  if (src.startsWith('http')) return 'http'
+                  return 'other'
+                } catch (_) { return null }
+              })(),
+            }))
+            console.log('[SeqDebug][ChatGPT] duplicate detected', {
+              jobId,
+              phase: 'pre-submit',
+              expectedMediaCount: mediaCount,
+              actualAttachmentCount: attachedBeforeSubmit,
+              totalRoots: allRoots.length,
+              rootSummaries: roots,
+            })
+          }
+        } catch (_) {}
         return sendDone({
           success: false,
           error: 'CHATGPT_SUBMIT_FAILED: duplicate attachments detected',
@@ -1613,7 +2497,8 @@ const AIFlowContentScript = {
         if (generating) continue
         log('result detected', { count: newImages.length })
         log('CHATGPT_JOB_DONE sent', { success: true, imageCount: newImages.length })
-        return sendDone({ success: true, imageUrls: newImages })
+        const images = await this.chatgptBuildGeneratedImagePayloads(newImages)
+        return sendDone({ success: true, imageUrls: newImages, images })
       }
 
       // Pre-turn grace: we have not yet seen a new assistant turn.
@@ -2206,52 +3091,60 @@ const AIFlowContentScript = {
   chatgptCountComposerAttachments() {
     const tiles = this.chatgptFindComposerAttachmentRoots()
     const finalCount = tiles.size
-    try {
-      const win = typeof window !== 'undefined' ? window : null
-      if (win) win.__CHATGPT_COUNTDIAG_LAST_TS = Date.now()
-      const samples = Array.from(tiles).slice(0, 3).map((el) => {
-        const ancestors = []
-        let cur = el
-        for (let i = 0; i < 6 && cur && cur.parentElement; i++) {
-          cur = cur.parentElement
-          if (!cur) break
-          ancestors.push({
-            tag: cur.tagName,
-            testId: cur.getAttribute && cur.getAttribute('data-testid'),
-            className: typeof cur.className === 'string' ? cur.className.slice(0, 80) : null,
-            childCount: cur.children ? cur.children.length : 0,
-          })
-        }
-        return {
-          tag: el.tagName,
-          testId: el.getAttribute && el.getAttribute('data-testid'),
-          className: typeof el.className === 'string' ? el.className.slice(0, 80) : null,
-          outerHTML: (el.outerHTML || '').slice(0, 250),
-          ancestors,
-        }
-      })
-      const summary = { finalCount, samples }
-      console.log('[ChatGPT][CountDiag] composer attachment candidates', summary)
-      // Persist the latest diag to a hidden DOM node on the
-      // composer root so the test can read it via page.evaluate.
-      // The content script runs in an ISOLATED world — its `window`
-      // is not the same as the page's main-world `window` — so we
-      // publish the diag onto a visible DOM element instead.
+    // [CountDiag] — gated by FLOW_DEBUG_VERBOSE. The verbose
+    // composer-attachment-candidates dump + DOM-stash publish are
+    // skipped entirely when debug is off to keep the devtools quiet
+    // (this counter is called from many hot paths: late-attach gate,
+    // settle poll, post-upload verification, pre-submit verification,
+    // legacy chatgptWaitForAttachmentDelta loop).
+    if (FLOW_DEBUG_VERBOSE) {
       try {
-        const host = document.querySelector('#prompt-textarea')
-          ? document.querySelector('#prompt-textarea').closest('form') || document.body
-          : document.body
-        let stash = host.querySelector('#__chatgpt_count_diag_stash__')
-        if (!stash) {
-          stash = document.createElement('script')
-          stash.id = '__chatgpt_count_diag_stash__'
-          stash.type = 'application/json'
-          stash.style.display = 'none'
-          host.appendChild(stash)
-        }
-        stash.textContent = JSON.stringify(summary)
-      } catch {}
-    } catch (_) {}
+        const win = typeof window !== 'undefined' ? window : null
+        if (win) win.__CHATGPT_COUNTDIAG_LAST_TS = Date.now()
+        const samples = Array.from(tiles).slice(0, 3).map((el) => {
+          const ancestors = []
+          let cur = el
+          for (let i = 0; i < 6 && cur && cur.parentElement; i++) {
+            cur = cur.parentElement
+            if (!cur) break
+            ancestors.push({
+              tag: cur.tagName,
+              testId: cur.getAttribute && cur.getAttribute('data-testid'),
+              className: typeof cur.className === 'string' ? cur.className.slice(0, 80) : null,
+              childCount: cur.children ? cur.children.length : 0,
+            })
+          }
+          return {
+            tag: el.tagName,
+            testId: el.getAttribute && el.getAttribute('data-testid'),
+            className: typeof el.className === 'string' ? el.className.slice(0, 80) : null,
+            outerHTML: (el.outerHTML || '').slice(0, 250),
+            ancestors,
+          }
+        })
+        const summary = { finalCount, samples }
+        console.log('[ChatGPT][CountDiag] composer attachment candidates', summary)
+        // Persist the latest diag to a hidden DOM node on the
+        // composer root so the test can read it via page.evaluate.
+        // The content script runs in an ISOLATED world — its `window`
+        // is not the same as the page's main-world `window` — so we
+        // publish the diag onto a visible DOM element instead.
+        try {
+          const host = document.querySelector('#prompt-textarea')
+            ? document.querySelector('#prompt-textarea').closest('form') || document.body
+            : document.body
+          let stash = host.querySelector('#__chatgpt_count_diag_stash__')
+          if (!stash) {
+            stash = document.createElement('script')
+            stash.id = '__chatgpt_count_diag_stash__'
+            stash.type = 'application/json'
+            stash.style.display = 'none'
+            host.appendChild(stash)
+          }
+          stash.textContent = JSON.stringify(summary)
+        } catch {}
+      } catch (_) {}
+    }
     return finalCount
   },
 
@@ -2987,28 +3880,97 @@ const AIFlowContentScript = {
       out.push(src)
     })
 
-    // Diagnostics: log the scan outcome so a human watching the
-    // console can see why an image was or was not picked up.
+    // [ChatGPT][Collect] diagnostic block — gated by FLOW_DEBUG_VERBOSE.
+    // The unconditional `result detected` log fires elsewhere when
+    // out.length > 0, so this block is purely the per-rejection
+    // verbose trace used to debug the collect pipeline. Skipped when
+    // debug is off to keep the devtools quiet during normal runs.
     try {
-      console.log('[ChatGPT][Collect] assistantTurns=' + assistantTurns +
-        ' candidateImages=' + candidateCount +
-        ' acceptedImages=' + out.length +
-        ' scanned=' + scanned)
-      if (out.length === 0 && rejected.length > 0) {
-        const summary = {}
-        for (const r of rejected) {
-          summary[r.reason] = (summary[r.reason] || 0) + 1
+      if (FLOW_DEBUG_VERBOSE) {
+        console.log('[ChatGPT][Collect] assistantTurns=' + assistantTurns +
+          ' candidateImages=' + candidateCount +
+          ' acceptedImages=' + out.length +
+          ' scanned=' + scanned)
+        if (out.length === 0 && rejected.length > 0) {
+          const summary = {}
+          for (const r of rejected) {
+            summary[r.reason] = (summary[r.reason] || 0) + 1
+          }
+          console.log('[ChatGPT][Collect] rejected', summary)
+          // Log the first 5 rejections with detail so the user can
+          // diagnose what filter ate the image.
+          rejected.slice(0, 5).forEach((r, i) => {
+            console.log('[ChatGPT][Collect] rejected#' + i, r)
+          })
         }
-        console.log('[ChatGPT][Collect] rejected', summary)
-        // Log the first 5 rejections with detail so the user can
-        // diagnose what filter ate the image.
-        rejected.slice(0, 5).forEach((r, i) => {
-          console.log('[ChatGPT][Collect] rejected#' + i, r)
-        })
       }
     } catch (_) {}
 
     return out
+  },
+
+  async chatgptBuildGeneratedImagePayloads(imageUrls) {
+    const urls = Array.isArray(imageUrls) ? imageUrls : []
+    const out = []
+    for (let i = 0; i < urls.length; i++) {
+      const url = urls[i]
+      if (!url || typeof url !== 'string') continue
+      out.push(await this.chatgptGeneratedImageToPayload(url, i))
+    }
+    return out
+  },
+
+  async chatgptGeneratedImageToPayload(url, index) {
+    const fallbackName = 'chatgpt-generated-' + Date.now() + '-' + index + '.png'
+    const item = {
+      mediaType: 'image',
+      url,
+      name: fallbackName,
+      mimeType: 'image/png',
+      source: 'chatgpt',
+    }
+
+    if (url.indexOf('data:image/') === 0) {
+      const match = url.match(/^data:([^;]+);base64,/)
+      item.data = url
+      item.mimeType = match ? match[1] : 'image/png'
+      return item
+    }
+
+    try {
+      const response = await fetch(url)
+      if (!response.ok) throw new Error('HTTP ' + response.status)
+      const blob = await response.blob()
+      const mimeType = blob.type || 'image/png'
+      item.mimeType = mimeType
+      item.name = this.chatgptGeneratedImageNameFromMime(mimeType, index)
+      item.data = await new Promise((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(String(reader.result || ''))
+        reader.onerror = () => reject(reader.error || new Error('FileReader failed'))
+        reader.readAsDataURL(blob)
+      })
+    } catch (err) {
+      console.warn('[ChatGPT][Collect] could not convert generated image to data URL', {
+        index,
+        urlSnippet: String(url).slice(0, 120),
+        error: err && (err.message || String(err)),
+      })
+    }
+
+    return item
+  },
+
+  chatgptGeneratedImageNameFromMime(mimeType, index) {
+    const type = String(mimeType || 'image/png').toLowerCase()
+    const ext = type.indexOf('jpeg') >= 0
+      ? 'jpg'
+      : type.indexOf('webp') >= 0
+        ? 'webp'
+        : type.indexOf('gif') >= 0
+          ? 'gif'
+          : 'png'
+    return 'chatgpt-generated-' + Date.now() + '-' + index + '.' + ext
   },
 
   chatgptFindSubmitButton() {
@@ -3036,7 +3998,80 @@ const AIFlowContentScript = {
     return null
   },
 
+  chatgptClickChatGPTControl(el) {
+    if (!el) return
+    this.chatgptPointerClickButton(el)
+    this.chatgptInvokeReactOnClick(el)
+    try { el.click() } catch (_) {}
+  },
+
+  chatgptFindRatioButton() {
+    const selectors = [
+      'button[aria-label="Choose image aspect ratio"]',
+      'button[aria-label*="image aspect ratio" i]',
+      'button[aria-label*="aspect ratio" i]',
+      'button[data-testid*="aspect-ratio" i]',
+    ]
+    for (const s of selectors) {
+      try {
+        const btn = document.querySelector(s)
+        if (btn && this.chatgptIsButtonUsable(btn)) return btn
+      } catch {}
+    }
+    return null
+  },
+
+  chatgptNormalizeRatioForChatGPT(ratio) {
+    const raw = String(ratio || '').trim()
+    const lower = raw.toLowerCase()
+    const asciiLower = lower.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    const map = {
+      '9:16': { key: 'story', value: '9:16', label: 'Story 9:16' },
+      story: { key: 'story', value: '9:16', label: 'Story 9:16' },
+      doc: { key: 'story', value: '9:16', label: 'Story 9:16' },
+
+      '3:4': { key: 'portrait', value: '3:4', label: 'Portrait 3:4' },
+      portrait: { key: 'portrait', value: '3:4', label: 'Portrait 3:4' },
+
+      '1:1': { key: 'square', value: '1:1', label: 'Square 1:1' },
+      square: { key: 'square', value: '1:1', label: 'Square 1:1' },
+      vuong: { key: 'square', value: '1:1', label: 'Square 1:1' },
+
+      '4:3': { key: 'landscape', value: '4:3', label: 'Landscape 4:3' },
+      landscape: { key: 'landscape', value: '4:3', label: 'Landscape 4:3' },
+
+      '16:9': { key: 'widescreen', value: '16:9', label: 'Widescreen 16:9' },
+      widescreen: { key: 'widescreen', value: '16:9', label: 'Widescreen 16:9' },
+      ngang: { key: 'widescreen', value: '16:9', label: 'Widescreen 16:9' },
+    }
+    return map[raw] || map[lower] || map[asciiLower] || map['1:1']
+  },
+
+  chatgptFindOpenRatioMenu() {
+    const selectors = [
+      '[role="listbox"]',
+      '[role="menu"]',
+      '[data-radix-popper-content-wrapper]',
+      '[data-side][data-align]',
+    ]
+    for (const s of selectors) {
+      try {
+        const nodes = Array.from(document.querySelectorAll(s))
+        for (let i = nodes.length - 1; i >= 0; i--) {
+          const node = nodes[i]
+          const rect = node.getBoundingClientRect ? node.getBoundingClientRect() : null
+          if (rect && rect.width > 0 && rect.height > 0) return node
+        }
+      } catch {}
+    }
+    return null
+  },
+
   async chatgptEnableImageMode() {
+    // TobyFlow behavior: if ratio control is visible, image mode is already
+    // active. Do not click "Create image" again, because that can toggle it off.
+    if (this.chatgptFindRatioButton()) return true
+
     // Click the "+" / tools button in composer to open the tools menu
     const triggerSelectors = [
       'button[aria-label*="tools" i]',
@@ -3055,60 +4090,83 @@ const AIFlowContentScript = {
     }
     if (!trigger) throw new Error('tools trigger not found')
 
-    trigger.click()
+    this.chatgptClickChatGPTControl(trigger)
     await this.chatgptSleep(400)
 
     // Look for "Create image" / "Create an image" item in any open menu
-    const itemSelectors = [
-      '[role="menuitem"]:has-text("Create image")',
-      '[role="menuitem"]:has-text("Create an image")',
-      'button:has-text("Create image")',
-      'button:has-text("Create an image")',
-    ]
-    // querySelector doesn't support :has-text; use textContent filter
     const candidates = document.querySelectorAll('[role="menuitem"], button, [role="button"]')
     for (const el of candidates) {
       const txt = (el.textContent || '').trim().toLowerCase()
       if (txt === 'create image' || txt === 'create an image' || txt.startsWith('create image')) {
-        el.click()
+        const checked = el.getAttribute('aria-checked') === 'true' || el.getAttribute('data-state') === 'checked'
+        if (!checked) this.chatgptClickChatGPTControl(el)
         await this.chatgptSleep(400)
-        return true
+        for (let i = 0; i < 8; i++) {
+          if (this.chatgptFindRatioButton()) return true
+          await this.chatgptSleep(100)
+        }
+        return !!this.chatgptFindRatioButton()
       }
     }
     throw new Error('Create image menu item not found')
   },
 
   async chatgptSetRatio(ratio) {
-    const ratioMap = {
-      '1:1': 'square',
-      '16:9': 'landscape',
-      '9:16': 'portrait',
-      '4:3': 'standard',
-      '3:4': 'portrait-standard',
+    const target = this.chatgptNormalizeRatioForChatGPT(ratio)
+    let ratioButton = null
+    for (let i = 0; i < 6; i++) {
+      ratioButton = this.chatgptFindRatioButton()
+      if (ratioButton) break
+      await this.chatgptSleep(100)
     }
-    const value = ratioMap[ratio] || ratio
-    const selectors = [
-      `[data-aspect-ratio="${value}"]`,
-      `[data-value="${ratio}"]`,
-      `button[aria-label*="${ratio}"]`,
-      `button[aria-label*="${value}" i]`,
-    ]
-    for (const s of selectors) {
-      try {
-        const el = document.querySelector(s)
-        if (el) { el.click(); return true }
-      } catch {}
+    if (!ratioButton) throw new Error('ratio button not found: ' + ratio)
+
+    const currentText = (ratioButton.getAttribute('aria-label') || ratioButton.textContent || '').toLowerCase()
+    if (currentText.includes(target.value.toLowerCase()) || currentText.includes(target.key)) {
+      return true
     }
-    // Text-based fallback
-    const buttons = document.querySelectorAll('button')
-    for (const b of buttons) {
-      const t = (b.getAttribute('aria-label') || b.textContent || '').toLowerCase()
-      if (t.includes(value) || t.includes(ratio.toLowerCase())) {
-        b.click()
+
+    this.chatgptClickChatGPTControl(ratioButton)
+    await this.chatgptSleep(250)
+
+    let menu = null
+    for (let i = 0; i < 10; i++) {
+      menu = this.chatgptFindOpenRatioMenu()
+      if (menu) break
+      await this.chatgptSleep(120)
+    }
+
+    const ratioItems = []
+    if (menu) {
+      ratioItems.push(...Array.from(menu.querySelectorAll('[role="option"], [role="menuitemradio"], [role="menuitem"], button, [role="button"]')))
+    }
+    ratioItems.push(...Array.from(document.querySelectorAll('[role="option"], [role="menuitemradio"], [role="menuitem"]')))
+
+    const uniqueItems = Array.from(new Set(ratioItems))
+    const targetLabel = target.label.toLowerCase()
+    const targetValue = target.value.toLowerCase()
+    const targetKey = target.key.toLowerCase()
+
+    for (const item of uniqueItems) {
+      const label = (item.getAttribute('aria-label') || '').trim().toLowerCase()
+      const text = (item.textContent || '').trim().toLowerCase()
+      if (
+        label === targetLabel ||
+        text === targetLabel ||
+        label.includes(targetValue) ||
+        text.includes(targetValue) ||
+        label.includes(targetKey) ||
+        text.includes(targetKey)
+      ) {
+        this.chatgptClickChatGPTControl(item)
+        await this.chatgptSleep(150)
+        try { document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })) } catch (_) {}
         return true
       }
     }
-    throw new Error('ratio control not found: ' + ratio)
+
+    try { document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })) } catch (_) {}
+    throw new Error('ratio control not found: ' + ratio + ' -> ' + target.label)
   }
 }
 

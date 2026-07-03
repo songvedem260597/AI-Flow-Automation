@@ -41,6 +41,7 @@ import {
 import { runPipeline, stopPipeline, pausePipeline, resumePipeline } from '@/pipeline'
 import type { PipelineCallbacks } from '@/pipeline'
 import { usePipelineStore } from '@/stores/pipelineStore'
+import { debugLog, debugWarn } from '@/lib/debug'
 
 const SUPPORTED_NODE_TYPES: FlowNodeType[] = [
   'prompt',
@@ -1852,12 +1853,88 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     return true
   }
 
+  // ── Run-state DOM cleanup ─────────────────────────────────────────────
+  // Removes `ai-node-running|completed|failed` and `data-run-state` from
+  // EVERY workflow node wrapper + card in the Drawflow canvas. Used:
+  //   1) at the very start of a new run (handleRun) so stale classes
+  //      from a previous run cannot leak into the new run.
+  //   2) at the start of syncNodeRunStates() to make the sync
+  //      deterministic — we clear first, then re-apply for ONLY the
+  //      nodes currently in nodeRunStates. This guarantees that
+  //      downstream / next / upstream nodes that are NOT in
+  //      nodeRunStates stay neutral.
+  //
+  // Without this, a node that was 'completed' in a previous run would
+  // keep its ai-node-completed class during the next run (until
+  // something explicitly removed it), producing the "downstream glow"
+  // bug observed in the UI.
+  function clearAllRunDomClasses(): number {
+    const container = document.querySelector('.parent-drawflow')
+    if (!container) return 0
+    let cleared = 0
+    const nodes = container.querySelectorAll<HTMLElement>(
+      '[data-workflow-node-id], .df-node, .drawflow-node'
+    )
+    nodes.forEach((el) => {
+      const card =
+        (el.querySelector<HTMLElement>('.df-node-body'))
+        || (el.querySelector<HTMLElement>('.df-node-card'))
+        || (el.querySelector<HTMLElement>('.node-card'))
+        || (el.querySelector<HTMLElement>('.workflow-node-card'))
+      const targets: (HTMLElement | null)[] = [el, el.closest<HTMLElement>('.drawflow-node'), card]
+      for (const target of targets) {
+        if (!target) continue
+        if (
+          target.classList.contains('ai-node-running')
+          || target.classList.contains('ai-node-completed')
+          || target.classList.contains('ai-node-failed')
+          || target.hasAttribute('data-run-state')
+        ) {
+          target.classList.remove('ai-node-running', 'ai-node-completed', 'ai-node-failed')
+          target.removeAttribute('data-run-state')
+          cleared++
+        }
+      }
+    })
+    debugLog('nodeState', '[NodeStateDebug] run reset', { clearedDomNodes: cleared })
+    return cleared
+  }
+
   // ── Pipeline visual callbacks ─────────────────────────────────────────
   const pipelineCallbacks = useMemo(() => ({
     onNodeStart: (nodeId: string) => {
-      console.log('[GlowDebug][Editor] onNodeStart', { nodeId })
-      setNodeRunStates((prev) => ({ ...prev, [nodeId]: 'running' }))
-      // Activate incoming edges (data flowing into this node)
+      debugLog('edgeFlow', '[EdgeFlowDebug][Editor] node start', {
+        nodeId,
+        activeIncomingEdges: (workflow.edges || [])
+          .filter((e: WorkflowEdge) => e.target === nodeId)
+          .map((e: WorkflowEdge) => e.id),
+        incorrectlyActiveOutgoingEdges: (workflow.edges || [])
+          .filter((e: WorkflowEdge) => e.source === nodeId)
+          .map((e: WorkflowEdge) => e.id),
+        reason: 'only incoming edges become active — outgoing stay inactive until the NEXT node onNodeStart',
+      })
+      debugLog('glow', '[GlowDebug][Editor] onNodeStart', { nodeId })
+      // [NodeStateDebug] — surface the post-update nodeRunStates so we
+      // can verify downstream / next / unstarted nodes stay neutral
+      // and the only new entry is `nodeId: 'running'`.
+      let postStartNodeRunStates: Record<string, NodeRunStatus> = {}
+      setNodeRunStates((prev) => {
+        const next = { ...prev, [nodeId]: 'running' }
+        postStartNodeRunStates = next
+        return next
+      })
+      debugLog('nodeState', '[NodeStateDebug] onNodeStart', {
+        nodeId,
+        nextNodeRunStates: postStartNodeRunStates,
+        downstreamNodeIds: (workflow.edges || [])
+          .filter((e: WorkflowEdge) => e.source === nodeId)
+          .map((e: WorkflowEdge) => e.target),
+      })
+      // Activate incoming edges (data flowing into this node).
+      // Outgoing edges of THIS node are intentionally NOT activated
+      // here — they will only light up when the NEXT node starts, at
+      // which point the edge's target is the next node and it gets
+      // activated as part of that next-node's incoming set.
       const incoming = (workflow.edges || [])
         .filter((e: WorkflowEdge) => e.target === nodeId)
       if (incoming.length > 0) {
@@ -1876,7 +1953,17 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       }
     },
     onNodeComplete: (nodeId: string, output: unknown) => {
-      console.log('[GlowDebug][Editor] onNodeComplete', { nodeId, output })
+      debugLog('edgeFlow', '[EdgeFlowDebug][Editor] node complete', {
+        nodeId,
+        incomingEdgesToDeactivate: (workflow.edges || [])
+          .filter((e: WorkflowEdge) => e.target === nodeId)
+          .map((e: WorkflowEdge) => e.id),
+        outgoingEdgesNotActivatedHere: (workflow.edges || [])
+          .filter((e: WorkflowEdge) => e.source === nodeId)
+          .map((e: WorkflowEdge) => e.id),
+        reason: 'edge activation moves to the NEXT node onNodeStart',
+      })
+      debugLog('glow', '[GlowDebug][Editor] onNodeComplete', { nodeId, output })
       // Minimum visible duration so Media/Prompt that finish in <50ms
       // still flash the running glow before settling into the completed purple state.
       const startedAt = Date.now()
@@ -1885,34 +1972,33 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       const minRunningMs = 500
       const delayMs = Math.max(0, minRunningMs - elapsed)
       const finalize = () => {
-        setNodeRunStates((prev) => ({ ...prev, [nodeId]: 'completed' }))
+        let postCompleteNodeRunStates: Record<string, NodeRunStatus> = {}
+        setNodeRunStates((prev) => {
+          const next = { ...prev, [nodeId]: 'completed' }
+          postCompleteNodeRunStates = next
+          return next
+        })
+        debugLog('nodeState', '[NodeStateDebug] onNodeComplete', {
+          nodeId,
+          nextNodeRunStates: postCompleteNodeRunStates,
+          downstreamNodeIds: (workflow.edges || [])
+            .filter((e: WorkflowEdge) => e.source === nodeId)
+            .map((e: WorkflowEdge) => e.target),
+        })
         setNodeOutputs((prev) => ({ ...prev, [nodeId]: output }))
-      const completedNode = workflow.nodes.find((n: WorkflowNode) => n.id === nodeId)
-      if (completedNode?.type === 'generate') {
-        updateNode(nodeId, { _output: output } as Partial<FlowNodeData>)
-      }
-        // Activate outgoing edges (data flowing out of this node)
-        const outgoing = (workflow.edges || [])
-          .filter((e: WorkflowEdge) => e.source === nodeId)
-        if (outgoing.length > 0) {
-          setActiveEdges((prev) => {
-            const next = { ...prev }
-            for (const edge of outgoing) {
-              next[edge.id] = {
-                source: edge.source,
-                target: edge.target,
-                sourceHandle: edge.sourceHandle || 'output_1',
-                targetHandle: edge.targetHandle || 'input_1'
-              }
-            }
-            return next
-          })
+        const completedNode = workflow.nodes.find((n: WorkflowNode) => n.id === nodeId)
+        if (completedNode?.type === 'generate') {
+          updateNode(nodeId, { _output: output } as Partial<FlowNodeData>)
         }
-            // Refresh node DOM so Generate node shows output preview
+        // Refresh node DOM so Generate node shows output preview.
+        // We intentionally DO NOT activate outgoing edges here — the
+        // edge from the just-completed node to the next node lights
+        // up only when the next node's onNodeStart fires (at which
+        // point the edge's target is the next node and it gets
+        // activated as part of that next-node's incoming set).
         requestAnimationFrame(() => {
           const domNode = document.querySelector(`[data-workflow-node-id="${CSS.escape(nodeId)}"]`)
           if (domNode) {
-            // Re-render node HTML with updated output data
             const node = workflow.nodes.find((n: WorkflowNode) => n.id === nodeId)
             if (node) {
               const updatedNode = { ...node, data: { ...node.data, _output: output } }
@@ -1932,16 +2018,32 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       else finalize()
     },
     onNodeFail: (nodeId: string, error: string) => {
-      console.log('[GlowDebug][Editor] onNodeFail', { nodeId, error })
+      debugLog('glow', '[GlowDebug][Editor] onNodeFail', { nodeId, error })
       setNodeRunStates((prev) => ({ ...prev, [nodeId]: 'failed' }))
       // Deactivate ALL active edges so nothing glows forever
       setActiveEdges({})
     },
     onEdgeActive: (edgeId: string) => {
-      console.log('[GlowDebug][Editor] onEdgeActive', { edgeId })
       // Resolve source/target from workflow.edges — callback only ships edgeId.
       const edge = (workflow.edges || []).find((e: WorkflowEdge) => e.id === edgeId)
-      if (!edge) return
+      if (!edge) {
+        debugLog('glow', '[GlowDebug][Editor] onEdgeActive', { edgeId })
+        return
+      }
+      // Find the running target node — edges only become active when
+      // their TARGET is the currently running node (per the user rule:
+      // "active incoming edges of current running node only").
+      const runningTargetIds = (workflow.nodes || [])
+        .filter((n: WorkflowNode) => n.id === edge.target)
+        .map((n: WorkflowNode) => n.id)
+      debugLog('edgeFlow', '[EdgeFlowDebug][Editor] edge active', {
+        edgeId,
+        source: edge.source,
+        target: edge.target,
+        runningNodeId: edge.target,
+        reason: 'incoming-to-running-node',
+      })
+      debugLog('glow', '[GlowDebug][Editor] onEdgeActive', { edgeId, runningTargetIds })
       setActiveEdges((prev) => ({
         ...prev,
         [edgeId]: {
@@ -1953,7 +2055,16 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       }))
     },
     onEdgeInactive: (edgeId: string) => {
-      console.log('[GlowDebug][Editor] onEdgeInactive', { edgeId })
+      const edge = (workflow.edges || []).find((e: WorkflowEdge) => e.id === edgeId)
+      if (edge) {
+        debugLog('edgeFlow', '[EdgeFlowDebug][Editor] edge inactive', {
+          edgeId,
+          source: edge.source,
+          target: edge.target,
+          reason: 'node-finished',
+        })
+      }
+      debugLog('glow', '[GlowDebug][Editor] onEdgeInactive', { edgeId })
       setActiveEdges((prev) => {
         if (!(edgeId in prev)) return prev
         const next = { ...prev }
@@ -1963,10 +2074,25 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     },
   }), [workflow, updateNode]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Apply node run state classes to DOM nodes
+  // Apply node run state classes to DOM nodes.
+  //
+  // Deterministic: every call starts from a clean canvas — we
+  // clearAllRunDomClasses() first to remove any stale
+  // `ai-node-running|completed|failed` / `data-run-state` that may
+  // have been left on the DOM by a previous run, by an aborted run,
+  // or by a `dataSignature` change that wiped the innerHTML without
+  // re-applying state. Then we re-apply classes for ONLY the nodes
+  // currently present in `nodeRunStates`. Nodes NOT in nodeRunStates
+  // (including downstream / next / unstarted nodes) stay neutral.
+  //
+  // This eliminates the "downstream glow" UI bug where a node that
+  // ran in a previous run retained its `ai-node-completed` class
+  // during the next run, causing it to look like it was still
+  // running while the actual current node was elsewhere.
   const syncNodeRunStates = () => {
     const container = document.querySelector('.parent-drawflow')
     if (!container) return
+    clearAllRunDomClasses()
     for (const [nodeId, status] of Object.entries(nodeRunStates)) {
       const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
       const data = (node?.data || {}) as Record<string, unknown>
@@ -1978,7 +2104,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       const selectorTried = `[data-workflow-node-id="${CSS.escape(nodeId)}"]`
       const el = container.querySelector<HTMLElement>(selectorTried)
       if (!el) {
-        console.log('[GlowDebug][DOM] apply node state', {
+        debugLog('glow', '[GlowDebug][DOM] apply node state', {
           nodeId,
           state: visualStatus,
           found: false,
@@ -2000,10 +2126,20 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       const classNameBefore = el.className
       applyNodeVisualRunState(nodeId, visualStatus)
       const classNameAfter = el.className
+      const cardClassNameAfter = (() => {
+        try { return card.className } catch { return 'error' }
+      })()
       const computedBoxShadow = (() => {
         try { return getComputedStyle(card).boxShadow } catch { return 'error' }
       })()
-      console.log('[GlowDebug][DOM] apply node state', {
+      debugLog('nodeState', '[NodeStateDebug] sync apply', {
+        nodeId,
+        state: visualStatus,
+        found: true,
+        classNameAfter,
+        cardClassNameAfter,
+      })
+      debugLog('glow', '[GlowDebug][DOM] apply node state', {
         nodeId,
         state: visualStatus,
         found: true,
@@ -2011,10 +2147,55 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         classNameBefore,
         classNameAfter,
         cardTagName: card.tagName,
-        cardClassName: card.className,
+        cardClassName: cardClassNameAfter,
         computedBoxShadow
       })
     }
+
+    // ── Downstream-glow detector ────────────────────────────────────
+    // After re-applying, scan the DOM for any node that has a run
+    // class but is NOT in nodeRunStates. If we find one whose id is
+    // downstream of a currently-running node, that means a stale
+    // class leaked — useful for the next regression. We only log;
+    // we don't auto-fix because the deterministic clear-and-apply
+    // above should already have removed the stale class.
+    try {
+      const runningIds = Object.entries(nodeRunStates)
+        .filter(([, s]) => s === 'running')
+        .map(([id]) => id)
+      if (runningIds.length > 0) {
+        const downstreamOf = (id: string) => workflowRef.current.edges
+          .filter((e) => e.source === id)
+          .map((e) => e.target)
+        const downstreamIds = new Set<string>()
+        for (const rid of runningIds) {
+          for (const t of downstreamOf(rid)) downstreamIds.add(t)
+        }
+        for (const targetId of downstreamIds) {
+          const stateInMap = nodeRunStates[targetId]
+          if (stateInMap) continue
+          const el = container.querySelector<HTMLElement>(
+            `[data-workflow-node-id="${CSS.escape(targetId)}"]`
+          )
+          if (!el) continue
+          const className = el.getAttribute('class') || ''
+          const runState = el.getAttribute('data-run-state')
+          if (
+            className.includes('ai-node-running')
+            || className.includes('ai-node-completed')
+            || className.includes('ai-node-failed')
+            || runState
+          ) {
+            debugWarn('nodeState', '[NodeStateDebug] unexpected downstream glow', {
+              runningNodeId: runningIds,
+              downstreamNodeId: targetId,
+              downstreamClassName: className,
+              downstreamRunState: runState,
+            })
+          }
+        }
+      }
+    } catch (_) {}
   }
 
   // Apply active edge animations to Drawflow SVG paths.
@@ -2040,7 +2221,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       const sourceId = meta.source
       const targetId = meta.target
       if (!sourceId || !targetId) {
-        console.log('[GlowDebug][DOM] apply edge state', {
+        debugLog('glow', '[GlowDebug][DOM] apply edge state', {
           edgeId,
           source: sourceId,
           target: targetId,
@@ -2115,7 +2296,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
           classes: svg.getAttribute('class'),
           childClasses: Array.from(svg.children).map((c) => c.getAttribute('class')).join('|')
         }))
-        console.log('[GlowDebug][DOM] apply edge state', {
+        debugLog('glow', '[GlowDebug][DOM] apply edge state', {
           edgeId,
           source: sourceId,
           target: targetId,
@@ -2134,7 +2315,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       targetSvg.classList.add('connection-active')
       targetSvg.setAttribute('data-edge-id', edgeId)
       const classNameAfter = targetSvg.getAttribute('class') || ''
-      console.log('[GlowDebug][DOM] apply edge state', {
+      debugLog('glow', '[GlowDebug][DOM] apply edge state', {
         edgeId,
         source: sourceId,
         target: targetId,
@@ -3330,7 +3511,12 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       return
     }
 
-    // Clear previous run visual state before starting
+    // Clear previous run visual state before starting.
+    // Order matters: clear the DOM classes FIRST so the next
+    // syncNodeRunStates() pass (triggered by the React state changes
+    // below) re-applies classes from a clean slate, instead of having
+    // to first fight stale `ai-node-completed` from the previous run.
+    clearAllRunDomClasses()
     setNodeRunStates({})
     setActiveEdges({})
     setNodeOutputs({})
@@ -3341,6 +3527,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const handleStop = () => {
     stopPipeline()
     // Clear all visual state on stop so nothing glows
+    clearAllRunDomClasses()
     setNodeRunStates({})
     setActiveEdges({})
   }

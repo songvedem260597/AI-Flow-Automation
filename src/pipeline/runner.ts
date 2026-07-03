@@ -4,6 +4,7 @@ import { usePipelineStore } from '@/stores/pipelineStore'
 import { useHistoryStore } from '@/stores/dataStore'
 import { useSettingsStore } from '@/stores/settingsStore'
 import { hasExtensionContext, isContextInvalidated } from '@/lib/extensionContextGuard'
+import { debugLog, debugWarn, DEBUG_FLAGS } from '@/lib/debug'
 
 // Same helpers, plain JS names (avoid TS-only `unknown` typing here)
 const hasExtensionContextSafe = (): boolean => hasExtensionContext()
@@ -79,6 +80,18 @@ function asString(value: unknown): string {
 
 function compactStrings(values: string[]): string[] {
   return values.map((value) => value.trim()).filter(Boolean)
+}
+
+function mediaFingerprint(media: { data?: string; url?: string; name?: string }): string {
+  const data = media?.data || ''
+  const url = media?.url || ''
+  if (data) {
+    return 'd[' + data.length + ']:' + data.slice(0, 64)
+  }
+  if (url) {
+    return 'u[' + url.length + ']:' + url.slice(0, 96)
+  }
+  return 'empty'
 }
 
 function normalizeProvider(value: unknown, fallback: AIProvider): AIProvider {
@@ -164,30 +177,94 @@ export class PipelineRunner {
   }
 
   private emitStart(nodeId: string, nodeType: string) {
-    console.log('[GlowDebug][Runner] start', { nodeId })
+    // Edge active timing — incoming only:
+    //   When a node starts, only edges INCOMING to it (i.e. edges whose
+    //   target === nodeId) become active. Outgoing edges of the node
+    //   stay INACTIVE — they should only light up when the NEXT node
+    //   starts, at which point the edge's target is the next node and
+    //   it gets activated as part of that next-node's incoming set.
+    //
+    // This avoids the UI bug where the edge leaving a still-running
+    // node lights up early (e.g. edge G1 → G2 glowing while G1 is
+    // still rendering).
+    debugLog('edgeFlow', '[EdgeFlowDebug][Runner] node start', {
+      nodeId,
+      activeIncomingEdges: this.getIncomingEdgeIds(nodeId),
+      incorrectlyActiveOutgoingEdges: this.getOutgoingEdgeIds(nodeId),
+    })
+    debugLog('glow', '[GlowDebug][Runner] start', { nodeId })
     try { this.callbacks.onNodeStart?.(nodeId, nodeType) } catch {}
     for (const edge of this.workflow.edges.filter((e) => e.target === nodeId)) {
-      console.log('[GlowDebug][Runner] edgeActive', { edgeId: edge.id, source: edge.source, target: edge.target })
+      debugLog('edgeFlow', '[EdgeFlowDebug][Runner] edge active', {
+        runningNodeId: nodeId,
+        edgeId: edge.id,
+        source: edge.source,
+        target: edge.target,
+        reason: 'incoming-to-running-node',
+      })
+      debugLog('glow', '[GlowDebug][Runner] edgeActive', { edgeId: edge.id, source: edge.source, target: edge.target })
       try { this.callbacks.onEdgeActive?.(edge.id) } catch {}
     }
   }
 
   private emitComplete(nodeId: string, output: unknown) {
-    console.log('[GlowDebug][Runner] complete', { nodeId, output })
+    // Edge inactive timing — incoming only:
+    //   When a node completes, only edges INCOMING to it (i.e. edges
+    //   whose target === nodeId) become inactive — data has finished
+    //   flowing into the node. Outgoing edges of the node stay
+    //   INACTIVE (they were never active); they will only light up
+    //   when the next node starts.
+    //
+    // Outgoing edges of the just-completed node are NOT activated
+    // here — that activation lives in the next-node's onNodeStart,
+    // not here.
+    debugLog('edgeFlow', '[EdgeFlowDebug][Runner] node complete', {
+      nodeId,
+      deactivatingIncomingEdges: this.getIncomingEdgeIds(nodeId),
+    })
+    debugLog('glow', '[GlowDebug][Runner] complete', { nodeId, output })
     try { this.callbacks.onNodeComplete?.(nodeId, output) } catch {}
-    for (const edge of this.workflow.edges.filter((e) => e.source === nodeId)) {
-      console.log('[GlowDebug][Runner] edgeInactive', { edgeId: edge.id, source: edge.source, target: edge.target })
+    for (const edge of this.workflow.edges.filter((e) => e.target === nodeId)) {
+      debugLog('edgeFlow', '[EdgeFlowDebug][Runner] edge inactive', {
+        runningNodeId: nodeId,
+        edgeId: edge.id,
+        source: edge.source,
+        target: edge.target,
+        reason: 'node-finished',
+      })
+      debugLog('glow', '[GlowDebug][Runner] edgeInactive', { edgeId: edge.id, source: edge.source, target: edge.target })
       try { this.callbacks.onEdgeInactive?.(edge.id) } catch {}
     }
   }
 
   private emitInactive(nodeId: string) {
+    // Defensive cleanup — used on FAILURE only (the success path goes
+    // through emitComplete, which already deactivates incoming edges
+    // of the completed node). For failed nodes we don't know which
+    // edges are "active" semantically, so we deactivate both incoming
+    // and outgoing of the failed node. The editor's onEdgeInactive
+    // short-circuits on already-inactive edges so the duplicate work
+    // is harmless.
     for (const edge of this.workflow.edges.filter((e) => e.target === nodeId)) {
-      console.log('[GlowDebug][Runner] edgeInactive', { edgeId: edge.id, source: edge.source, target: edge.target })
+      debugLog('edgeFlow', '[EdgeFlowDebug][Runner] edge inactive (failure cleanup)', {
+        runningNodeId: nodeId,
+        edgeId: edge.id,
+        source: edge.source,
+        target: edge.target,
+        reason: 'node-failed',
+      })
+      debugLog('glow', '[GlowDebug][Runner] edgeInactive', { edgeId: edge.id, source: edge.source, target: edge.target })
       try { this.callbacks.onEdgeInactive?.(edge.id) } catch {}
     }
     for (const edge of this.workflow.edges.filter((e) => e.source === nodeId)) {
-      console.log('[GlowDebug][Runner] edgeInactive', { edgeId: edge.id, source: edge.source, target: edge.target })
+      debugLog('edgeFlow', '[EdgeFlowDebug][Runner] edge inactive (failure cleanup)', {
+        runningNodeId: nodeId,
+        edgeId: edge.id,
+        source: edge.source,
+        target: edge.target,
+        reason: 'node-failed',
+      })
+      debugLog('glow', '[GlowDebug][Runner] edgeInactive', { edgeId: edge.id, source: edge.source, target: edge.target })
       try { this.callbacks.onEdgeInactive?.(edge.id) } catch {}
     }
   }
@@ -251,6 +328,192 @@ export class PipelineRunner {
     return sorted
   }
 
+  // ── Lazy execution plan ──────────────────────────────────────────────
+  // The legacy `getSortedNodes()` is a textbook Kahn's algorithm that
+  // pops every node with in-degree 0 first. For a workflow like:
+  //
+  //     M1 → G1   M2 → G2
+  //     P1 → G1   P2 → G2
+  //                 G1 → G2
+  //
+  // the legacy order is [M1, P1, M2, P2, G1, G2] — M2/P2 execute BEFORE
+  // G1 completes, which makes them glow "completed" while G1 is still
+  // running. The UI then shows a downstream node finished early.
+  //
+  // The fix: build a lazy plan from the TERMINAL nodes (no outgoing
+  // edges), and only execute a node's direct upstream dependencies
+  // when the downstream node is about to run. For the same workflow:
+  //
+  //     terminals = [G2]
+  //     lazy plan = [M1, P1, G1, M2, P2, G2]
+  //
+  // — M2 and P2 execute AFTER G1 completes, so they only glow
+  // "completed" once G2 is actually starting up. That matches user
+  // intent and the visual lifecycle.
+  //
+  // The execution order is computed once at the start of run() and
+  // iterated like before — same retry / stop / pause semantics, same
+  // emitStart / emitComplete lifecycle. The only change is WHICH order
+  // we iterate.
+  private pickExecutionTargets(): WorkflowNode[] {
+    const nodes = this.getEnabledNodes()
+    if (nodes.length === 0) return []
+
+    const edges = this.getEnabledEdges(nodes)
+    const hasOutgoing = new Set<string>()
+    for (const edge of edges) hasOutgoing.add(edge.source)
+
+    const terminals = nodes.filter((node) => !hasOutgoing.has(node.id))
+    if (terminals.length > 0) return terminals
+
+    // Fallback: every node has an outgoing edge (e.g. feedback loop
+    // that isn't a true cycle, or workflow ending in a node whose
+    // outgoing edge points outside the enabled set). Use ALL enabled
+    // nodes as targets so we still execute the full graph.
+    return nodes
+  }
+
+  private buildLazyExecutionPlan(targets: WorkflowNode[]): WorkflowNode[] {
+    const nodes = this.getEnabledNodes()
+    const nodeMap = new Map(nodes.map((node) => [node.id, node]))
+    const edges = this.getEnabledEdges(nodes)
+    const originalIndex = new Map(nodes.map((n, idx) => [n.id, idx]))
+    const compareNodes = (a: WorkflowNode, b: WorkflowNode) => {
+      if (a.position.x !== b.position.x) return a.position.x - b.position.x
+      if (a.position.y !== b.position.y) return a.position.y - b.position.y
+      return (originalIndex.get(a.id) || 0) - (originalIndex.get(b.id) || 0)
+    }
+
+    // Group incoming edges by target. Sort each group's edges so we
+    // walk the "upstream chain" (the source whose own ancestry is
+    // longest — GENERATE nodes first, then by position) BEFORE
+    // walking sibling leaf sources. This makes the lazy plan match
+    // user intent: for the topology M1→G1, P1→G1, G1→G2, M2→G2,
+    // P2→G2 the DFS visits G2's incoming edges in order
+    // [G1, M2, P2] so the G1 chain (M1, P1, G1) is fully executed
+    // before M2 / P2 are touched. Walking [M2, P2, G1] would
+    // produce [M2, P2, M1, P1, G1, G2] which fires M2/P2 visual
+    // lifecycle while G1 is still pending.
+    const incomingByTarget = new Map<string, WorkflowEdge[]>()
+    for (const edge of edges) {
+      const list = incomingByTarget.get(edge.target) || []
+      list.push(edge)
+      incomingByTarget.set(edge.target, list)
+    }
+    for (const [targetId, list] of incomingByTarget) {
+      list.sort((a, b) => {
+        const aNode = nodeMap.get(a.source)
+        const bNode = nodeMap.get(b.source)
+        if (!aNode || !bNode) return 0
+        const rank = (n: WorkflowNode): number => {
+          if (n.type === 'generate') return 0
+          if (n.type === 'image' || n.type === 'video') return 1
+          return 2
+        }
+        const aRank = rank(aNode)
+        const bRank = rank(bNode)
+        if (aRank !== bRank) return aRank - bRank
+        return compareNodes(aNode, bNode)
+      })
+      incomingByTarget.set(targetId, list)
+    }
+
+    const visited = new Set<string>()
+    const plan: WorkflowNode[] = []
+    // Stack-based DFS to avoid recursion blowup on large workflows.
+    // We push a "frame" for each (nodeId, edgeIndex) pair so we can
+    // walk deps one at a time and resume after each dep finishes.
+    type Frame = { nodeId: string; edgeIndex: number }
+    const stack: Frame[] = []
+
+    // Sort targets so the plan visits them in a stable order. For two
+    // independent chains ending in two terminals, we want to walk the
+    // earlier (top-left) terminal's chain first.
+    const sortedTargets = [...targets].sort(compareNodes)
+
+    for (const target of sortedTargets) {
+      stack.push({ nodeId: target.id, edgeIndex: 0 })
+      while (stack.length > 0) {
+        // Cycle guard — if we ever revisit the same node within a
+        // single DFS branch, bail out instead of looping forever.
+        // The plan will still be valid (the visited check below
+        // prevents duplicates across branches); we just need to
+        // avoid infinite recursion.
+        const frame = stack[stack.length - 1]
+        const incoming = incomingByTarget.get(frame.nodeId) || []
+        const incomingNodeIds = incoming
+          .map((e) => e.source)
+          .filter((sid) => !visited.has(sid))
+
+        if (frame.edgeIndex === 0 && incomingNodeIds.length > 0) {
+          // Log the full dep list once per node (the first time we
+          // touch it on the stack), so operators can read the
+          // upstream chain at a glance.
+          const frameNode = nodeMap.get(frame.nodeId)
+          const frameTitle = (frameNode?.data as Record<string, unknown> | undefined)?.label as string || frameNode?.type
+          const depSummaries = incomingNodeIds.map((sid) => {
+            const sn = nodeMap.get(sid)
+            return {
+              nodeId: sid,
+              nodeTitle: (sn?.data as Record<string, unknown> | undefined)?.label as string || sn?.type,
+              type: sn?.type,
+            }
+          })
+          debugLog('scheduler', '[SchedulerDebug][Runner] execute deps', {
+            nodeId: frame.nodeId,
+            nodeTitle: frameTitle,
+            deps: depSummaries,
+          })
+        }
+
+        if (frame.edgeIndex < incoming.length) {
+          const edge = incoming[frame.edgeIndex]
+          frame.edgeIndex++
+          if (visited.has(edge.source)) continue
+          if (stack.some((f) => f.nodeId === edge.source)) {
+            // Cycle: edge.source is on the current DFS stack. Skip it
+            // rather than loop. This can happen if the workflow has
+            // a cycle that Kahn's algorithm would have rejected; we
+            // tolerate it here by treating the cycle edge as a no-op
+            // for scheduling (the downstream node will read context
+            // from earlier executions / fall back to undefined).
+            debugWarn('scheduler', '[SchedulerDebug][Runner] cycle detected, skipping edge', {
+              source: edge.source,
+              target: edge.target,
+              edgeId: edge.id,
+            })
+            continue
+          }
+          const sourceNode = nodeMap.get(edge.source)
+          if (!sourceNode) continue
+          stack.push({ nodeId: edge.source, edgeIndex: 0 })
+          continue
+        }
+
+        // All incoming edges walked — this node is ready to be added
+        // to the plan (post-order, so deps come before dependents).
+        stack.pop()
+        if (visited.has(frame.nodeId)) continue
+        visited.add(frame.nodeId)
+        const node = nodeMap.get(frame.nodeId)
+        if (node) {
+          plan.push(node)
+          debugLog('scheduler', '[SchedulerDebug][Runner] execute node', {
+            nodeId: frame.nodeId,
+            nodeTitle: node.data?.label || node.type,
+            type: node.type,
+            index: plan.length,
+          })
+        }
+      }
+    }
+
+    // Final dedup pass in case targets overlap (e.g. workflow with
+    // duplicate terminal references). Should be unreachable in
+    // practice but harmless.
+    return plan
+  }
+
   private getNodeInputs(node: WorkflowNode): NodeInputs {
     const nodes = this.getEnabledNodes()
     const nodeMap = new Map(nodes.map((item) => [item.id, item]))
@@ -294,11 +557,17 @@ export class PipelineRunner {
     const pipelineStore = usePipelineStore.getState()
     const settings = useSettingsStore.getState()
 
+    console.log(`[Runner] start workflow: ${this.workflow.name} (${this.workflow.nodes?.length || 0} nodes)`)
+
     try {
       await this.acquireWakeLock()
       pipelineStore.startPipeline(this.taskId)
       pipelineStore.addLog(this.taskId, 'info', `Workflow started: ${this.workflow.name}`)
 
+      // Compute both the legacy Kahn-topological order and the new
+      // lazy-dependency plan. The lazy plan is what we actually
+      // execute; the legacy order is logged for comparison so the
+      // [SchedulerDebug] log shows the exact diff that fixed the bug.
       const sortedNodes = this.getSortedNodes()
       const totalNodes = sortedNodes.length
       pipelineStore.addLog(
@@ -307,9 +576,23 @@ export class PipelineRunner {
         `Execution order: ${sortedNodes.map((node) => node.data.label || node.type).join(' -> ')}`
       )
 
+      const lazyTargets = this.pickExecutionTargets()
+      const lazyPlan = this.buildLazyExecutionPlan(lazyTargets)
+      debugLog('scheduler', '[SchedulerDebug][Runner] execution plan', {
+        oldOrder: sortedNodes.map((node) => `${node.id}:${node.data?.label || node.type}`),
+        newOrder: lazyPlan.map((node) => `${node.id}:${node.data?.label || node.type}`),
+        reason: 'lazy-dependency — execute a node\'s direct upstream only when the downstream is about to run',
+        lazyTargets: lazyTargets.map((node) => node.id),
+      })
+      pipelineStore.addLog(
+        this.taskId,
+        'info',
+        `Lazy plan: ${lazyPlan.map((node) => node.data.label || node.type).join(' -> ')}`
+      )
+
       const retryByNode = new Map<string, number>()
 
-      for (let i = 0; i < sortedNodes.length; i++) {
+      for (let i = 0; i < lazyPlan.length; i++) {
         if (this.shouldStop) {
           pipelineStore.stopPipeline(this.taskId)
           pipelineStore.addLog(this.taskId, 'warn', 'Workflow stopped by user')
@@ -321,15 +604,16 @@ export class PipelineRunner {
           if (this.shouldStop) break
         }
 
-        const node = sortedNodes[i]
+        const node = lazyPlan[i]
         const inputs = this.getNodeInputs(node)
-        const progress = Math.round(((i + 1) / totalNodes) * 100)
+        const progress = Math.round(((i + 1) / lazyPlan.length) * 100)
 
         pipelineStore.updateProgress(this.taskId, node.id, progress, this.context)
         pipelineStore.addLog(this.taskId, 'info', `Executing: ${node.data.label}`, node.id, {
           inputCount: inputs.items.length
         })
 
+        console.log(`[Runner] node start: ${node.id} (${node.type})`)
         // Emit visual state events
         this.emitStart(node.id, node.type)
 
@@ -342,6 +626,7 @@ export class PipelineRunner {
           })
           pipelineStore.addLog(this.taskId, 'success', `Completed: ${node.data.label}`, node.id)
 
+          console.log(`[Runner] node done: ${node.id} (${node.type})`)
           // Emit success events
           this.emitComplete(node.id, result)
           this.emitInactive(node.id)
@@ -372,7 +657,7 @@ export class PipelineRunner {
               node.id
             )
             try { this.callbacks.onNodeFail?.(node.id, errorMessage) } catch {}
-            console.log('[GlowDebug][Runner] fail', { nodeId: node.id, error: errorMessage })
+            debugLog('glow', '[GlowDebug][Runner] fail', { nodeId: node.id, error: errorMessage })
             this.emitInactive(node.id)
             pipelineStore.failPipeline(this.taskId, {
               nodeId: node.id,
@@ -393,7 +678,7 @@ export class PipelineRunner {
           }
 
           try { this.callbacks.onNodeFail?.(node.id, errorMessage) } catch {}
-          console.log('[GlowDebug][Runner] fail', { nodeId: node.id, error: errorMessage })
+          debugLog('glow', '[GlowDebug][Runner] fail', { nodeId: node.id, error: errorMessage })
           this.emitInactive(node.id)
           pipelineStore.failPipeline(this.taskId, {
             nodeId: node.id,
@@ -420,6 +705,7 @@ export class PipelineRunner {
           })
 
           pipelineStore.addLog(this.taskId, 'success', 'Workflow completed successfully')
+          console.log(`[Runner] workflow done: ${this.workflow.name}`)
         }
       }
     } catch (error) {
@@ -431,6 +717,7 @@ export class PipelineRunner {
         recoverable: false
       })
       pipelineStore.addLog(this.taskId, 'error', `Workflow failed: ${errorMessage}`)
+      console.error(`[Runner] workflow failed: ${this.workflow.name} — ${errorMessage}`)
     } finally {
       await this.releaseWakeLock()
       await this.adapter.cleanup()
@@ -528,7 +815,7 @@ export class PipelineRunner {
     }
 
     if (provider === 'chatgpt') {
-      return this.runChatGPTGenerate(data, prompt, mediaInputs)
+      return this.runChatGPTGenerate({ ...data, nodeId: node.id }, prompt, mediaInputs)
     }
 
     if (provider === 'google-flow') {
@@ -560,9 +847,47 @@ export class PipelineRunner {
   ): MediaInput[] {
     const allMedia: MediaInput[] = []
     for (const input of inputs.items) {
-      const media = this.coerceMedia(input.value)
-      if (media) allMedia.push({ ...media, targetHandle: input.targetHandle })
+      const mediaItems = this.coerceMediaList(input.value)
+      for (const media of mediaItems) {
+        allMedia.push({ ...media, targetHandle: input.targetHandle })
+      }
     }
+
+    // [SeqDebug][Runner] resolved generate inputs — TEMPORARY diagnostic,
+    // always-on while investigating sequential multi-generate duplicate
+    // attachments. Logs the upstream edge topology and the final media
+    // list (post-coercion) so we can verify whether the same upstream
+    // image is being sent twice via different paths (transitive ancestor
+    // collapse / edge duplication).
+    try {
+      const incomingEdges = inputs.items.map((input) => ({
+        edgeId: input.edge?.id,
+        source: input.sourceNode?.id,
+        sourceType: input.sourceNode?.type,
+        sourceHandle: input.sourceHandle,
+        targetHandle: input.targetHandle,
+      }))
+      const targetNodeId = inputs.items[0]?.edge?.target || '(unknown)'
+      debugLog('seq', '[SeqDebug][Runner] resolved generate inputs', {
+        nodeId: targetNodeId,
+        provider,
+        promptInputsCount: inputs.items.filter((i) => i.targetHandle === 'input_2').length,
+        mediaInputsCount: allMedia.length,
+        mediaInputs: allMedia.map((media, index) => ({
+          index,
+          sourceNodeId: incomingEdges.find((e) => e.targetHandle === media.targetHandle)?.source,
+          sourceHandle: incomingEdges.find((e) => e.targetHandle === media.targetHandle)?.sourceHandle,
+          targetHandle: media.targetHandle,
+          mediaType: media.mediaType,
+          hasData: Boolean(media.data),
+          hasUrl: Boolean(media.url),
+          name: media.name,
+          mimeType: media.mimeType,
+          fingerprint: mediaFingerprint(media),
+        })),
+        incomingEdges,
+      })
+    } catch (_) {}
 
     if (provider === 'chatgpt') {
       return allMedia.filter((media) => media.mediaType === 'image')
@@ -611,7 +936,7 @@ export class PipelineRunner {
     // Extra defensive filter: only count media that has actual upload
     // payload. Media without `data` cannot be uploaded, so retrying
     // would not re-trigger an upload (safe to retry).
-    const uploadable = mediaInputs.filter((m) => Boolean(m.data))
+    const uploadable = mediaInputs.filter((m) => Boolean(m.data || m.url))
     return uploadable.length > 0
   }
 
@@ -637,8 +962,8 @@ export class PipelineRunner {
     // + runtime-resolved content script injection) before sending
     // CHATGPT_SUBMIT_AND_WAIT, so the tab is guaranteed to have a
     // listener when the upload + submit fires.
-    const mediaUploads = mediaInputs
-      .filter((media) => Boolean(media.data))
+    const uploadableMediaInputs = await this.prepareUploadableMediaInputs(mediaInputs)
+    const mediaUploads = uploadableMediaInputs
       .map((media, index) => {
         const payload = dataUrlToUploadPayload(
           media,
@@ -651,11 +976,27 @@ export class PipelineRunner {
         }
       })
 
+    // [SeqDebug][Runner] chatgpt payload — TEMPORARY diagnostic,
+    // always-on while investigating sequential multi-generate duplicate
+    // attachments. Captures the EXACT mediaUploads we are about to ship
+    // to the background. Fingerprints let us see at a glance whether the
+    // same upstream image arrived twice (e.g. via both a direct edge AND
+    // a Media Node copy).
+    try {
+      debugLog('seq', '[SeqDebug][Runner] chatgpt payload', {
+        nodeId: asString(data.nodeId) || '(no-nodeId)',
+        promptLength: prompt.length,
+        mediaUploadsCount: mediaUploads.length,
+        fingerprints: mediaUploads.map((m) => mediaFingerprint({ data: 'data:' + m.type + ';base64,' + m.base64 })),
+      })
+    } catch (_) {}
+
     const response = await this.sendRuntimeMessage({
       action: 'RUN_CHATGPT_PROMPT',
       payload: {
         prompt,
         ratio: asString(data.aspectRatio) || DEFAULT_IMAGE_RATIO,
+        fallbackPrefix: 'Generate an image of: ',
         autoDownload: false,
         timeoutMs,
         mediaUploads,
@@ -682,7 +1023,37 @@ export class PipelineRunner {
     }
 
     const job = await this.waitForChatGPTJob(String(response.jobId), timeoutMs)
-    const imageUrls = Array.isArray(job.imageUrls) ? job.imageUrls : []
+    const jobImages = Array.isArray(job.images)
+      ? job.images
+          .map((image, index) => {
+            if (!isRecord(image)) return null
+            const dataUrl = asString(image.data) || asString(image.mediaData) || asString(image.imageData)
+            const url = asString(image.url) || asString(image.mediaUrl) || asString(image.imageUrl)
+            if (!dataUrl && !url) return null
+            return {
+              mediaType: 'image' as const,
+              data: dataUrl,
+              url,
+              name: asString(image.name) || asString(image.mediaName) || asString(image.imageName) || `chatgpt-generated-${index + 1}.png`,
+              mimeType: asString(image.mimeType) || asString(image.mediaMimeType) || 'image/png',
+              aspectRatio: asString(image.aspectRatio) || asString(data.aspectRatio) || DEFAULT_IMAGE_RATIO,
+              source: asString(image.source) || 'chatgpt',
+            }
+          })
+          .filter((image): image is NonNullable<typeof image> => Boolean(image))
+      : []
+    const imageUrls = Array.isArray(job.imageUrls)
+      ? job.imageUrls
+      : jobImages.map((image) => image.url || image.data || '').filter(Boolean)
+    const images = jobImages.length > 0
+      ? jobImages
+      : imageUrls.map((url: string) => ({
+          mediaType: 'image' as const,
+          url,
+          source: 'chatgpt',
+          mimeType: 'image/png',
+          aspectRatio: asString(data.aspectRatio) || DEFAULT_IMAGE_RATIO,
+        }))
     return {
       type: 'generation',
       provider: 'chatgpt',
@@ -692,7 +1063,7 @@ export class PipelineRunner {
       jobId: response.jobId,
       imageUrls,
       // Normalized media array for downstream nodes (Download, etc.)
-      images: imageUrls.map((url: string) => ({ url, source: 'chatgpt' })),
+      images,
       result: job
     }
   }
@@ -722,7 +1093,7 @@ export class PipelineRunner {
 
     const fileIds: string[] = []
     const fileNameMap: Record<string, string> = {}
-    const flowMediaInputs = mediaInputs.filter((media) => Boolean(media.data))
+    const flowMediaInputs = await this.prepareUploadableMediaInputs(mediaInputs)
 
     for (let index = 0; index < flowMediaInputs.length; index++) {
       const media = flowMediaInputs[index]
@@ -871,6 +1242,135 @@ export class PipelineRunner {
     }
   }
 
+  private coerceMediaList(value: unknown): MediaInput[] {
+    if (Array.isArray(value)) {
+      return value.flatMap((item) => this.coerceMediaList(item))
+    }
+    if (!isRecord(value)) return []
+
+    const media: MediaInput[] = []
+    const direct = this.coerceMedia(value)
+    if (direct) media.push(direct)
+
+    const inheritedAspectRatio = asString(value.aspectRatio)
+    const pushGeneratedMedia = (item: unknown, index: number) => {
+      if (!isRecord(item)) return
+      const generated = this.coerceMedia({
+        mediaType: item.mediaType || 'image',
+        data: asString(item.data) || asString(item.mediaData) || asString(item.imageData),
+        url: asString(item.url) || asString(item.mediaUrl) || asString(item.imageUrl),
+        name: asString(item.name) || asString(item.mediaName) || asString(item.imageName) || `generated-image-${index + 1}`,
+        mimeType: asString(item.mimeType) || asString(item.mediaMimeType) || 'image/png',
+        aspectRatio: asString(item.aspectRatio) || inheritedAspectRatio,
+      })
+      if (generated) media.push(generated)
+    }
+
+    const generatedImages = value.images
+    if (Array.isArray(generatedImages)) {
+      generatedImages.forEach(pushGeneratedMedia)
+    }
+
+    const imageUrls = value.imageUrls
+    if (Array.isArray(imageUrls)) {
+      imageUrls.forEach((url, index) => {
+        if (typeof url !== 'string' || !url) return
+        const alreadyIncluded = media.some((item) => item.url === url)
+        if (!alreadyIncluded) {
+          media.push({
+            mediaType: 'image',
+            url,
+            name: `generated-image-${index + 1}.png`,
+            mimeType: 'image/png',
+            aspectRatio: inheritedAspectRatio,
+          })
+        }
+      })
+    }
+
+    const result = value.result
+    if (isRecord(result)) {
+      for (const item of this.coerceMediaList(result)) {
+        const alreadyIncluded = media.some((existing) => {
+          return (item.data && existing.data === item.data) || (item.url && existing.url === item.url)
+        })
+        if (!alreadyIncluded) media.push(item)
+      }
+    }
+
+    return media
+  }
+
+  private async prepareUploadableMediaInputs(mediaInputs: MediaInput[]): Promise<MediaInput[]> {
+    const uploadable: MediaInput[] = []
+
+    for (const media of mediaInputs) {
+      if (media.data) {
+        uploadable.push(media)
+        continue
+      }
+
+      if (!media.url) continue
+
+      const resolved = await this.resolveMediaUrlToData(media)
+      if (!resolved?.data) {
+        throw new Error(`Could not prepare media "${media.name || media.url}" for upload`)
+      }
+      uploadable.push(resolved)
+    }
+
+    return uploadable
+  }
+
+  private async resolveMediaUrlToData(media: MediaInput): Promise<MediaInput | null> {
+    const url = media.url || ''
+    if (!url) return null
+
+    if (url.startsWith('data:')) {
+      return { ...media, data: url }
+    }
+
+    try {
+      const response = await fetch(url)
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const blob = await response.blob()
+      const data = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(String(reader.result || ''))
+        reader.onerror = () => reject(reader.error || new Error('FileReader failed'))
+        reader.readAsDataURL(blob)
+      })
+      const mimeType = media.mimeType || blob.type || (media.mediaType === 'video' ? 'video/mp4' : 'image/png')
+
+      return {
+        ...media,
+        data,
+        mimeType,
+        name: media.name || this.mediaNameFromMime(media.mediaType, mimeType),
+      }
+    } catch (error) {
+      console.warn('[Runner] Failed to fetch upstream media URL for upload', {
+        name: media.name,
+        mediaType: media.mediaType,
+        urlSnippet: url.slice(0, 120),
+        error,
+      })
+      return null
+    }
+  }
+
+  private mediaNameFromMime(mediaType: MediaKind, mimeType: string): string {
+    const fallbackExtension = mediaType === 'video' ? 'mp4' : 'png'
+    const extension = mimeType.includes('quicktime')
+      ? 'mov'
+      : mimeType.includes('jpeg')
+        ? 'jpg'
+        : mimeType.includes('/')
+          ? mimeType.split('/')[1] || fallbackExtension
+          : fallbackExtension
+    return `${mediaType}-${Date.now()}.${extension}`
+  }
+
   private extractDownloadSources(inputs: NodeInputs): string[] {
     const sources: string[] = []
 
@@ -973,6 +1473,12 @@ export class PipelineRunner {
     const heartbeatStaleMs = 40000
     let everSawProgress = false
     let lastLogAt = 0
+    // Default-mode logging: only emit a status line when the phase
+    // changes (queued → submitting → waiting_result → rendering →
+    // done/failed). With DEBUG_CHATGPT_HEARTBEAT or DEBUG_RUNNER_WAIT
+    // enabled, also dump a verbose throttled status every ~15s for
+    // operator debugging.
+    let lastPhase: string | null = null
 
     while (Date.now() - startedAt < maxWaitMs) {
       const response = await this.sendRuntimeMessage({
@@ -1009,26 +1515,47 @@ export class PipelineRunner {
 
         if (Date.now() - lastLogAt > 1500) {
           lastLogAt = Date.now()
-          console.log('[Runner] wait chatgpt job', {
-            jobId,
-            elapsedMs,
-            lastHeartbeatAgoMs,
-            lastProgressAgoMs,
-            phase,
-            generating,
-            candidateImages,
-            acceptedImages,
-            hasPendingImage,
-            status: job.status,
-          })
+          // Phase-change log: always emit when the phase string from
+          // the content script differs from what we saw last. With
+          // debug flags enabled, also emit a throttled full-status
+          // dump so operators can see heartbeat / progress deltas.
+          const phaseChanged = phase !== lastPhase
+          if (phaseChanged) {
+            const elapsedSec = Math.round(elapsedMs / 1000)
+            console.log(
+              `[Runner] chatgpt phase: ${phase || 'unknown'} ` +
+              `(${elapsedSec}s elapsed, job ${jobId})`
+            )
+            lastPhase = phase
+          }
+          if (DEBUG_FLAGS.chatgptHeartbeat || DEBUG_FLAGS.runnerWait) {
+            debugLog('chatgptHeartbeat', '[Runner] wait chatgpt job', {
+              jobId,
+              elapsedMs,
+              lastHeartbeatAgoMs,
+              lastProgressAgoMs,
+              phase,
+              generating,
+              candidateImages,
+              acceptedImages,
+              hasPendingImage,
+              status: job.status,
+            })
+          }
         }
 
         if (job.status === 'done') {
-          console.log('[Runner] chatgpt job done', {
-            jobId,
-            imageCount: Array.isArray(job.imageUrls) ? job.imageUrls.length : 0,
-            elapsedMs,
-          })
+          console.log(
+            `[Runner] chatgpt job done (${Math.round(elapsedMs / 1000)}s, ` +
+            `${Array.isArray(job.imageUrls) ? job.imageUrls.length : 0} images, job ${jobId})`
+          )
+          if (DEBUG_FLAGS.chatgptHeartbeat) {
+            debugLog('chatgptHeartbeat', '[Runner] chatgpt job done (verbose)', {
+              jobId,
+              imageCount: Array.isArray(job.imageUrls) ? job.imageUrls.length : 0,
+              elapsedMs,
+            })
+          }
           return job
         }
 
@@ -1047,6 +1574,7 @@ export class PipelineRunner {
             await new Promise((resolve) => setTimeout(resolve, 1500))
             continue
           }
+          console.error(`[Runner] chatgpt job failed: ${errMsg}`, { jobId, elapsedMs })
           throw new Error(errMsg)
         }
 
@@ -1055,14 +1583,20 @@ export class PipelineRunner {
         // died or the tab crashed. Even if lastProgressAt is recent,
         // we cannot trust future updates.
         if (lastHeartbeatAt > 0 && lastHeartbeatAgoMs > heartbeatStaleMs) {
-          console.log('[Runner] chatgpt job heartbeat lost', {
-            jobId,
-            elapsedMs,
-            lastHeartbeatAgoMs,
-            lastProgressAgoMs,
-            heartbeatStaleMs,
-            phase,
-          })
+          console.error(
+            `[Runner] chatgpt heartbeat lost: no update for ` +
+            `${Math.round(lastHeartbeatAgoMs / 1000)}s (job ${jobId})`
+          )
+          if (DEBUG_FLAGS.chatgptHeartbeat) {
+            debugLog('chatgptHeartbeat', '[Runner] chatgpt heartbeat lost (verbose)', {
+              jobId,
+              elapsedMs,
+              lastHeartbeatAgoMs,
+              lastProgressAgoMs,
+              heartbeatStaleMs,
+              phase,
+            })
+          }
           throw new Error(
             'ChatGPT content script heartbeat lost: no update for ' +
             Math.round(lastHeartbeatAgoMs / 1000) + 's. ' +
@@ -1073,11 +1607,17 @@ export class PipelineRunner {
         // ── GATE B — initial no-progress budget. ────────────────────
         if (!everSawProgress) {
           if (elapsedMs > initialNoProgressTimeoutMs) {
-            console.log('[Runner] chatgpt job no-progress timeout', {
-              jobId,
-              elapsedMs,
-              initialNoProgressTimeoutMs,
-            })
+            console.error(
+              `[Runner] chatgpt no-progress timeout after ` +
+              `${Math.round(initialNoProgressTimeoutMs / 1000)}s (job ${jobId})`
+            )
+            if (DEBUG_FLAGS.chatgptHeartbeat) {
+              debugLog('chatgptHeartbeat', '[Runner] chatgpt no-progress timeout (verbose)', {
+                jobId,
+                elapsedMs,
+                initialNoProgressTimeoutMs,
+              })
+            }
             throw new Error(
               'Timeout waiting for ChatGPT result: no generation progress within ' +
               Math.round(initialNoProgressTimeoutMs / 1000) + 's'
@@ -1086,14 +1626,20 @@ export class PipelineRunner {
         } else {
           // ── GATE C — generation has stalled. ────────────────────
           if (lastProgressAgoMs > staleMs && !stillActive) {
-            console.log('[Runner] chatgpt job stale timeout', {
-              jobId,
-              elapsedMs,
-              lastHeartbeatAgoMs,
-              lastProgressAgoMs,
-              staleMs,
-              phase,
-            })
+            console.error(
+              `[Runner] chatgpt stale timeout: progress frozen for ` +
+              `${Math.round(lastProgressAgoMs / 1000)}s (job ${jobId})`
+            )
+            if (DEBUG_FLAGS.chatgptHeartbeat) {
+              debugLog('chatgptHeartbeat', '[Runner] chatgpt stale timeout (verbose)', {
+                jobId,
+                elapsedMs,
+                lastHeartbeatAgoMs,
+                lastProgressAgoMs,
+                staleMs,
+                phase,
+              })
+            }
             throw new Error(
               'Timeout waiting for ChatGPT result: progress stale for ' +
               Math.round(lastProgressAgoMs / 1000) + 's'
@@ -1103,13 +1649,19 @@ export class PipelineRunner {
           // for 2x staleMs — even with an active signal we should
           // not wait forever.
           if (lastProgressAgoMs > staleMs * 2) {
-            console.log('[Runner] chatgpt job hard stale timeout', {
-              jobId,
-              elapsedMs,
-              lastHeartbeatAgoMs,
-              lastProgressAgoMs,
-              phase,
-            })
+            console.error(
+              `[Runner] chatgpt hard-stale timeout: progress frozen for ` +
+              `${Math.round(lastProgressAgoMs / 1000)}s despite heartbeat (job ${jobId})`
+            )
+            if (DEBUG_FLAGS.chatgptHeartbeat) {
+              debugLog('chatgptHeartbeat', '[Runner] chatgpt hard-stale timeout (verbose)', {
+                jobId,
+                elapsedMs,
+                lastHeartbeatAgoMs,
+                lastProgressAgoMs,
+                phase,
+              })
+            }
             throw new Error(
               'Timeout waiting for ChatGPT result: progress stale for ' +
               Math.round(lastProgressAgoMs / 1000) + 's despite heartbeat'
@@ -1125,11 +1677,10 @@ export class PipelineRunner {
       await new Promise((resolve) => setTimeout(resolve, 1500))
     }
 
-    console.log('[Runner] chatgpt job max-wait timeout', {
-      jobId,
-      elapsedMs: Date.now() - startedAt,
-      maxWaitMs,
-    })
+    console.error(
+      `[Runner] chatgpt max-wait timeout after ` +
+      `${Math.round((Date.now() - startedAt) / 1000)}s (job ${jobId})`
+    )
     throw new Error('Timeout waiting for ChatGPT result: max wait reached after ' + Math.round(maxWaitMs / 1000) + 's')
   }
 
