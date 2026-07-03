@@ -131,6 +131,68 @@ Do not regress any existing stable behavior, especially:
 - Separate Flow and ChatGPT automation paths.
 - Debug logs staying behind debug flags.
 - Runtime verification requirements.
+- Workflow `runner.ts` lazy-dependency execution plan (see "Workflow runner
+  execution order" below). Do NOT replace it with a fresh Kahn topological
+  sort that pops every in-degree-zero node first — the bug it fixed was a
+  downstream node "completing" before its upstream was actually done.
+- ChatGPT provider contract: `RUN_CHATGPT_PROMPT` accepts `mediaUploads[]`,
+  `focus: false` from workflow callers, `requestFingerprint`-based dedupe,
+  and `CHATGPT_JOB_DONE` images array. Do NOT change these without
+  inspecting all call sites in `runner.ts` and `GenPanel.tsx`.
+
+### 7a. Do Not Regress — ChatGPT-specific invariants
+
+These are the load-bearing invariants of the current ChatGPT pipeline. Any
+change to `src/contents/content-script.ts`, `src/pipeline/runner.ts`,
+`src/background/index.ts`, or `src/lib/debug.ts` MUST preserve them. If a
+fix requires breaking one of these, surface it explicitly before doing so.
+
+- Do not focus the ChatGPT tab during workflow runs unless explicitly
+  requested. Workflow `runner.ts` passes `focus: false` to `RUN_CHATGPT_PROMPT`
+  so the caller's tab (Workflow Editor / Side Panel) stays visible. Only
+  GenPanel defaults to `focus: true`.
+- Do not use per-image paste upload (P1/P2/A/B/C legacy ladder) for
+  multi-image ChatGPT jobs. Multi-image MUST go through
+  `uploadImagesBatchViaFileInput` (single `input[type=file]` + `DataTransfer`
+  change event for N files). On failure, multi-image jobs fail hard.
+  Re-running the Generate Node would re-upload refs and produce duplicate
+  attachments — that is the failure mode this rule prevents.
+- Do not re-enable P1/P2/A/B/C fallback for multi-image. The fallback is
+  only legal as a single-image retry path AFTER batch upload fails and the
+  composer is empty.
+- Do not let `chatgptIsGenerating() === true` block result detection. As
+  soon as `chatgptCollectGeneratedImages` returns ≥1 image not in the
+  post-submit baseline, the content script posts `CHATGPT_JOB_DONE` with
+  `success: true` — even if the spinner is still up.
+- Do not update `lastProgressAt` on a plain heartbeat. Only phase changes,
+  spinner-on flips, image/turn/text count bumps, and pending-image flips
+  count as real progress. `progressAdvanced(next, prev)` in
+  `background/index.ts` is the gate; the first heartbeat after entering
+  `waiting_result` is treated as progress to prevent the
+  "no-progress" race against the runner.
+- Do not spam debug logs by default. All ChatGPT-side verbose logs
+  (`[SeqDebug][ChatGPT]`, `[ChatGPT][UploadDiag]`, `[ChatGPT][CountDiag]`,
+  `[ChatGPT][Collect] rejected/...`, `[ChatGPT][Background] job heartbeat`,
+  `[Runner] wait chatgpt job` per-poll dump) are gated. They MUST stay
+  gated. Use `AI_FLOW_DEBUG_SEQ`, `AI_FLOW_DEBUG_CHATGPT_HB`, or the
+  master `AI_FLOW_DEBUG` to enable.
+- Do not send `quantity` to ChatGPT. `quantity?: number` on
+  `GenerateNodeData` is Google Flow only. The runner never serializes it
+  into `RUN_CHATGPT_PROMPT` payloads.
+- Do not change the ChatGPT upload / result / heartbeat flow while
+  working on UI-only tasks (preview download button, sidebar styling,
+  etc.). Those edits must not touch `runner.ts`, `background/index.ts`,
+  `content-script.ts`, or `src/lib/debug.ts`.
+- Do not hide execution-order bugs with CSS. If a node glows in the wrong
+  state, fix the actual runtime state / order in `runner.ts` — never paper
+  over it with a UI animation or a CSS class.
+- Do not modify build artifacts (`build/**`, `plasmo.config.ts` caches)
+  manually. Plasmo regenerates them on `npm run build`.
+- Do not swap the composer-scoped visual counter
+  (`chatgptCountVisualComposerAttachments`) for the broad composer
+  counter (`chatgptCountComposerAttachments`). The broad counter leaks
+  chat-history images and breaks the duplicate guard for legitimate
+  uploads.
 
 ## Tech Stack
 
@@ -211,11 +273,13 @@ ai-workflow-automation/
 ## Important Conventions
 
 - Generation settings come from **GenPanel UI state**, NOT from the Flow settings page DOM.
-- **No `File` objects** cross the background/content runtime message boundary. Files are converted to base64 first.
-- `upload_xxx` keys must be resolved to real `tileId` before `RUN_FLOW_PROMPT` fires.
+- **No `File` objects** cross the background/content runtime message boundary. Files are converted to base64 first. For ChatGPT, `RUN_CHATGPT_PROMPT` carries `mediaUploads: { base64, type, name }[]` and the content script rebuilds a `File` from base64 inside the page.
+- `upload_xxx` keys must be resolved to real `tileId` before `RUN_FLOW_PROMPT` fires. ChatGPT has no `tileId` step — bytes are forwarded as `mediaUploads[]`.
 - The bridge runs in the **MAIN world** via `chrome.scripting.executeScript`. The ISOLATED content script communicates with it via `window.postMessage`.
 - **Build pass is NOT runtime verification.** After building, always reload the extension and verify `window.__FLOW_BRIDGE_BUILD_TIME__` in the Flow page console.
 - Never rewrite `flow-slate-bridge.ts` unless explicitly required. Preserve all fallback logic, retries, and verification.
+- **ChatGPT tab focus**: workflow callers (`runner.ts`) MUST pass `focus: false` to `RUN_CHATGPT_PROMPT`. GenPanel direct calls default to `focus: true`. The user's tab (Workflow Editor / Side Panel) stays visible during workflow runs.
+- **ChatGPT quantity**: ChatGPT does not accept a quantity field. `quantity?: number` on `GenerateNodeData` is Google Flow only and is never sent via `RUN_CHATGPT_PROMPT`.
 
 ## Reloading After Changes
 
@@ -579,69 +643,227 @@ Returns `{ ids, fileNames, details, counts, rawCount }` for all visible tiles on
 
 ### Overview
 
-ChatGPT image generation runs independently from Flow automation and does not touch any Flow code. The architecture uses a **jobId model** with persistent state so it survives MV3 service worker suspension.
+ChatGPT image generation runs independently from Flow automation and does not touch any Flow code. The architecture uses a **jobId model** with persistent state so it survives MV3 service worker suspension. Workflow (`runner.ts`) and GenPanel share the exact same `RUN_CHATGPT_PROMPT` entry point — only the caller's intent differs.
+
+Two provider call sites:
+
+- **Workflow runs** (`runner.ts → runChatGPTGenerate`): pass `focus: false` to `RUN_CHATGPT_PROMPT` so the caller's tab (Workflow Editor / Side Panel) stays visible. Awaits `CHATGPT_JOB_DONE` via `waitForChatGPTJob` before continuing the pipeline.
+- **GenPanel direct run**: defaults `focus: true` so the user can see the ChatGPT tab flip active while a generation runs. Polls `GET_CHATGPT_JOB_STATUS` every 1.5s.
 
 ### Architecture
 
 ```
-GenPanel (activeProvider='chatgpt')
+runner.ts (Workflow Generate Node, activeProvider='chatgpt')
   └─ chrome.runtime.sendMessage({ action: 'RUN_CHATGPT_PROMPT', payload })
         └─ background/index.ts — runChatGPTPrompt()
-             ├─ openProviderTab('chatgpt')                    [existing helper]
-             ├─ chrome.scripting.executeScript(...)            [inject content-script]
-             ├─ chrome.storage.session.set(jobs[jobId]={status:'running', ...})
+             ├─ openProviderTab('chatgpt', payload.focus !== false)
+             │    ↑ defaults to focus=true; workflow callers pass focus:false
+             ├─ ensureChatGPTContentReady(tabId)
+             │    ├─ wait for tab.status === 'complete' (30s budget)
+             │    ├─ CHATGPT_PING ×3 pre-inject; if no pong, resolve
+             │    │   content script bundle via resolveChatGPTContentScriptFile
+             │    │   (picks entry whose primary JS starts with `content-script.`,
+             │    │   excludes debug-bridge / flow-content / flow-slate-bridge)
+             │    ├─ chrome.scripting.executeScript({ tabId, files: [scriptFile] })
+             │    └─ CHATGPT_PING ×10 (300ms each) until pong.success
+             ├─ chatgptFindRunningJobByFingerprint() — reuse an in-flight
+             │   job for the same (prompt, ratio, mediaUploads[], autoDownload,
+             │   outputFolder) signature; chatgptSubmitFlights Map also
+             │   coalesces concurrent submits.
+             ├─ chrome.storage.session.set(jobs[jobId] = {
+             │     status: 'running', startedAt, promptPreview,
+             │     autoDownload, outputFolder, imageUrls: [],
+             │     images: [], downloaded: 0, error: '', tabId,
+             │     requestFingerprint,
+             │   })
              ├─ chrome.tabs.sendMessage(tabId, {
              │     action: 'CHATGPT_SUBMIT_AND_WAIT',
-             │     payload: { prompt, ratio, autoDownload, timeoutMs, jobId }
-             │  })
-             └─ return { success: true, accepted: true, jobId }   [immediate]
-                   └─ GenPanel polls GET_CHATGPT_JOB_STATUS every 1.5s
+             │     payload: {
+             │       prompt, ratio, fallbackPrefix,
+             │       autoDownload, timeoutMs = min(payload.timeoutMs, 30min),
+             │       jobId,
+             │       mediaUploads: Array.isArray(payload.mediaUploads)
+             │         ? payload.mediaUploads
+             │         : []
+             │     }
+             │   })
+             └─ return { success: true, accepted: true, jobId }  [immediate]
 
-content-script.ts (chatgpt.com tab, isolated world)
+content-script.ts (chatgpt.com tab, ISOLATED world)
   ├─ receives CHATGPT_SUBMIT_AND_WAIT
-  ├─ returns { accepted: true, jobId } immediately
-  └─ (long poll runs in tab via runChatGPTJob())
-       ├─ verify composer exists
-       ├─ chatgptEnableImageMode() (best-effort)
-       ├─ chatgptSetRatio(ratio) (best-effort)
-       ├─ chatgptWaitForIdle(30s) — wait previous generation
-       ├─ baseline = chatgptCollectFileIds() — file_ids from chat history
-       ├─ setInputValue + dispatchInputEvent on composer
-       ├─ chatgptFindSubmitButton() + click
-       ├─ poll every 1s (default 300s timeout):
-       │     ├─ chatgptIsGenerating() — spinner/stop-button detection
-       │     ├─ chatgptDetectTextOnlyError() — refusal text detection
-       │     └─ chatgptCollectGeneratedImages(baselineFileIds)
-       │           ├─ skip blur/backdrop/placeholder (alt text)
-       │           ├─ skip uploaded/reference images (alt + DOM ancestors)
-       │           ├─ skip icons (w/h < 128)
-       │           ├─ skip file_ids in baseline
-       │           └─ dedupe by file_id (?id=file_xxx) or src fallback
-       └─ chrome.runtime.sendMessage({
-              action: 'CHATGPT_JOB_DONE',
-              jobId,
-              payload: { success, imageUrls, error, message }
-            })
+  ├─ chatgptSubmitAndWait returns { accepted: true, jobId } immediately
+  ├─ dedupe: same jobId + status==='running' → ack as duplicate
+  ├─ concurrency guard: different jobId but status==='running' →
+  │   CHATGPT_JOB_DONE with success:false error='CHATGPT_BUSY…'
+  └─ (long poll + upload runs in tab via runChatGPTJob)
+       Phase 0  — pre-upload composer cleanup
+                  chatgptWaitForIdle(30s)
+                  if chatgptCountComposerAttachments() > 0:
+                    chatgptRemoveAllComposerAttachments() — clear stale
+                    if still >0 after cleanup: fail CHATGPT_SUBMIT_FAILED
+       Phase 0a — idempotent short-circuit
+                  if attached === mediaCount (per chatgptCountComposerAttachments):
+                    skip upload, fall through to prompt + send
+       Phase 0b — media upload
+                  ┌──────── multi-image (mediaCount > 1) ───────┐
+                  │ uploadImagesBatchViaFileInput(mediaUploads, jobId)
+                  │   - chatgptRemoveComposerAttachmentsOnly (visual)
+                  │   - decode all base64 → File[]
+                  │   - find <input type=file>, dispatch input+change ONCE
+                  │   - settle poll (≤10s, every 500ms):
+                  │       visualCount === expected → ok
+                  │       visualCount  >  expected → duplicate fail
+                  │       visualCount  <  expected → incomplete fail
+                  │ on failure: HARD fail. NO legacy P1/P2 fallback.
+                  └─────────────────────────────────────────────┘
+                  ┌──────── single-image (mediaCount === 1) ──────┐
+                  │ primary: uploadImagesBatchViaFileInput (same path)
+                  │ fallback: only when batch fails AND clean before
+                  │   uploadImage(dataUrl, { beforeCount, expectedTotalCount:1 })
+                  │   legacy per-item P1/P2/A/B/C strategies.
+                  └─────────────────────────────────────────────────┘
+       Phase 0c — post-upload visual verification (chatgptCountVisualComposerAttachments)
+                  expected === mediaCount: pass
+                  expected  >  mediaCount: CHATGPT_SUBMIT_FAILED: duplicate…
+                  expected  <  mediaCount: CHATGPT_SUBMIT_FAILED: composer shows
+                                                    N attachment(s), expected M
+       Phase 1 — best-effort: chatgptEnableImageMode (false → prepend
+                  fallbackPrefix to prompt); chatgptSetRatio(ratio) iff
+                  image-mode actually engaged.
+       Phase 2 — chatgptWaitForIdle(30s), preSubmitFileIds =
+                  chatgptCollectFileIds(), preSubmitAssistantTurnCount =
+                  chatgptCountAssistantTurns()  ← baseline locked here so
+                  post-upload attachments are not counted as new results.
+       Phase 3 — chatgptFindComposer(10s); chatgptClearEditor; insert via
+                  paste / execCommand / innerHTML ladder; verify
+                  textContent.includes(prompt.slice(0,20)) before submit.
+       Phase 4 — pre-submit re-verify (visual counter): duplicate → fail.
+       Phase 5 — chatgptFindSubmitButtonWithRetry(5s, 200ms);
+                  chatgptIsButtonUsable. If usable, pointer-click. Else
+                  chatgptSubmitExistingComposerFallbacks tries Enter →
+                  pointerClick → form.requestSubmit.
+       Phase 6 — verify submit via chatgptWaitForSubmitSignal(multi-signal):
+                  editor cleared | spinner visible | stop-button visible |
+                  send-button disabled | new assistant turn. If none of
+                  those fire in 7s → CHATGPT_SUBMIT_UNVERIFIED.
+       Phase 7 — POST-SUBMIT baseline: postSubmitAssistantTurnCount =
+                  baselineAssistantTurnCountForClick; postSubmitFileIds =
+                  preSubmitFileIds ∪ baselineFileIdsForClick;
+                  postSubmitImageSignatures = baselineImageSignaturesForClick.
 
-background/index.ts — CHATGPT_JOB_DONE listener
-  ├─ receive CHATGPT_JOB_DONE from content-script
-  ├─ if success && autoDownload: chrome.downloads.download(...) per imageUrl
+       Poll loop (~1s tick, sleep 1000ms each iteration; maxWaitMs cap):
+         ─ entry heartbeat: phase='waiting_result', progressChanged=true
+                          so background bumps lastProgressAt to start
+                          (prevents "no-progress" false positive).
+         ─ check extension context: if invalidated → fail CHATGPT.
+         ─ chatgptIsGenerating → toggles phase 'generating'/'rendering';
+           lastGenerating flip fires a phase-change heartbeat.
+         ─ chatgptDetectTextOnlyError → CHATGPT returned text, not image.
+         ─ chatgptCollectGeneratedImages(postSubmitFileIds,
+           postSubmitAssistantTurnCount, postSubmitImageSignatures):
+              if newImages.length > 0:
+                if generating: heartbeat rendering, continue
+                else: sendDone({ success: true, imageUrls, images })
+                THIS is the result path. generating=true does NOT block
+                result detection — image visibility wins.
+         ─ pre-turn grace window: continue while we have not yet seen a
+           new assistant turn (sawAnyProgress extends further).
+         ─ pending-image marker: keep waiting (asset in flight).
+         ─ no spinner + new turn + no pending + no images → render grace
+           (30s) before "text-only reply" or "progress stale" verdict.
+         ─ on hard fail: sendDone({ success: false, error, message }).
+
+       On terminal state:
+         safeSendFireAndForget({
+           action: 'CHATGPT_JOB_DONE',
+           jobId,
+           payload: { success, imageUrls, images, error, message }
+         })
+
+background/index.ts — CHATGPT_JOB_DONE listener (registered at module load)
+  ├─ payload.success && payload.images → store full ChatGPTGeneratedImage[]
+  │  array. payload.imageUrls used as fallback when images[] is missing.
+  ├─ on success + autoDownload: chrome.downloads.download one by one to
+  │  `${outputFolder}/chatgpt-${timestamp}-${i}.png`, count `downloaded`.
   ├─ chrome.storage.session.set(jobs[jobId] = {
   │     status: 'done' | 'failed',
-  │     imageUrls, downloaded, error, finishedAt
+  │     imageUrls, images, downloaded, error, message, finishedAt
   │   })
-  └─ (GenPanel poll picks up the updated state)
+  └─ persistent failure: error='Background handler crashed: …' is also
+     persisted so retry-aware callers can show a real reason.
+
+Meanwhile, the content script emits periodic CHATGPT_JOB_PROGRESS heartbeats.
+
+background/index.ts — CHATGPT_JOB_PROGRESS listener
+  ├─ lastHeartbeatAt = now (every heartbeat — proves script is alive)
+  ├─ progressChanged? computed locally from prev vs new payload:
+  │     phase string changed, generating flipped on, assistantTurns /
+  │     candidateImages / acceptedImages bumped, hasPendingImage flipped
+  │     on, lastAssistantTextLength grew, or payload.progressChanged.
+  ├─ if progressChanged: lastProgressAt = now
+  ├─ patch job.progress, persist.
+  └─ debug log gated by DEBUG_FLAGS.chatgptHeartbeat ('AI_FLOW_DEBUG_CHATGPT_HB')
+
+runner.ts — waitForChatGPTJob(jobId, timeoutMs)
+  Polls GET_CHATGPT_JOB_STATUS every 1500ms. Three gates decide timeout:
+
+  GATE A — heartbeat lost.
+      lastHeartbeatAt>0 AND now - lastHeartbeatAt > 40s
+      Throw "ChatGPT content script heartbeat lost: no update for Ns."
+
+  GATE B — initial no-progress budget.
+      !everSawProgress AND elapsedMs > max(payload.timeoutMs, 300s)
+      Throw "Timeout waiting for ChatGPT result: no generation progress
+             within Ns."
+
+  GATE C — generation stalled after at least one advance.
+      everSawProgress AND now - lastProgressAt > 90s (staleMs)
+      AND !stillActive (not generating AND no hasPendingImage AND no candidates)
+      Throw "Timeout waiting for ChatGPT result: progress stale for Ns."
+
+  Hard-stale backstop.
+      everSawProgress AND now - lastProgressAt > 180s (2×staleMs)
+      — extends past any active signal, never wait forever despite heartbeats.
+      Throw "…despite heartbeat."
+
+  TIMEOUT edge case (from BG → content script reported 'failed' status).
+      /timeout/i.test(errMsg) AND hasPendingImage → continue waiting.
+      Re-running the Generate Node would re-upload refs → duplicates.
+      Heartbeat-stale gate (A) is the real authority here.
+
+  Termination.
+      job.status === 'done' → return job (no hard timeout race for result).
+      job.status === 'failed' → throw job.error.
+  Phase-change logging (default-mode, debug off):
+      Emits `[Runner] chatgpt phase: <phase> (Ns elapsed, job <id>)` ONLY
+      when the phase string differs from the previous iteration. Verbose
+      throttled dump of lastHeartbeatAgoMs / lastProgressAgoMs / candidate /
+      accepted only fires under DEBUG_FLAGS.chatgptHeartbeat or
+      DEBUG_FLAGS.runnerWait.
+  Force in-flight job to fail on hard cap (maxWaitMs = max(timeoutMs, 600000)).
+
+background/index.ts — chatgptCleanupExpiredJobs (SW startup)
+  Running jobs older than CHATGPT_JOB_TTL_MS (30 min) → status='failed',
+  error='Job hard timeout after 1800s'. Terminal jobs older than 30 min
+  since finishedAt → deleted.
+
+background/index.ts — extension reload cleanup
+  reloadProviderTabsOnExtensionReload() reloads existing provider tabs on
+  install / update / startup when stored version/build markers differ from
+  the current manifest. This is gated — same bundle on later wake-ups
+  are no-ops. Close-stale-workflow-editor runs unconditionally on install.
 ```
 
 ### Background actions
 
 
-| Action                   | Behavior                                                                                                               |
-| ------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
-| `RUN_CHATGPT_PROMPT`     | Open/inject ChatGPT tab, persist job state, kick off content script, return `{ success, accepted, jobId }` immediately |
-| `CHATGPT_JOB_DONE`       | Receive from content script: run downloads, update job in storage                                                      |
-| `GET_CHATGPT_JOB_STATUS` | Read job state from `chrome.storage.session` (local fallback), return full `ChatGPTJobState`                           |
-
+| Action                   | Behavior                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RUN_CHATGPT_PROMPT`     | Open/inject ChatGPT tab, persist job state, kick off content script, return `{ success, accepted, jobId }` immediately. `payload.focus` defaults to `true` (GenPanel); pass `focus:false` from workflow callers. Reuses an in-flight job by `requestFingerprint` hash and dedupes via `chatgptSubmitFlights` Map while the submit is mid-flight. |
+| `CHATGPT_JOB_DONE`       | Receive from content script: run auto-downloads, persist full `images[]` + `imageUrls[]` + `downloaded` + terminal status. Failure path also persists the message string for the runner.                                                                                                                                                                                |
+| `CHATGPT_JOB_PROGRESS`   | Heartbeat. Always bumps `lastHeartbeatAt`. Bumps `lastProgressAt` ONLY when counters / phase / spinner actually advance. Per-poll debug dump gated by `DEBUG_FLAGS.chatgptHeartbeat`.                                                                                                                                                                                |
+| `GET_CHATGPT_JOB_STATUS` | Read job state from `chrome.storage.session` (local fallback), return full `ChatGPTJobState`. Runner polls every 1500ms while waiting.                                                                                                                                                                                                                               |
+| `CHATGPT_PING`           | Health check used by `ensureChatGPTContentReady` to verify the content script listener is alive before firing `CHATGPT_SUBMIT_AND_WAIT`. Returns `{ success, provider, url }`.                                                                                                                                                                                          |
 
 ### Job state shape
 
@@ -654,14 +876,104 @@ interface ChatGPTJobState {
   autoDownload: boolean
   outputFolder?: string
   imageUrls: string[]
+  images?: ChatGPTGeneratedImage[]  // full payload from content script
   downloaded: number
   error: string
   message?: string
   tabId?: number
+  requestFingerprint?: string  // dedupe: same (prompt, ratio, mediaUploads,
+                              // autoDownload, outputFolder) within TTL
+  /** Wall-clock of the latest CHATGPT_JOB_PROGRESS. Bumped on every
+   *  heartbeat. Used by the runner to detect a dead content script
+   *  (no updates for >40s = context invalidated or tab crashed). */
+  lastHeartbeatAt?: number
+  /** Wall-clock of the latest REAL generation advance (phase change,
+   *  spinner flip, image / turn / text count bump). Plain heartbeats
+   *  do NOT bump this — heartbeats alone prove liveness, not advance.
+   *  Used by the runner to detect the generation itself has stalled. */
+  lastProgressAt?: number
+  /** Latest progress payload from the content script. See
+   *  ChatGPTJobProgress below. */
+  progress?: ChatGPTJobProgress
+  /** True when content script detected a partial image render that
+   *  never completed within the polling window. The runner reads
+   *  this to skip node-level retry even when the error is "TIMEOUT"
+   *  — re-running would create duplicate attachments. */
+  hasPendingImage?: boolean
+}
+
+interface ChatGPTJobProgress {
+  phase?: 'pre_upload' | 'uploading' | 'submitting'
+        | 'waiting_result' | 'generating' | 'rendering' | 'done' | 'failed'
+  generating?: boolean
+  assistantTurns?: number
+  candidateImages?: number   // candidate without spinner / full render
+  acceptedImages?: number    // accepted (post-spinner, dedupe-clean)
+  hasPendingImage?: boolean
+  elapsedMs?: number
+  lastAssistantTextLength?: number
+  /** True when the heartbeat represents a real generation advance —
+   *  phase change, spinner flip, count bump, etc. Background uses
+   *  this to decide whether to bump `lastProgressAt`. */
+  progressChanged?: boolean
+  lastMessage?: string
 }
 ```
 
-Stored under key `chatgptJobs` in `chrome.storage.session` (Chrome 102+ MV3). Falls back to `chrome.storage.local` if session fails. Terminal jobs (done/failed) are dropped after 30 minutes by `chatgptCleanupExpiredJobs()` on SW startup.
+Stored under key `chatgptJobs` in `chrome.storage.session` (Chrome 102+ MV3). Falls back to `chrome.storage.local` if session fails. Terminal jobs (done/failed) are dropped after 30 minutes by `chatgptCleanupExpiredJobs()` on SW startup. Running jobs older than `CHATGPT_JOB_TTL_MS` (30 min) are force-failed.
+
+### Multi-image upload (composer-scoped batch)
+
+Reference images for ChatGPT go through a **batch file input path** that
+fires a single `input` + `change` event with N files at once. The legacy
+per-item paste upload (P1/P2 via `ClipboardEvent` → `Event('paste')` with
+`clipboardData` getter) is documented in `uploadImage(...)` and is invoked
+**only** as a single-image fallback when the batch fails.
+
+```
+Multi-image rules (strict):
+  mediaCount > 1:
+    PRIMARY (and only) PATH    uploadImagesBatchViaFileInput
+    Failure                   CHATGPT_SUBMIT_FAILED: batch upload failed: …
+                              NO legacy P1/P2 fallback. Re-running the
+                              Generate Node would re-upload refs and
+                              produce duplicate attachments.
+
+Single-image rules:
+  mediaCount === 1:
+    PRIMARY PATH              uploadImagesBatchViaFileInput
+    Failure                   chatgptRemoveComposerAttachmentsOnly first,
+                              then loop uploadImage(dataUrl, { beforeCount,
+                              expectedTotalCount: 1 }).
+    Reason for single-image fallback being safe:
+                              P1's deferred commit never queues with a
+                              sibling P2 (only one item is in flight).
+```
+
+Pre-upload cleanup runs unconditionally so a stale leftover from a prior
+attempt cannot inflate the post-upload count and trip the duplicate
+detector. After batch upload, `chatgptCountVisualComposerAttachments`
+re-counts and re-applies the duplicate / incomplete guards:
+
+- `actual === mediaCount`: ok, continue to Phase 1.
+- `actual > mediaCount`: hard fail
+  `CHATGPT_SUBMIT_FAILED: duplicate attachments detected`.
+- `actual < mediaCount`: hard fail
+  `CHATGPT_SUBMIT_FAILED: composer shows N attachment(s), expected M`.
+
+`chatgptCountVisualComposerAttachments` (composer-scoped visual counter):
+
+- Walks only the composer root (`chatgptGetComposerRoot`).
+- Skips anything inside `[data-message-author-role]` (chat history).
+- Counts:
+  - buttons whose accessible name contains remove / delete / close /
+    dismiss / xóa / xoá, OR
+  - `<img>` whose src is `blob:` / `data:` OR ≥ 48px on either axis.
+- Dedupes so a parent tile containing both kinds is counted once.
+
+Pre-submit re-verification (Phase 4 above) applies the same guard again
+so any ChatGPT-side rendering between upload and submit cannot inflate
+the count and cause duplicate submit.
 
 ### Reference images for ChatGPT
 
@@ -670,31 +982,41 @@ GenPanel lets the user attach reference images to a ChatGPT run. The flow is
 uploads the bytes directly to the ChatGPT composer.
 
 ```
-GenPanel (activeProvider='chatgpt', refImages.length > 0)
- └─ For each refImage with id === 'upload_xxx':
-    └─ fileToBase64Payload(pendingUploads[id]) → { base64, type }
- └─ chrome.runtime.sendMessage({ action: 'RUN_CHATGPT_PROMPT', payload: { ... , mediaUploads } })
- └─ background/index.ts — runChatGPTPrompt()
-    └─ forward payload.mediaUploads as-is in CHATGPT_SUBMIT_AND_WAIT
- └─ content-script.ts — runChatGPTJob()
-    ├─ chatgptWaitForIdle(30s)
-    ├─ chatgptRemoveComposerAttachments() — clear stale attachments
-    ├─ uploadImage(dataUrl) per mediaUploads[i]
-    ├─ post-upload verify: attached === expected
-    ├─ continue with prompt insert + submit + image collection
+runner.ts → runChatGPTGenerate
+  prepares mediaUploads[]: { name, type, base64 } after resolving URL inputs
+  via resolveMediaUrlToData (data: pass-through; http(s) → fetch → FileReader)
+  chrome.runtime.sendMessage({ action: 'RUN_CHATGPT_PROMPT', payload: {
+      prompt, ratio, fallbackPrefix, autoDownload, timeoutMs, mediaUploads,
+      focus: false
+  } })
+
+background/index.ts — runChatGPTPrompt()
+  forwards payload.mediaUploads as-is in CHATGPT_SUBMIT_AND_WAIT
+
+content-script.ts — runChatGPTJob()
+  pre-upload composer cleanup (if mediaCount > 0)
+  uploadImagesBatchViaFileInput(mediaUploads, jobId)
+  visual count verify against mediaCount
+  pre-submit visual count re-verify
+  prompt insert + send + result detection
 ```
 
-**`ChatGPTPromptPayload.mediaUploads`** is `{ base64: string; type: string }[]`.
+**`ChatGPTPromptPayload.mediaUploads`** is `{ base64: string; type: string; name?: string }[]`.
 **Real tileIds (non-`upload_xxx` refs) are NOT forwarded** — the bytes are not
-available on the GenPanel side, so re-sending them is impossible. The Flow
+available on the runner side, so re-sending them is impossible. The Flow
 `resolveReferenceImagesBeforeRun()` path must NOT be reused for ChatGPT.
 
-**Reference Images UI in GenPanel** is now shown for both providers. The
+**Reference Images UI in GenPanel** is shown for both providers. The
 Flow-only sub-pieces (`refMode` select, "Drag to reorder" hint) are internally
 gated by `activeProvider === 'flow'`. The upload bar, count, image grid, and
 remove button work for both providers.
 
-### GenPanel polling contract
+**Quantity and `Auto`/`Manual` mode are Google Flow only.** ChatGPT does NOT
+accept a `quantity` field; the runner never forwards it via ChatGPT
+`mediaUploads`. ChatGPT does not have an Auto/Manual toggle — submitting IS
+the run, and the runner awaits `CHATGPT_JOB_DONE` before continuing.
+
+### GenPanel polling contract (direct ChatGPT run)
 
 ```
 1. RUN_CHATGPT_PROMPT → receives { jobId }
@@ -705,67 +1027,200 @@ remove button work for both providers.
              status === 'failed' → setGenStatus('idle') + alert(error)
 ```
 
+### Workflow runner wait contract
+
+`waitForChatGPTJob(jobId, timeoutMs)` in `runner.ts` is the authoritative
+waiting path for Workflow Generate Nodes. Polling cadence is 1.5s. The
+runner never calls `uploadImage` directly for ChatGPT — it sends the full
+`mediaUploads[]` over the boundary and lets the content-script runner own
+the upload pipeline.
+
+`timeoutMs` defaults to `max(payload.timeoutMs, 300000)` and the hard cap
+is `max(timeoutMs, 600000)` (`maxWaitMs`). Plain phase-change logs are the
+only debug-free output; only `DEBUG_FLAGS.chatgptHeartbeat` /
+`DEBUG_FLAGS.runnerWait` produces the per-poll counter dump.
+
+On `status === 'failed'` with `/timeout/i` AND `hasPendingImage === true`,
+the runner **continues waiting** rather than letting the runner-level catch
+block re-run the Generate Node (which would re-upload refs and create
+duplicate attachments). The heartbeat-stale gate eventually takes over.
+
+### Non-retryable Generate Nodes (chatgpt + google-flow)
+
+`runner.isNonRetryableGenerateNode(node)` short-circuits the catch block's
+node-level retry loop for any Generate Node that has uploadable media inputs
+across the current providers. The runner logs the cause and breaks the
+pipeline with `recoverable: false`. Per-step recovery (tab complete, content
+ping, find composer, find send button) still happens inside the provider
+path — the gate only closes the cross-node retry loop, where duplicate
+attachments are the failure mode.
+
+### Workflow runner execution order (lazy dependency plan)
+
+`runner.run()` does NOT use a textbook Kahn topological sort that pops
+every in-degree-zero node first. The legacy `getSortedNodes()` is computed
+for logging comparison, but the **actual execution order** is built by
+`buildLazyExecutionPlan(pickExecutionTargets())`:
+
+1. `pickExecutionTargets()` returns the workflow's **terminal nodes** —
+   nodes with no outgoing edges. If every node has outgoing edges (e.g. a
+   feedback loop), fall back to using all enabled nodes as targets.
+2. `buildLazyExecutionPlan()` does a **stack-based post-order DFS** from
+   those terminals, walking each target's incoming edges in priority order:
+   - `generate` nodes first, then `image` / `video` media nodes, then
+     everything else.
+   - Tie-break by canvas position `(x, y)` and original index.
+3. The resulting plan executes a node's **direct upstream only when the
+   downstream node is about to run**, so the lifecycle of a leaf source
+   (e.g. an unrelated `Media Node`) does not visually "complete" before
+   its real downstream chain finishes.
+
+Why the lazy plan matters:
+
+For the topology `M1 → G1`, `P1 → G1`, `G1 → G2`, `M2 → G2`, `P2 → G2`:
+
+- Kahn legacy order: `[M1, P1, M2, P2, G1, G2]` — M2/P2 light up
+  "completed" while G1 is still rendering.
+- Lazy order: `[M1, P1, G1, M2, P2, G2]` — M2/P2 only run after G1
+  finishes, so the visual lifecycle matches user intent.
+
+Cycle handling: if the DFS stack revisits a node already in flight, the
+edge is skipped with `[SchedulerDebug][Runner] cycle detected` rather than
+looping forever. Kahn's strict cycle rejection is replaced by tolerant
+skip; the workflow still completes its reachable subset.
+
+The lazy plan replaces the legacy Kahn sort. Do not reintroduce a
+fresh-Kahn-only execution path: that bug keeps coming back because the
+"fire M2/P2 early" symptom is purely a UI timing issue, not a correctness
+issue. The fix lives in scheduling, not in CSS.
+
+### Lazy plan invariants (do not regress)
+
+- Terminal-first DFS is the only execution order. The legacy Kahn order
+  is logged (and visible under `[SchedulerDebug]`) but never executed.
+- Incoming-edge priority is `generate > image/video > other`, tie-broken
+  by `(x, y)` then original index. Do not re-sort to position-only.
+- Cycle edges are skipped with a `[SchedulerDebug]` warning, not thrown.
+  The runner-level catch still surfaces the failure if a downstream
+  reads a missing context.
+- `pickExecutionTargets()` returns terminals; if no terminal exists
+  (closed feedback loop), fall back to ALL enabled nodes, NOT to a
+  shuffled / position-sorted order.
+
 ### Known v1 limitations
 
 - **Closing/reopening the panel does not resume running ChatGPT jobs.** GenPanel has no job recovery on mount. Jobs continue running in the chatgpt.com tab and write to storage, but no UI is watching to collect the result.
 - **Image mode / aspect ratio**: `chatgptEnableImageMode()` and `chatgptSetRatio()` are best-effort. Failures are logged and do not abort the job.
 - **DOM selector drift**: ChatGPT's React DOM changes frequently. The selectors in `chatgptFindSubmitButton`, `chatgptIsGenerating`, `chatgptEnableImageMode` are best-guess and may need updating.
+- **Multi-image strict path**: if the batch file input fails for a multi-image job, the job fails hard rather than retrying through per-item paste. This is intentional (see above).
+- **`generating=true` does NOT block result detection.** As soon as
+  `chatgptCollectGeneratedImages` returns ≥1 image that is not in the
+  post-submit baseline, the content script posts `CHATGPT_JOB_DONE` with
+  `success: true`. We do not wait for the spinner to drop first.
 
 ### Files involved
 
 
-| File                                    | Role                                                        |
-| --------------------------------------- | ----------------------------------------------------------- |
-| `src/background/index.ts`               | Job registry, storage, routing, `CHATGPT_JOB_DONE` listener |
-| `src/content-scripts/content-script.ts` | `CHATGPT_SUBMIT_AND_WAIT` + `runChatGPTJob()` + helpers     |
-| `src/components/gen/GenPanel.tsx`       | Job submission + polling loop                               |
+| File                                       | Role                                                                                                                      |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| `src/background/index.ts`                  | Job registry, storage, `RUN_CHATGPT_PROMPT` / `CHATGPT_JOB_DONE` / `CHATGPT_JOB_PROGRESS` / `GET_CHATGPT_JOB_STATUS`     |
+| `src/contents/content-script.ts`           | `CHATGPT_SUBMIT_AND_WAIT` listener, `runChatGPTJob`, batch upload, visual counter, result detection, `CHATGPT_JOB_DONE` |
+| `src/components/gen/GenPanel.tsx`          | Direct ChatGPT submission + polling loop (GenPanel-only)                                                                  |
+| `src/pipeline/runner.ts`                   | Workflow Generate Node ChatGPT execution + heartbeat-based wait (`waitForChatGPTJob`)                                     |
+| `src/lib/debug.ts`                         | Shared `DEBUG_FLAGS` for chatgptHeartbeat / runnerWait / seq / etc.                                                      |
 
 
 ### What NOT to touch (ChatGPT v1)
 
-- `src/contents/flow-content.ts`
-- `src/contents/flow-slate-bridge.ts`
-- `src/contents/chatgpt-content.ts`
-- `src/contents/chatgpt-bridge.ts`
-- `FLOW_*` actions
-- `RUN_FLOW_PROMPT` from ChatGPT path
+These are the load-bearing ChatGPT files. Touching them without explicit
+instruction is the most common way ChatGPT regressions slip in.
 
----
+- `src/contents/flow-content.ts` — Flow-only orchestration.
+- `src/contents/flow-slate-bridge.ts` — Flow-only MAIN-world bridge.
+- `src/contents/content-script.ts` — ChatGPT content script (the only
+  ChatGPT content file; there is no separate `chatgpt-content.ts` or
+  `chatgpt-bridge.ts` — the project collapsed them into one bundle).
+- `src/background/index.ts` — ChatGPT job registry / heartbeat routing /
+  download handler.
+- `src/pipeline/runner.ts` — Workflow Generate Node ChatGPT execution
+  + `waitForChatGPTJob` (heartbeat-driven, three-gate, non-retryable
+  generate node logic).
+- `src/lib/debug.ts` — Shared `DEBUG_FLAGS` (`seq`, `chatgptHeartbeat`,
+  `runnerWait`, etc.). Changing the master / per-flag fan-out breaks
+  every debug-gated log site.
+- `FLOW_*` actions.
+- `RUN_FLOW_PROMPT` from the ChatGPT path.
+- `uploadImage(...)` legacy P1/P2/A/B/C ladder re-enabled for multi-image.
+- Visual counter swapped for the broad composer counter (it leaks chat
+  history and breaks the duplicate guard for legitimate uploads).
 
 ## Debug Flags
 
-### Enabling verbose logs
+All extension-side verbose logs route through `src/lib/debug.ts` and its
+`debugLog(flag, …)` / `debugWarn(flag, …)` helpers. `DEBUG_FLAGS` is read
+once at bundle evaluation time from `localStorage`, with a `refreshDebugFlags()`
+re-read for hot-flips in long-running loops. There is **no master "all logs on"
+switch per file** — there is one master (`AI_FLOW_DEBUG`) that fans out to
+every per-flag key.
 
-All three files support a debug flag. When enabled, additional diagnostic logs are emitted.
+`src/lib/debug.ts` exposes these flags (default `false`):
 
-`**flow-slate-bridge.ts`** and `**flow-content.ts**` (`FLOW_DEBUG_VERBOSE`):
+| Flag (DEBUG_FLAGS key)  | localStorage key              | Default logs gated                                                                                                                  |
+| ----------------------- | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `nodeState`             | `AI_FLOW_DEBUG_NODE_STATE`    | `[NodeStateDebug]` — node visual-state transitions.                                                                                  |
+| `glow`                  | `AI_FLOW_DEBUG_GLOW`          | `[GlowDebug]` — node / edge glow lifecycle.                                                                                          |
+| `edgeFlow`              | `AI_FLOW_DEBUG_EDGE_FLOW`     | `[EdgeFlowDebug]` — incoming/outgoing edge active / inactive events with reasons.                                                   |
+| `scheduler`             | `AI_FLOW_DEBUG_SCHEDULER`     | `[SchedulerDebug]` — lazy-dependency execution plan and DFS dep list.                                                               |
+| `seq`                   | `AI_FLOW_DEBUG_SEQ`           | `[SeqDebug]` — sequential-multi-generate duplicate-attachment diagnostics in runner / BG / content-script.                         |
+| `chatgptHeartbeat`      | `AI_FLOW_DEBUG_CHATGPT_HB`    | Per-poll `[ChatGPT][Background] job heartbeat` and `[Runner] wait chatgpt job` dumps.                                                |
+| `runnerWait`            | `AI_FLOW_DEBUG_RUNNER_WAIT`   | Per-poll `[Runner] wait chatgpt job` counter dumps (alias for `chatgptHeartbeat`).                                                   |
+
+Enable / disable per flag:
 
 ```js
-localStorage.setItem('FLOW_DEBUG_VERBOSE', '1')
-// or
-window.__FLOW_DEBUG_VERBOSE__ = true
-```
+localStorage.setItem('AI_FLOW_DEBUG_NODE_STATE',  '1')  // enable one flag
+localStorage.setItem('AI_FLOW_DEBUG_SEQ',         '1')  // enable another
+localStorage.removeItem('AI_FLOW_DEBUG_NODE_STATE')    // disable that one
 
-`**background/index.ts**` (`BG_DEBUG`):
-
-```js
-// localStorage from extension page/tab:
+// Master switch — turns ALL flags on:
 localStorage.setItem('AI_FLOW_DEBUG', '1')
-// NOTE: window.__AI_FLOW_DEBUG__ does NOT work in service worker (no window).
-// BG_DEBUG is read once at bundle evaluation time.
+
+// Master off — clear all AI_FLOW_DEBUG_* keys:
+localStorage.removeItem('AI_FLOW_DEBUG')
+for (const k of [...localStorage.keys()].filter(k => k.startsWith('AI_FLOW_DEBUG_'))) localStorage.removeItem(k)
 ```
 
-`**GenPanel.tsx**` (`GP_DEBUG`):
+### Per-file legacy flags (Flow only)
+
+Two legacy flags still exist for Flow-specific verbose logs and are NOT
+managed by `src/lib/debug.ts`:
+
+| File                              | Flag                       | How to enable                                                                                                 |
+| --------------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `flow-slate-bridge.ts`            | `FLOW_DEBUG_VERBOSE`       | `localStorage.setItem('FLOW_DEBUG_VERBOSE', '1')` or `window.__FLOW_DEBUG_VERBOSE__ = true`                   |
+| `flow-content.ts`                 | `FLOW_DEBUG_VERBOSE`       | same                                                                                                          |
+| `flow-content.ts`                 | `FLOW_DEBUG_SETTINGS`      | same pattern — gates `[settings result]`, `[RUN_FLOW_PROMPT_PAYLOAD]`, `[REFS_NORMALIZED]`, etc.              |
+
+`FLOW_DEBUG_VERBOSE` is also honored by `src/contents/content-script.ts`
+(ChatGPT side) as a legacy alias for the `[SeqDebug]` gate, in addition to
+the new `DEBUG_FLAGS.seq`. `src/contents/content-script.ts` reads:
 
 ```js
-localStorage.setItem('AI_FLOW_DEBUG', '1')
-// or
-window.__AI_FLOW_DEBUG__ = true
+FLOW_DEBUG_VERBOSE     // legacy alias for [SeqDebug] / [UploadDiag] / [CountDiag] / [Collect]
+window.__FLOW_DEBUG_VERBOSE__   // mirror flag for the page console
 ```
+
+### Background debug flag
+
+`background/index.ts` reads only `AI_FLOW_DEBUG` (no per-flag support there
+because the SW has no `window`). `BG_DEBUG = (typeof localStorage !==
+'undefined' && localStorage.getItem('AI_FLOW_DEBUG') === '1')`, evaluated
+once at bundle load. `window.__AI_FLOW_DEBUG__` does NOT work in a service
+worker.
 
 ### Default behavior (debug off)
 
-Concise logs visible in console:
+Concise logs visible in console (lifecycle / sentinels only):
 
 ```
 [Bridge] BUILD_TIME 2026-06-26 01:15:00
@@ -782,11 +1237,41 @@ Concise logs visible in console:
 [FlowContent][AUTO_DOWNLOAD] tile SUCCESS ...
 [Bridge] submit SUCCESS via ...
 [Background] runFlowPrompt result: ...
+[Provider][BG] openProviderTab provider=chatgpt …
+[ChatGPT][Background] tab opened/focused tabId=…
+[ChatGPT][Background] ensuring content script tabId=… status=complete
+[ChatGPT][Background] content ping ok provider=chatgpt
+[ChatGPT][Background] job persisted: cgpt_…
+[ChatGPT][Background] CHATGPT_SUBMIT_AND_WAIT sent tabId=… jobId=…
+[ChatGPT][Background] job done — image count: N
+[ChatGPT][Background] Downloaded N of M
+[ChatGPT][Job] media batch upload start / result
+[ChatGPT][Job] composer attachments counted / send button lookup start
+[ChatGPT][Job] prompt insert verified / submit verified / result detected
+[ChatGPT][Job] CHATGPT_JOB_DONE sent { success: true, imageCount: N }
+[ChatGPT][BatchUpload] start / change dispatched / settle done
+[Runner] start workflow: <name>
+[Runner] chatgpt phase: <phase> (Ns elapsed, job <id>)   ← only on phase change
+[Runner] chatgpt job done (Ns, N images, job <id>)
 ```
 
-### What is gated behind debug flags
+The following prefixes are **silent by default** and only appear when their
+flag is enabled:
 
-`**flow-slate-bridge.ts**` (`FLOW_DEBUG_VERBOSE`) — via `bridgeDebug()`:
+- `[NodeStateDebug]`
+- `[GlowDebug]`
+- `[EdgeFlowDebug]`
+- `[SchedulerDebug]`
+- `[SeqDebug]` (gated by `DEBUG_FLAGS.seq`; legacy alias `FLOW_DEBUG_VERBOSE`)
+- `[ChatGPT][UploadDiag]`, `[ChatGPT][CountDiag]`, `[ChatGPT][Collect] rejected/...`
+  (gated by `FLOW_DEBUG_VERBOSE` / `DEBUG_FLAGS.seq`)
+- `[ChatGPT][Background] job heartbeat` (gated by `DEBUG_FLAGS.chatgptHeartbeat`)
+- `[Runner] wait chatgpt job` per-poll counter dump (gated by
+  `DEBUG_FLAGS.chatgptHeartbeat` or `DEBUG_FLAGS.runnerWait`)
+
+### What is gated behind debug flags (canonical list)
+
+`flow-slate-bridge.ts` (`FLOW_DEBUG_VERBOSE`) — via `bridgeDebug()`:
 
 - `[Bridge] Message:` / INSERT/CLEAR/verify per-call details
 - `[Bridge][tileIdentity] getTileSnapshot` — polling heartbeat
@@ -796,7 +1281,7 @@ Concise logs visible in console:
 - `__flowDebugScan` verbose DOM dump
 - Upload, addRef, download, settings panel verbose details
 
-`**flow-content.ts**` (`FLOW_DEBUG_VERBOSE`) — via `flowDebug()`:
+`flow-content.ts` (`FLOW_DEBUG_VERBOSE`) — via `flowDebug()`:
 
 - `debugRunFlowPrompt` [1-4/4] steps
 - `[BASELINE]`, `[BASELINE_FILE_NAMES]` — pre-submit tile snapshot
@@ -808,7 +1293,7 @@ Concise logs visible in console:
 - `[AUTO_DOWNLOAD_VIDEO_PROVISIONAL_CONFIRMED]`
 - `__flowDebugScan` verbose DOM dump (with short non-verbose fallback when debug off)
 
-`**flow-content.ts**` (`FLOW_DEBUG_SETTINGS`) — via `settingsDebug()`:
+`flow-content.ts` (`FLOW_DEBUG_SETTINGS`) — via `settingsDebug()`:
 
 - `[settings result]` — applySettings response
 - `[RUN_FLOW_PROMPT_PAYLOAD]` — raw payload on receipt
@@ -816,14 +1301,53 @@ Concise logs visible in console:
 - `[REFS_NORMALIZED]` — ref normalization
 - `[APPLY_SETTINGS_TARGET]` — settings being applied
 
-`**background/index.ts**` (`BG_DEBUG`):
+`background/index.ts` (`BG_DEBUG` via `AI_FLOW_DEBUG`):
 
 - Every `chrome.runtime.onMessage` received action
 - Bridge ping response
 - Script injection steps
 - Bridge ready check poll
 
-`**GenPanel.tsx**` (`GP_DEBUG`):
+`runner.ts` (`DEBUG_FLAGS.scheduler` / `edgeFlow` / `glow`):
+
+- `[EdgeFlowDebug][Runner] node start/complete/failure cleanup`
+- `[GlowDebug][Runner] start/complete/fail/edgeActive/edgeInactive`
+- `[SchedulerDebug][Runner] execution plan / execute deps / execute node /
+  cycle detected`
+
+`runner.ts` (`DEBUG_FLAGS.seq`):
+
+- `[SeqDebug][Runner] resolved generate inputs / chatgpt payload`
+  (sequential-multi-generate duplicate-attachment diagnostic)
+
+`background/index.ts` ChatGPT paths (`DEBUG_FLAGS.seq`):
+
+- `[SeqDebug][BG] chatgpt prompt payload / job done / job done (failure path)`
+  (sequential-multi-generate duplicate-attachment diagnostic)
+
+`background/index.ts` ChatGPT heartbeat (`DEBUG_FLAGS.chatgptHeartbeat`):
+
+- `[ChatGPT][Background] job heartbeat` — per-poll counter dump (silent by default)
+
+`runner.ts` `waitForChatGPTJob` (`DEBUG_FLAGS.chatgptHeartbeat` /
+`DEBUG_FLAGS.runnerWait`):
+
+- `[Runner] wait chatgpt job` per-poll counter dump (silent by default)
+- `[Runner] chatgpt job done (verbose)`, `heartbeat lost (verbose)`,
+  `no-progress timeout (verbose)`, `stale timeout (verbose)`,
+  `hard-stale timeout (verbose)`
+
+`content-script.ts` ChatGPT verbose (`FLOW_DEBUG_VERBOSE` /
+`DEBUG_FLAGS.seq`):
+
+- `[SeqDebug][ChatGPT] job start / cleanup / post-upload visual count /
+  pre-submit visual count / duplicate detected`
+- `[ChatGPT][UploadDiag]` per-strategy trace inside `uploadImage`
+- `[ChatGPT][CountDiag]` broad counter dump
+- `[ChatGPT][Collect] assistantTurns=… candidateImages=… acceptedImages=…
+  scanned=…` + `rejected / rejected#…` per-reason dump
+
+`GenPanel.tsx` (`GP_DEBUG` via `AI_FLOW_DEBUG`):
 
 - `[MODE_CHANGE]` — on mode switch (throttled, fires max once per 500ms)
 - `[RENDER_STATE]` — on key state changes (throttled)
