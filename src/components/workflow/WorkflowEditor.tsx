@@ -3082,6 +3082,73 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         setSelectedNode(null)
       }
     }
+
+    // ── Empty-area pan ─────────────────────────────────────────────
+    // Left-button drag on any viewport area that is NOT a node, port,
+    // connection, or interactive form control. Drawflow already has its
+    // own background-pan (mousedown on .parent-drawflow), but it
+    // triggers node-drag when the target is a .drawflow-node and does
+    // nothing on areas Drawflow did not annotate. This handler runs in
+    // the capture phase AFTER handleBidirectionalPortMouseDown (so port
+    // drags still win) and stops propagation to suppress Drawflow's
+    // own drag logic on the canvas surface, then mutates
+    // editor.canvas_x / canvas_y + the precanvas transform the same
+    // way applyCanvasZoom does.
+    let panActive = false
+    let panStartX = 0
+    let panStartY = 0
+    let panBaseX = 0
+    let panBaseY = 0
+    let panPointerId: number | null = null
+
+    const isPanExcluded = (target: EventTarget | null): boolean => {
+      const el = target as HTMLElement | null
+      if (!el) return true
+      if (el.closest('.drawflow-node')) return true
+      if (el.closest('.input, .output, .main-path, svg.connection')) return true
+      if (el.closest('button, [role="button"], input, textarea, select, [contenteditable="true"]')) return true
+      if (el.closest('.tobyflow-node-picker, .df-node-prompt-editor, .df-node-resize-handle, .df-port-icon')) return true
+      return false
+    }
+
+    const handlePanPointerMove = (event: PointerEvent) => {
+      if (!panActive || event.pointerId !== panPointerId) return
+      const dx = event.clientX - panStartX
+      const dy = event.clientY - panStartY
+      editor.canvas_x = Math.round(panBaseX + dx)
+      editor.canvas_y = Math.round(panBaseY + dy)
+      editor.precanvas.style.transformOrigin = '0 0'
+      editor.precanvas.style.transform = `translate(${editor.canvas_x}px, ${editor.canvas_y}px) scale(${editor.zoom})`
+      scheduleConnectionSync()
+    }
+    const handlePanPointerUp = (event: PointerEvent) => {
+      if (!panActive || event.pointerId !== panPointerId) return
+      panActive = false
+      panPointerId = null
+      document.removeEventListener('pointermove', handlePanPointerMove, true)
+      document.removeEventListener('pointerup', handlePanPointerUp, true)
+      document.removeEventListener('pointercancel', handlePanPointerUp, true)
+    }
+    const handleViewportPanPointerDown = (event: PointerEvent) => {
+      if (event.button !== 0) return
+      if (panActive) return
+      if (isPanExcluded(event.target)) return
+      if (!editor.precanvas) return
+
+      panActive = true
+      panStartX = event.clientX
+      panStartY = event.clientY
+      panBaseX = Number(editor.canvas_x) || 0
+      panBaseY = Number(editor.canvas_y) || 0
+      panPointerId = event.pointerId
+
+      event.preventDefault()
+      event.stopImmediatePropagation()
+
+      document.addEventListener('pointermove', handlePanPointerMove, true)
+      document.addEventListener('pointerup', handlePanPointerUp, true)
+      document.addEventListener('pointercancel', handlePanPointerUp, true)
+    }
     const handlePromptInlineEdit = (event: MouseEvent) => {
       const target = event.target instanceof Element ? event.target : null
       if (!target || target.closest('.df-node-prompt-editor')) return
@@ -3405,6 +3472,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     canvasEl.addEventListener('mousedown', handleBidirectionalPortMouseDown, true)
     canvasEl.addEventListener('mousedown', handleSelectionMouseDown, true)
     canvasEl.addEventListener('mousedown', stopNodePillDragStart, true)
+    canvasEl.addEventListener('pointerdown', handleViewportPanPointerDown, true)
     canvasEl.addEventListener('dblclick', handlePromptInlineEdit)
     canvasEl.addEventListener('dblclick', handleImageNodeUpload)
     canvasEl.addEventListener('click', handleNodePillClick)
@@ -3432,6 +3500,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       canvasEl.removeEventListener('mousedown', handleBidirectionalPortMouseDown, true)
       canvasEl.removeEventListener('mousedown', handleSelectionMouseDown, true)
       canvasEl.removeEventListener('mousedown', stopNodePillDragStart, true)
+      canvasEl.removeEventListener('pointerdown', handleViewportPanPointerDown, true)
       canvasEl.removeEventListener('dblclick', handlePromptInlineEdit)
       canvasEl.removeEventListener('dblclick', handleImageNodeUpload)
       canvasEl.removeEventListener('click', handleNodePillClick)

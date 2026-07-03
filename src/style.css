@@ -1684,7 +1684,7 @@ svg.ai-edge-completed path,
 
 .df-node-output-preview {
   position: relative;
-  border-radius: 6px;
+  border-radius: 0;
   overflow: hidden;
   background: #0a0a0a;
 }
