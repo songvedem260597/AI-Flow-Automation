@@ -114,6 +114,12 @@ const GENERATE_MEDIA_TYPE_OPTIONS = [
   { value: 'image', label: 'Image' },
   { value: 'video', label: 'Video' }
 ]
+const GENERATE_QUANTITY_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: '1', label: 'x1' },
+  { value: '2', label: 'x2' },
+  { value: '3', label: 'x3' },
+  { value: '4', label: 'x4' }
+]
 const GOOGLE_FLOW_IMAGE_MODEL_OPTIONS = ['Nano Banana Pro', 'Nano Banana 2', 'Nano Banana 2 Lite']
 const GOOGLE_FLOW_VIDEO_MODEL_OPTIONS = [
   'Omni Flash',
@@ -137,7 +143,7 @@ const IMAGE_ASPECT_RATIO_VALUES = {
 type GenerateMediaType = 'image' | 'video'
 type MediaNodeType = 'image' | 'video'
 type ImageAspectRatioOption = keyof typeof IMAGE_ASPECT_RATIO_VALUES
-type NodePillField = 'provider' | 'aspectRatio' | 'mediaType' | 'model' | 'videoDuration'
+type NodePillField = 'provider' | 'aspectRatio' | 'mediaType' | 'model' | 'videoDuration' | 'quantity'
 
 interface NodePillOption {
   value: string
@@ -251,6 +257,7 @@ function getPillOptions(field: NodePillField, data: Record<string, unknown> = {}
   if (field === 'mediaType') return normalizePillOptions(GENERATE_MEDIA_TYPE_OPTIONS)
   if (field === 'model') return normalizePillOptions(getGenerateModelOptions(data))
   if (field === 'videoDuration') return normalizePillOptions(getGenerateVideoDurationOptions(data))
+  if (field === 'quantity') return normalizePillOptions(GENERATE_QUANTITY_OPTIONS)
   return normalizePillOptions(
     data && Object.keys(data).length > 0 ? getGenerateAspectRatioOptions(data) : ASPECT_RATIO_OPTIONS
   )
@@ -261,6 +268,7 @@ function pillFieldLabel(field: NodePillField) {
   if (field === 'mediaType') return 'Media type'
   if (field === 'model') return 'Model'
   if (field === 'videoDuration') return 'Duration'
+  if (field === 'quantity') return 'Quantity'
   return 'Aspect ratio'
 }
 
@@ -1293,7 +1301,9 @@ function renderDrawflowNode(node: WorkflowNode) {
     const generateModel = String(generateData.model || modelOptions[0] || '')
     const generateDuration = String(generateData.videoDuration || durationOptions[0] || VIDEO_DURATION_OPTIONS[1])
     const supportsVideo = generateProviderSupportsVideo(generateData.provider)
-    const mode = data.autoGenerate === false ? 'Manual' : 'Auto'
+    const isGoogleFlow = String(generateData.provider || 'chatgpt') === 'google-flow'
+    const quantityValue = String(generateData.quantity ?? 1)
+    const quantityOptions = isGoogleFlow ? GENERATE_QUANTITY_OPTIONS : []
 
     // Output preview: if node completed and has images, show first image
     const output = data._output as Record<string, unknown> | undefined
@@ -1326,7 +1336,7 @@ function renderDrawflowNode(node: WorkflowNode) {
           ${modelOptions.length ? renderPillTrigger('model', generateModel, modelOptions) : ''}
           ${mediaType === 'video' ? renderPillTrigger('videoDuration', generateDuration, durationOptions) : ''}
           ${renderPillTrigger('aspectRatio', generateAspectRatio, ratioOptions)}
-          <button type="button" class="df-node-tag df-node-tag-editable"><span>${mode}</span></button>
+          ${isGoogleFlow ? renderPillTrigger('quantity', quantityValue, quantityOptions) : ''}
         </div>
       </div>
     `
@@ -1630,6 +1640,24 @@ const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, nodeId, onClose
               >
                 {aspectRatioOptions.map((ratio) => (
                   <option key={ratio} value={ratio}>{ratio}</option>
+                ))}
+              </select>
+              <ChevronDown className={selectIconClass} />
+            </div>
+          </label>
+        )}
+
+        {node.type === 'generate' && generateProvider === 'google-flow' && (
+          <label className="block">
+            <span className={fieldLabelClass}>Quantity</span>
+            <div className="relative">
+              <select
+                value={String(Math.max(1, Math.min(4, Number(generateData.quantity ?? 1))))}
+                onChange={(event) => updateGenerate({ quantity: Number(event.target.value) })}
+                className={fieldSelectClass}
+              >
+                {GENERATE_QUANTITY_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
                 ))}
               </select>
               <ChevronDown className={selectIconClass} />
@@ -2496,6 +2524,52 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       document.removeEventListener('keydown', handleKeyDown)
     }
   }, [imagePreview])
+
+  const handleDownloadPreview = async () => {
+    if (!imagePreview || !imagePreview.src) return
+
+    const src = imagePreview.src
+    const rawName = (imagePreview.name || '').trim()
+    const fallbackName = `image-${Date.now()}.png`
+    let filename = rawName || fallbackName
+    filename = filename.replace(/[^\w.\-]+/g, '-').replace(/^-+|-+$/g, '')
+    if (!filename) filename = fallbackName
+    if (!/\.[a-zA-Z0-9]{2,5}$/.test(filename)) {
+      filename = `${filename}.png`
+    }
+
+    const triggerAnchorDownload = (href: string) => {
+      const anchor = document.createElement('a')
+      anchor.href = href
+      anchor.download = filename
+      anchor.rel = 'noopener'
+      anchor.style.display = 'none'
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+    }
+
+    try {
+      let blobUrl: string | null = null
+      if (/^https?:/i.test(src)) {
+        const response = await fetch(src)
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+        const blob = await response.blob()
+        blobUrl = URL.createObjectURL(blob)
+        triggerAnchorDownload(blobUrl)
+        setTimeout(() => URL.revokeObjectURL(blobUrl!), 10000)
+        return
+      }
+      triggerAnchorDownload(src)
+    } catch (err) {
+      console.warn('[WorkflowEditor] Preview download fetch failed, trying direct anchor:', err)
+      try {
+        triggerAnchorDownload(src)
+      } catch (innerErr) {
+        console.error('[WorkflowEditor] Preview download failed:', innerErr)
+      }
+    }
+  }
 
   const handleCanvasContextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement | null
@@ -3672,7 +3746,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         mediaType: { mediaType: option.value },
         model: { model: option.value },
         videoDuration: { videoDuration: option.value },
-        aspectRatio: { aspectRatio: option.value }
+        aspectRatio: { aspectRatio: option.value },
+        quantity: { quantity: Number(option.value) }
       }
       updateNode(
         nodePillMenu.nodeId,
@@ -3934,14 +4009,27 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
                 <div className="min-w-0 text-[11px] font-medium text-white/62">
                   <span className="block truncate">{imagePreview.name}</span>
                 </div>
-                <button
-                  type="button"
-                  title="Close preview"
-                  onClick={() => setImagePreview(null)}
-                  className="flex h-8 w-8 items-center justify-center rounded-lg text-white/45 transition-colors hover:bg-white/[0.07] hover:text-white"
-                >
-                  <X className="h-4 w-4" />
-                </button>
+                <div className="flex items-center gap-1">
+                  {imagePreview.mediaType === 'image' && imagePreview.src && (
+                    <button
+                      type="button"
+                      title="Download"
+                      aria-label="Download"
+                      onClick={handleDownloadPreview}
+                      className="flex h-8 w-8 items-center justify-center rounded-lg text-white/45 transition-colors hover:bg-white/[0.07] hover:text-white"
+                    >
+                      <Download className="h-4 w-4" />
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    title="Close preview"
+                    onClick={() => setImagePreview(null)}
+                    className="flex h-8 w-8 items-center justify-center rounded-lg text-white/45 transition-colors hover:bg-white/[0.07] hover:text-white"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
               </div>
               <div
                 className="flex min-h-0 flex-1 items-center justify-center p-5"
