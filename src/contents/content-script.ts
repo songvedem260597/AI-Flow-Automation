@@ -194,6 +194,35 @@ const AIFlowContentScript = {
     }
     state.listenerAttached = true
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+      const msgAction = (message && message.action) || ''
+      // ── Provider-deferral guard ─────────────────────────────────────
+      // The generic shared content script is injected on every page
+      // (matches <all_urls>). When the Flow page is open, flow-content.ts
+      // also registers its own listener. Per Chrome, the first
+      // sendResponse wins. This script's listener is registered FIRST
+      // (it loads before flow-content.ts in the manifest order). If we
+      // respond to Flow-related actions, our "Unknown action: ..."
+      // catch fires synchronously through a Promise microtask and beats
+      // flow-content.ts's slower async response, breaking Flow entirely.
+      //
+      // Fix: this script is NOT responsible for Flow. Defer to
+      // flow-content.ts by NOT calling sendResponse for any Flow-related
+      // action. The deferral covers:
+      //   - FLOW_* actions (e.g. FLOW_INJECT_BRIDGE, FLOW_UPLOAD_IMAGES,
+      //     FLOW_GET_TILES, FLOW_DEBUG_PING, FLOW_CONTENT_PING)
+      //   - RUN_FLOW_PROMPT (the actual generation request)
+      //   - FLOW_STATUS messages are outbound only (this script sends,
+      //     never receives).
+      // Chrome then ignores this listener's response and honors
+      // flow-content.ts's. ChatGPT / generic-provider logic is unchanged.
+      if (typeof msgAction === 'string' && (
+        msgAction.indexOf('FLOW_') === 0 ||
+        msgAction === 'RUN_FLOW_PROMPT'
+      )) {
+        // Do not return true — this listener does not own the message
+        // channel. The Flow-specific content script will respond.
+        return false
+      }
       this.handleMessage(message).then(sendResponse).catch((err) => {
         sendResponse({ success: false, error: err.message })
       })

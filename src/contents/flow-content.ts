@@ -291,6 +291,40 @@ function settingsDebug() {
   if (FLOW_DEBUG_SETTINGS) console.log.apply(console, args)
 }
 
+// ── FlowTrace — always-on structured trace logs ─────────────────────────────
+// Production trace for diagnosing failures. Always visible in console, not
+// gated by debug flags. Use [FlowTrace] prefix for grep-ability.
+function flowTrace(scope: string, event: string, data?: Record<string, unknown> | string | unknown) {
+  var payload: unknown
+  if (data === undefined) {
+    payload = ''
+  } else if (typeof data === 'string') {
+    payload = data
+  } else {
+    try {
+      payload = JSON.stringify(data)
+    } catch (_) {
+      payload = String(data)
+    }
+  }
+  console.log('[FlowTrace][' + scope + '] ' + event + ' ' + payload)
+}
+
+function flowTraceFail(step: string, reason: string, extra: Record<string, unknown> = {}) {
+  var failRecord = {
+    step: step,
+    reason: reason,
+    rawResult: extra.rawResult,
+    normalized: extra.normalized,
+    payloadSummary: extra.payloadSummary,
+    fallback: extra.fallback,
+    extra: extra.extra,
+    timestamp: Date.now(),
+  }
+  ;(window as unknown as Record<string, unknown>).__lastFlowTraceFail = failRecord
+  console.error('[FlowTrace][Fail]', JSON.stringify(failRecord))
+}
+
 // ── Debug Run Flow Prompt ────────────────────────────────────────────────────
 
 function sleep(ms: number) {
@@ -398,6 +432,91 @@ async function debugRunFlowPrompt(prompt: string): Promise<Record<string, unknow
 
 // ── Run Flow Prompt Pipeline ─────────────────────────────────────────────────
 
+// Fallback: DOM-first Google Flow insert path.
+//
+// The Slate editor object is not always reachable through React fiber on
+// the current Flow composer (slateEditorFound=false), but the DOM
+// contenteditable IS mounted and `document.execCommand('insertText')` DOES
+// drive Flow's onChange. When the Slate `insert` action fails, this helper
+// invokes the new `insertGoogleFlowPromptOnly` bridge action which uses a
+// selector-first editor discovery + execCommand.
+//
+// IMPORTANT: this is insert-only. It does NOT click Tạo — the submit
+// step is a separate boundary so the auto-download polling loop in
+// runFlowPrompt() can still capture a pre-submit tile snapshot. The
+// normal Step 6 (verify) → Step 7 (pre-submit baseline + submit) →
+// Step 8 (auto-download) pipeline continues unchanged after this
+// fallback succeeds.
+async function runFlowPromptInsertGoogleFlowFallback(
+  payload: Record<string, unknown>
+): Promise<{ success: boolean; status: string; error?: string; insertResult?: Record<string, unknown> }> {
+  console.warn('[FlowContent] Falling back to insertGoogleFlowPromptOnly (DOM-first insert only)', JSON.stringify({
+    fallbackReason: 'slate_insert_failed',
+  }))
+  notifyStatus('FLOW_GFLOW_INSERT_FALLBACK')
+
+  const gflowInsert = await bridgeCall('insertGoogleFlowPromptOnly', { text: payload.prompt as string }, 15000)
+  const gflowOk = !!(gflowInsert as Record<string, unknown>).success
+  if (!gflowOk) {
+    const reason = String((gflowInsert as Record<string, unknown>).error || 'unknown')
+    return {
+      success: false,
+      status: 'FLOW_INSERT_FAILED',
+      error: 'Slate insert failed AND DOM-first insert fallback failed: ' + reason,
+    }
+  }
+
+  // Synthesize an insertResult in the same shape the Slate path returns,
+  // so the rest of runFlowPrompt() (verify, pre-submit baseline, submit,
+  // auto-download) can continue uninterrupted.
+  return {
+    success: true,
+    status: 'FLOW_INSERT_SUCCESS',
+    insertResult: {
+      success: true,
+      method: String((gflowInsert as Record<string, unknown>).method || 'gflow-dom-insert'),
+      strategy: 'gflow-dom-fallback',
+      error: '',
+    },
+  }
+}
+
+// Fallback: DOM-first Google Flow submit path (button click only).
+//
+// Invoked when the standard Slate `submit` action fails. Locates the
+// Tạo button and clicks it. The prompt is assumed to already be
+// inserted (Slate path or DOM-first insert fallback).
+async function runFlowPromptSubmitGoogleFlowFallback(): Promise<{ success: boolean; submitResult: Record<string, unknown> }> {
+  console.warn('[FlowContent] Falling back to submitGoogleFlowButtonOnly (DOM-first click only)', JSON.stringify({
+    fallbackReason: 'slate_submit_failed',
+  }))
+  notifyStatus('FLOW_GFLOW_SUBMIT_FALLBACK')
+
+  const gflowButton = await bridgeCall('submitGoogleFlowButtonOnly', {}, 15000)
+  const gflowOk = !!(gflowButton as Record<string, unknown>).success
+  if (!gflowOk) {
+    const reason = String((gflowButton as Record<string, unknown>).error || 'unknown')
+    return {
+      success: false,
+      submitResult: {
+        success: false,
+        method: 'gflow-dom-click',
+        buttonText: '',
+        error: 'Slate submit failed AND DOM-first submit fallback failed: ' + reason,
+      },
+    }
+  }
+  return {
+    success: true,
+    submitResult: {
+      success: true,
+      method: String((gflowButton as Record<string, unknown>).method || 'gflow-dom-click'),
+      buttonText: '',
+      error: '',
+    },
+  }
+}
+
 async function runFlowPrompt(payload: {
   prompt: string
   mode: 'image' | 'video'
@@ -421,20 +540,62 @@ async function runFlowPrompt(payload: {
 }): Promise<Record<string, unknown>> {
   console.log('[FlowContent] runFlowPrompt START, mode=' + payload.mode + ', prompt len:', payload.prompt?.length)
 
+  // ── FlowTrace: payload summary ──────────────────────────────────────
+  var payloadSummary = {
+    mode: payload.mode,
+    model: payload.model,
+    aspectRatio: payload.aspectRatio,
+    quantity: payload.quantity,
+    duration: payload.duration || '',
+    autoDownload: !!payload.autoDownload,
+    outputFolder: payload.outputFolder || '',
+    resolution: payload.resolution || '',
+    videoResolution: payload.videoResolution || '',
+    fileIdsCount: (payload.fileIds || []).length,
+    frameFileIds: payload.frameFileIds ? { hasFrame1: !!payload.frameFileIds.frame1, hasFrame2: !!payload.frameFileIds.frame2 } : null,
+    focusTab: !!payload.focusTab,
+    promptLen: payload.prompt?.length || 0,
+    url: window.location.href,
+  }
+  flowTrace('Content', 'RUN_FLOW_PROMPT_START', payloadSummary)
+
   // Wait for bridge to be ready (polls every 500ms, up to 10s)
+  flowTrace('Content', 'BRIDGE_WAIT_START', { timeoutMs: 10000 })
   const readyCheck = await waitBridgeReady()
   if (!readyCheck.ready) {
+    flowTraceFail('waitBridgeReady', 'BRIDGE_NOT_READY', {
+      rawResult: readyCheck,
+      payloadSummary: payloadSummary,
+    })
     return {
       success: false,
       status: 'BRIDGE_NOT_READY',
       bridgeReady: false,
       error: readyCheck.error,
       url: window.location.href,
-      hint: 'Reload the Flow tab and try again.'
+      hint: 'Reload the Flow tab and try again.',
     }
   }
+  flowTrace('Content', 'BRIDGE_WAIT_DONE', { ready: true })
 
   // Step 1-2: Apply settings from Gen tab payload (NEVER skip in normal runs)
+  // FlowTrace: explicit APPLY_SETTINGS_START (single, predictable key for grep)
+  console.log('[FlowTrace][Content] APPLY_SETTINGS_START', JSON.stringify({
+    mode: payload.mode,
+    model: payload.model,
+    ratio: payload.aspectRatio,
+    quantity: payload.quantity,
+    duration: payload.duration || '',
+    autoDownload: !!payload.autoDownload,
+    outputFolder: payload.outputFolder || '',
+    fileIdsCount: (payload.fileIds || []).length,
+    promptLen: payload.prompt?.length || 0,
+    url: window.location.href,
+    flag_DISABLE_settings_automation_is_debug_only: true,
+  }))
+  flowTrace('Content', 'STEP_1_2_APPLY_SETTINGS_START', {
+    target: { mode: payload.mode, model: payload.model, aspectRatio: payload.aspectRatio, quantity: payload.quantity, duration: payload.duration || '' },
+  })
   let settingsResult: Record<string, unknown>
   try {
     settingsResult = await bridgeCall('applySettings', { payload })
@@ -443,31 +604,94 @@ async function runFlowPrompt(payload: {
       message: (err as Error)?.message,
       stack: (err as Error)?.stack,
     })
-    return {
-      success: false,
-      error: (err as Error)?.message || 'FLOW_APPLY_SETTINGS_FAILED',
-      stage: 'applySettings',
-    }
+    flowTraceFail('applySettings', 'FLOW_APPLY_SETTINGS_EXCEPTION', {
+      rawResult: { message: (err as Error)?.message },
+      payloadSummary: payloadSummary,
+    })
+    // Soft-fail policy: do NOT abort the pipeline. Settings automation is
+    // currently gated by ENABLE_FLOW_SETTINGS_AUTOMATION=false in the
+    // bridge, so this path is expected to fail in production. Continue
+    // with insert/submit using the Flow page's current state.
+    settingsResult = { success: false, error: 'FLOW_APPLY_SETTINGS_EXCEPTION', errorMessage: (err as Error)?.message, softFailed: true }
   }
+  // FlowTrace: explicit APPLY_SETTINGS_RAW_RESULT (single, predictable key for grep)
+  console.log('[FlowTrace][Content] APPLY_SETTINGS_RAW_RESULT', JSON.stringify({
+    success: !!(settingsResult as Record<string, unknown>)?.success,
+    error: (settingsResult as Record<string, unknown>)?.error || '',
+    method: (settingsResult as Record<string, unknown>)?.method || '',
+    hasDetails: !!(settingsResult as Record<string, unknown>)?.details,
+  }))
+  flowTrace('Content', 'STEP_1_2_APPLY_SETTINGS_RAW', settingsResult)
   if (!settingsResult?.success) {
-    console.error('[FlowContent] Step 1-2 apply settings FAILED:', JSON.stringify(settingsResult, null, 2))
-    return {
+    const settingsError = String((settingsResult as Record<string, unknown>)?.error || 'FLOW_APPLY_SETTINGS_FAILED')
+    console.error('[FlowTrace][Fail]', JSON.stringify({
+      step: 'applySettings',
+      reason: settingsError,
+      rawResult: settingsResult,
+      payloadSummary: {
+        mode: payload.mode,
+        model: payload.model,
+        ratio: payload.aspectRatio,
+        quantity: payload.quantity,
+        autoDownload: payload.autoDownload,
+      },
+    }))
+    // Detect specific failure category for [FlowTrace][Fail] classification
+    var settingsReason = 'FLOW_APPLY_SETTINGS_FAILED'
+    if (settingsError.includes('FLOW_MODEL_MISSING')) settingsReason = 'FLOW_SETTINGS_MODEL_MISSING'
+    else if (settingsError.includes('FLOW_MODEL_OPTION_NOT_FOUND')) settingsReason = 'FLOW_SETTINGS_MODEL_OPTION_NOT_FOUND'
+    else if (settingsError.includes('FLOW_MODEL_DROPDOWN_NOT_FOUND')) settingsReason = 'FLOW_SETTINGS_MODEL_DROPDOWN_NOT_FOUND'
+    else if (settingsError.includes('FLOW_MODEL_MENU_NOT_FOUND')) settingsReason = 'FLOW_SETTINGS_MODEL_MENU_NOT_FOUND'
+    else if (settingsError.includes('FLOW_SETTINGS_BUTTON_NOT_FOUND')) settingsReason = 'FLOW_SETTINGS_BUTTON_NOT_FOUND'
+    else if (settingsError.includes('FLOW_SETTINGS_PANEL_NOT_FOUND')) settingsReason = 'FLOW_SETTINGS_PANEL_NOT_FOUND'
+    else if (settingsError.includes('FLOW_SETTINGS_VERIFY_MISMATCH')) settingsReason = 'FLOW_SETTINGS_VERIFY_MISMATCH'
+    else if (settingsError.includes('FLOW_EDITOR_NOT_FOUND')) settingsReason = 'FLOW_EDITOR_NOT_FOUND'
+    flowTraceFail('applySettings', settingsReason, {
+      rawResult: settingsResult,
+      payloadSummary: payloadSummary,
+      extra: { settingsError: settingsError, settingsDetails: (settingsResult as Record<string, unknown>)?.details },
+    })
+    // ── SOFT-FAIL POLICY ──────────────────────────────────────────────
+    // The bridge has ENABLE_FLOW_SETTINGS_AUTOMATION=false as a kill switch,
+    // but the production action handler still calls applyFlowSettings which
+    // can fail when Flow UI doesn't match selectors. Instead of aborting the
+    // whole queue, we continue with insert/submit using whatever settings
+    // are currently visible on the Flow page. The user gets a soft warning
+    // and a flowStep message, but the queue keeps progressing.
+    console.warn('[FlowTrace][Content] APPLY_SETTINGS_SOFT_FAIL_CONTINUE', JSON.stringify({
+      reason: settingsReason,
+      softFailed: true,
+      willContinueWith: 'insert/submit using current Flow page settings',
+    }))
+    settingsResult = {
       success: false,
-      error: (settingsResult as Record<string, unknown>)?.error || 'FLOW_APPLY_SETTINGS_FAILED',
-      stage: 'applySettings',
-      details: settingsResult,
+      softFailed: true,
+      error: settingsError,
+      method: 'soft-fail-continue',
+      status: settingsReason,
     }
   }
-  settingsDebug('[FlowContent][settings result]', settingsResult)
+  flowTrace('Content', 'STEP_1_2_APPLY_SETTINGS_DONE', {
+    success: !!(settingsResult as Record<string, unknown>)?.success,
+    softFailed: !!(settingsResult as Record<string, unknown>)?.softFailed,
+    method: (settingsResult as Record<string, unknown>)?.method || '',
+  })
   await new Promise(r => setTimeout(r, 400))
 
   // Step 3: Clear editor
   console.log('[FlowContent] Step 3: clearEditor')
+  flowTrace('Content', 'STEP_3_CLEAR_START', {})
   notifyStatus('FLOW_RUN_STARTED')
   const clearResult = await bridgeCall('clear')
+  flowTrace('Content', 'STEP_3_CLEAR_RAW', clearResult)
   if (!clearResult.success) {
+    flowTraceFail('clear', 'FLOW_CLEAR_FAILED', {
+      rawResult: clearResult,
+      payloadSummary: payloadSummary,
+    })
     return { success: false, status: 'FLOW_CLEAR_FAILED', error: (clearResult as Record<string, unknown>).error || 'clear failed' }
   }
+  flowTrace('Content', 'STEP_3_CLEAR_DONE', { method: (clearResult as Record<string, unknown>).method })
   await new Promise(r => setTimeout(r, 300))
 
   // Step 4: Add reference images BEFORE text
@@ -477,6 +701,10 @@ async function runFlowPrompt(payload: {
   if (payload.fileIds && payload.fileIds.some(id => id.startsWith('upload_'))) {
     const unresolved = payload.fileIds.filter(id => id.startsWith('upload_'))
     console.error('[FlowContent] REF_UPLOAD_NOT_RESOLVED: ' + JSON.stringify(unresolved))
+    flowTraceFail('addRefImages', 'REF_UPLOAD_NOT_RESOLVED', {
+      payloadSummary: payloadSummary,
+      extra: { unresolved: unresolved },
+    })
     return {
       success: false,
       status: 'REF_UPLOAD_NOT_RESOLVED',
@@ -486,6 +714,7 @@ async function runFlowPrompt(payload: {
 
   if (payload.fileIds && payload.fileIds.length > 0 && !isFrames) {
     console.log('[FlowContent] Step 4: addRefImages, count=' + payload.fileIds.length)
+    flowTrace('Content', 'STEP_4_ADD_REF_START', { count: payload.fileIds.length, isFrames: isFrames })
     for (const fileId of payload.fileIds) {
       const fileName = payload.fileNameMap?.[fileId] || ''
       console.log('[FlowContent][ADD_REF_START]', JSON.stringify({ fileId, fileName }))
@@ -500,6 +729,11 @@ async function runFlowPrompt(payload: {
         method: addRefMethod,
       }))
       if (!addRefSuccess) {
+        flowTraceFail('addRefImages', 'FLOW_ADD_REF_FAILED', {
+          rawResult: addRefResult,
+          payloadSummary: payloadSummary,
+          extra: { fileId: fileId, fileName: fileName, addRefError: addRefError },
+        })
         return {
           success: false,
           status: 'FLOW_ADD_REF_FAILED',
@@ -508,33 +742,102 @@ async function runFlowPrompt(payload: {
         }
       }
     }
+    flowTrace('Content', 'STEP_4_ADD_REF_DONE', { count: payload.fileIds.length })
     await new Promise(r => setTimeout(r, 300))
   }
 
   // Step 5: Insert text
   console.log('[FlowContent] Step 5: insertText, len=', payload.prompt.length)
-  const insertResult = await bridgeCall('insert', { text: payload.prompt })
+  flowTrace('Content', 'STEP_5_INSERT_START', { promptLen: payload.prompt.length })
+  let insertResult = await bridgeCall('insert', { text: payload.prompt })
+  flowTrace('Content', 'STEP_5_INSERT_RAW', insertResult)
   if (!insertResult.success) {
-    return { success: false, status: 'FLOW_INSERT_FAILED', error: (insertResult as Record<string, unknown>).error || 'insert failed' }
+    // ── Fallback: DOM-first Google Flow INSERT path ─────────────────────
+    flowTrace('Content', 'INSERT_FALLBACK_START', {
+      reason: 'slate_insert_failed',
+      slateError: (insertResult as Record<string, unknown>).error,
+    })
+    const insertFallback = await runFlowPromptInsertGoogleFlowFallback(payload as Record<string, unknown>)
+    flowTrace('Content', 'INSERT_FALLBACK_RESULT', insertFallback)
+    if (!insertFallback.success || !insertFallback.insertResult) {
+      flowTraceFail('insertGoogleFlowPromptOnly', 'FLOW_GFLOW_INSERT_FALLBACK_FAILED', {
+        rawResult: insertFallback,
+        payloadSummary: payloadSummary,
+        fallback: 'insertGoogleFlowPromptOnly',
+      })
+      return {
+        success: false,
+        status: insertFallback.status || 'FLOW_INSERT_FAILED',
+        error: insertFallback.error || 'DOM-first insert fallback failed',
+        insertMethod: 'gflow-dom-insert-failed',
+        fallback: 'insertGoogleFlowPromptOnly',
+      }
+    }
+    // Synthesize a successful insertResult and continue the normal flow.
+    insertResult = insertFallback.insertResult
+    notifyStatus('FLOW_INSERT_SUCCESS')
+    console.log('[FlowContent] Step 5 DOM-first insert fallback succeeded, continuing normal pipeline', JSON.stringify({
+      method: (insertResult as Record<string, unknown>).method,
+      strategy: (insertResult as Record<string, unknown>).strategy,
+    }))
   }
+  flowTrace('Content', 'STEP_5_INSERT_DONE', {
+    success: !!insertResult.success,
+    method: (insertResult as Record<string, unknown>).method,
+    strategy: (insertResult as Record<string, unknown>).strategy,
+  })
   notifyStatus('FLOW_INSERT_SUCCESS')
   await new Promise(r => setTimeout(r, 500))
 
   // Step 6: Verify
+  flowTrace('Content', 'STEP_6_VERIFY_START', {})
   const verifyResult = await bridgeCall('verify')
+  flowTrace('Content', 'STEP_6_VERIFY_RAW', verifyResult)
   if (!(verifyResult as Record<string, unknown>).hasContent) {
+    flowTrace('Content', 'STEP_6_VERIFY_NO_CONTENT', { retrying: true })
     const retryInsert = await bridgeCall('insert', { text: payload.prompt })
+    flowTrace('Content', 'STEP_6_RETRY_INSERT_RAW', retryInsert)
     if (!retryInsert.success) {
-      return { success: false, status: 'FLOW_VERIFY_FAILED', error: 'Text not in Slate model after retry' }
+      // ── Fallback: DOM-first Google Flow INSERT path (retry) ─────────
+      console.warn('[FlowContent] Step 6 verify/retry failed, falling back to insertGoogleFlowPromptOnly (DOM-first insert only)')
+      flowTrace('Content', 'INSERT_FALLBACK_START', {
+        reason: 'step6_verify_retry_failed',
+        slateError: (retryInsert as Record<string, unknown>).error,
+      })
+      const insertFallback2 = await runFlowPromptInsertGoogleFlowFallback(payload as Record<string, unknown>)
+      flowTrace('Content', 'INSERT_FALLBACK_RESULT', insertFallback2)
+      if (!insertFallback2.success || !insertFallback2.insertResult) {
+        flowTraceFail('insertGoogleFlowPromptOnly', 'FLOW_GFLOW_INSERT_FALLBACK_FAILED', {
+          rawResult: insertFallback2,
+          payloadSummary: payloadSummary,
+          fallback: 'insertGoogleFlowPromptOnly',
+          extra: { triggerStep: 'step6_verify_retry' },
+        })
+        return {
+          success: false,
+          status: insertFallback2.status || 'FLOW_VERIFY_FAILED',
+          error: insertFallback2.error || 'DOM-first insert fallback failed (verify retry)',
+          insertMethod: 'gflow-dom-insert-failed',
+          fallback: 'insertGoogleFlowPromptOnly',
+        }
+      }
+      insertResult = insertFallback2.insertResult
+      notifyStatus('FLOW_INSERT_SUCCESS')
+      console.log('[FlowContent] Step 6 DOM-first insert fallback (retry) succeeded, continuing normal pipeline', JSON.stringify({
+        method: (insertResult as Record<string, unknown>).method,
+        strategy: (insertResult as Record<string, unknown>).strategy,
+      }))
     }
     await new Promise(r => setTimeout(r, 500))
   }
+  flowTrace('Content', 'STEP_6_VERIFY_DONE', { hasContent: !!(verifyResult as Record<string, unknown>).hasContent })
 
   // Step 7: Submit — capture baseline snapshot RIGHT BEFORE submit.
   // This is critical: if captured after submit, result tiles may already exist
   // and the diff will find 0 new tiles (download nothing).
   // Snapshot includes both tileIds AND fileNames for dual filtering.
   console.log('[FlowContent] Step 7: submit (capturing pre-submit baseline)')
+  flowTrace('Content', 'STEP_7_BASELINE_CAPTURE_START', {})
   var preSubmitIds: string[] = []
   var preSubmitFileNames: string[] = []
   var preSubmitDetails: Array<{ id: string; fileName: string; status: string }> = []
@@ -543,6 +846,11 @@ async function runFlowPrompt(payload: {
     preSubmitIds = ((preSubmitSnapshot as Record<string, unknown>).ids as string[]) || []
     preSubmitFileNames = ((preSubmitSnapshot as Record<string, unknown>).fileNames as string[]) || []
     preSubmitDetails = ((preSubmitSnapshot as Record<string, unknown>).details as Array<{ id: string; fileName: string; status: string }>) || []
+    flowTrace('Content', 'STEP_7_BASELINE_CAPTURED', {
+      idsCount: preSubmitIds.length,
+      fileNamesCount: preSubmitFileNames.length,
+      nonEmptyFileNames: preSubmitFileNames.filter(function (f) { return f.length > 0 }).length,
+    })
     if (FLOW_DEBUG_VERBOSE) console.log('[FlowContent][BASELINE]', JSON.stringify({
       ids: preSubmitIds.length,
       fileNames: preSubmitFileNames.length,
@@ -560,13 +868,49 @@ async function runFlowPrompt(payload: {
     if (FLOW_DEBUG_VERBOSE && baselineNonEmpty.length > 0) {
       console.log('[FlowContent][BASELINE_FILE_NAMES_FULL]', JSON.stringify(baselineNonEmpty))
     }
-  } catch (_) {}
+  } catch (e) {
+    flowTraceFail('getTileSnapshot', 'FLOW_BASELINE_CAPTURE_FAILED', {
+      rawResult: { message: (e as Error)?.message },
+      payloadSummary: payloadSummary,
+    })
+  }
 
   console.log('[FlowContent] Step 7: submit')
-  const submitResult = await bridgeCall('submit')
+  flowTrace('Content', 'STEP_7_SUBMIT_START', {})
+  let submitResult = await bridgeCall('submit')
+  flowTrace('Content', 'STEP_7_SUBMIT_RAW', submitResult)
   if (!submitResult.success) {
-    return { success: false, status: 'FLOW_SUBMIT_FAILED', error: (submitResult as Record<string, unknown>).error || 'submit failed' }
+    // ── Fallback: DOM-first Google Flow SUBMIT path (button click only) ─
+    flowTrace('Content', 'SUBMIT_FALLBACK_START', {
+      reason: 'slate_submit_failed',
+      slateError: (submitResult as Record<string, unknown>).error,
+    })
+    const submitFallback = await runFlowPromptSubmitGoogleFlowFallback()
+    flowTrace('Content', 'SUBMIT_FALLBACK_RESULT', submitFallback)
+    if (!submitFallback.success) {
+      flowTraceFail('submitGoogleFlowButtonOnly', 'FLOW_GFLOW_SUBMIT_FALLBACK_FAILED', {
+        rawResult: submitFallback.submitResult,
+        payloadSummary: payloadSummary,
+        fallback: 'submitGoogleFlowButtonOnly',
+      })
+      return {
+        success: false,
+        status: 'FLOW_SUBMIT_FAILED',
+        error: (submitFallback.submitResult as Record<string, unknown>).error || 'submit failed',
+        submitMethod: (submitFallback.submitResult as Record<string, unknown>).method || '',
+        fallback: 'submitGoogleFlowButtonOnly',
+      }
+    }
+    // Synthesize a successful submitResult and continue the normal flow.
+    submitResult = submitFallback.submitResult
+    console.log('[FlowContent] Step 7 DOM-first submit fallback succeeded, continuing normal pipeline', JSON.stringify({
+      method: (submitResult as Record<string, unknown>).method,
+    }))
   }
+  flowTrace('Content', 'STEP_7_SUBMIT_DONE', {
+    success: !!submitResult.success,
+    method: (submitResult as Record<string, unknown>).method,
+  })
   notifyStatus('FLOW_SUBMIT_SUCCESS')
   await new Promise(r => setTimeout(r, 1000))
 
@@ -1669,6 +2013,15 @@ async function runFlowPrompt(payload: {
     autoDownloadResult = { successCount: successCount, failCount: failCount }
   }
 
+  flowTrace('Content', 'STEP_8_AUTO_DOWNLOAD_RESULT', {
+    autoDownload: normAutoDownload,
+    autoDownloadResult: autoDownloadResult,
+    normMode: normMode,
+    downloadResolution: normDownloadResolution,
+    videoDownloadResolution: normVideoResolution,
+    outputFolder: normOutputFolder,
+  })
+
 // When autoDownload is OFF, default to success. When ON, three cases:
     // - all expected succeeded with no partial: FLOW_SUBMIT_SUCCESS
     // - partial (confirmed < expected): AUTO_DOWNLOAD_PARTIAL_SUCCESS
@@ -1692,6 +2045,14 @@ async function runFlowPrompt(payload: {
         runSucceeded = false
       }
     }
+
+    flowTrace('Content', 'RUN_FLOW_PROMPT_RETURN', {
+      success: runSucceeded,
+      status: finalStatus,
+      autoDownload: autoDownloadResult,
+      submitMethod: (submitResult as Record<string, unknown>).method || '',
+      insertStrategy: (insertResult as Record<string, unknown>).strategy || '',
+    })
 
     return {
       success: runSucceeded,
@@ -1722,6 +2083,18 @@ function notifyStatus(status: string, data: Record<string, unknown> = {}) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const action = (message as Record<string, unknown>).action as string
+
+  // FlowTrace: log every incoming action so listener-race issues are visible.
+  // Other content scripts (e.g. generic content-script.ts) may also receive
+  // the same message and respond first. This log proves whether THIS content
+  // script's listener was reached at all.
+  console.log('[FlowTrace][Content] ON_MESSAGE_RECEIVED', JSON.stringify({
+    action: action,
+    senderTabId: sender?.tab?.id,
+    senderUrl: sender?.tab?.url,
+    senderFrameId: sender?.frameId,
+    url: window.location.href,
+  }))
 
   if (action === 'FLOW_DEBUG_PING') {
     const scan = (window as unknown as Record<string, unknown>).__flowDebugScan?.()
@@ -1847,10 +2220,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (action === 'FLOW_INJECT_BRIDGE') {
+    console.log('[FlowTrace][Content] FLOW_INJECT_BRIDGE_ENTERED', JSON.stringify({
+      url: window.location.href,
+      bridgeLoadedByMarker: !!window.__flowSlateBridgeCleanup,
+      bridgeBuildTime: window.__FLOW_BRIDGE_BUILD_TIME__ || null,
+    }))
     flowDebug('[FlowContent] FLOW_INJECT_BRIDGE received')
     ;(async () => {
       const ready = await waitBridgeReady()
       flowDebug('[FlowContent] waitBridgeReady result:', ready)
+      console.log('[FlowTrace][Content] FLOW_INJECT_BRIDGE_RESPOND', JSON.stringify({
+        bridgeLoaded: true,
+        bridgeReady: ready.ready,
+        bridgeBuildTime: window.__FLOW_BRIDGE_BUILD_TIME__ || null,
+      }))
       sendResponse({ ok: true, bridgeLoaded: true, bridgeReady: ready.ready })
     })()
     return true

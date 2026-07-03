@@ -1764,22 +1764,102 @@ async function runFlowPrompt(
     duration: payload.duration,
   }, null, 2))
 
+  // ── FlowTrace: BG entry ───────────────────────────────────────────────
+  console.log('[FlowTrace][BG] RUN_FLOW_PROMPT_RECEIVED ' + JSON.stringify({
+    mode: payload.mode,
+    model: payload.model,
+    ratio: payload.aspectRatio,
+    quantity: payload.quantity,
+    duration: payload.duration || '',
+    autoDownload: payload.autoDownload,
+    outputFolder: payload.outputFolder || '',
+    fileIdsCount: (payload.fileIds || []).length,
+    promptLen: payload.prompt?.length || 0,
+    senderTabId: senderTabId,
+    payloadTabId: payload.tabId,
+  }))
+
   let tabId = payload.tabId || senderTabId
   if (!tabId) {
     tabId = await findOrOpenFlowTab()
-    if (!tabId) return { success: false, error: 'Could not find or open Flow tab' }
+    if (!tabId) {
+      console.error('[FlowTrace][Fail] ' + JSON.stringify({
+        step: 'BG.tabId',
+        reason: 'FLOW_TAB_NOT_FOUND',
+        rawResult: null,
+        payloadSummary: { mode: payload.mode, model: payload.model, quantity: payload.quantity },
+      }))
+      return { success: false, error: 'Could not find or open Flow tab' }
+    }
+  }
+  // Log tab URL so we can detect stale / wrong tab
+  try {
+    const tabInfo = await chrome.tabs.get(tabId).catch(() => null)
+    console.log('[FlowTrace][BG] TAB_RESOLVED tabId=' + tabId + ' url=' + (tabInfo?.url || 'unknown') + ' title=' + (tabInfo?.title || 'unknown') + ' senderTabId=' + senderTabId + ' payloadTabId=' + payload.tabId)
+  } catch (_) {
+    console.log('[FlowTrace][BG] TAB_RESOLVED tabId=' + tabId + ' url=<unknown> senderTabId=' + senderTabId + ' payloadTabId=' + payload.tabId)
   }
 
   try {
-    // Step 1: Check if bridge is already loaded via content script
-    const pingResult = await chrome.tabs.sendMessage(tabId, { action: 'FLOW_INJECT_BRIDGE' }).catch(() => null)
+    // ── Step 1: Multi-layer bridge readiness probe ───────────────────────
+    // Layer A: MAIN-world probe (pingFlowBridgeViaMainWorld) reads markers
+    //          and postMessage pings the bridge directly. Bypasses any
+    //          content script listener race entirely.
+    // Layer B: content-script ping (chrome.tabs.sendMessage FLOW_INJECT_BRIDGE)
+    //          — now that content-script.ts defers FLOW_* actions, this
+    //          listener-race winner is flow-content.ts. Used as a fallback
+    //          if the MAIN-world probe times out (e.g. sandbox restriction
+    //          on executeScript).
+    // Layer C: send RUN_FLOW_PROMPT directly. flow-content.ts's
+    //          runFlowPrompt internally calls waitBridgeReady (which polls
+    //          bridgeCall('ping') up to 10s) — this can recover if the
+    //          bridge is loading but not yet ready at probe time.
+    //
+    // Soft-fail: even if all three layers report not-ready, we DO NOT
+    // abort here. Instead we log the failure and fall through to send
+    // RUN_FLOW_PROMPT directly. The content script's own waitBridgeReady
+    // (10s timeout, polls every 500ms) is the last line of defense.
+    console.log('[FlowTrace][BG] PING_BRIDGE_START tabId=' + tabId)
+    var pingResult = await pingFlowBridgeViaMainWorld(tabId)
+    console.log('[FlowTrace][BG] PING_BRIDGE_RAW ' + JSON.stringify({
+      tabId: tabId,
+      pingResult: pingResult,
+      responseRaw: pingResult,
+      layer: 'MAIN_world_probe',
+    }))
     if (BG_DEBUG) console.log('[Background] Bridge check response:', pingResult)
-    const bridgeLoaded = pingResult?.bridgeLoaded === true && pingResult?.bridgeReady === true
+    var bridgeLoaded = pingResult?.bridgeLoaded === true && pingResult?.bridgeReady === true
+
+    // Layer B: try content-script FLOW_INJECT_BRIDGE if MAIN probe reports
+    // the bridge is loaded but not yet ready (timing race on first paint).
+    if (pingResult?.bridgeLoaded === true && pingResult?.bridgeReady !== true) {
+      console.log('[FlowTrace][BG] PING_BRIDGE_TRY_CONTENT_SCRIPT tabId=' + tabId)
+      try {
+        const csResult = await chrome.tabs.sendMessage(tabId, { action: 'FLOW_INJECT_BRIDGE' }).catch(function () { return null })
+        console.log('[FlowTrace][BG] PING_BRIDGE_CONTENT_SCRIPT_RAW ' + JSON.stringify({
+          tabId: tabId,
+          csResult: csResult,
+          responseRaw: csResult,
+          layer: 'content_script_ping',
+        }))
+        if (csResult?.bridgeReady === true) {
+          bridgeLoaded = true
+          console.log('[FlowTrace][BG] BRIDGE_READY_VIA_CONTENT_SCRIPT_PING')
+        }
+      } catch (e) {
+        console.log('[FlowTrace][BG] PING_BRIDGE_CONTENT_SCRIPT_ERROR error=' + (e as Error)?.message)
+      }
+    }
 
     if (!bridgeLoaded) {
       if (BG_DEBUG) console.log('[Background] Bridge not ready, injecting scripts...')
       const scripts = await getFlowScriptFiles()
       if (!scripts.content) {
+        console.error('[FlowTrace][Fail] ' + JSON.stringify({
+          step: 'BG.injectScripts',
+          reason: 'FLOW_SCRIPTS_NOT_FOUND',
+          rawResult: null,
+        }))
         return { success: false, error: 'Could not find flow-content script in manifest' }
       }
 
@@ -1792,6 +1872,11 @@ async function runFlowPrompt(
         })
       } catch (e) {
         console.warn('[Background] Content injection failed:', e)
+        console.error('[FlowTrace][Fail] ' + JSON.stringify({
+          step: 'BG.injectContent',
+          reason: 'FLOW_CONTENT_INJECTION_FAILED',
+          rawResult: { message: (e as Error).message },
+        }))
         return { success: false, error: 'Content script injection failed: ' + (e as Error).message }
       }
 
@@ -1806,6 +1891,11 @@ async function runFlowPrompt(
           })
         } catch (e) {
           console.warn('[Background] Bridge injection failed:', e)
+          console.error('[FlowTrace][Fail] ' + JSON.stringify({
+            step: 'BG.injectBridge',
+            reason: 'FLOW_BRIDGE_INJECTION_FAILED',
+            rawResult: { message: (e as Error).message },
+          }))
           return { success: false, error: 'Bridge MAIN world injection failed: ' + (e as Error).message }
         }
       }
@@ -1814,30 +1904,86 @@ async function runFlowPrompt(
       await new Promise(r => setTimeout(r, 800))
       if (BG_DEBUG) console.log('[Background] Injection done, polling bridge ready...')
 
-      // Poll until bridge is ready (via content script postMessage)
+      // Poll using MAIN-world probe. BridgeReady can come from either
+      //   (a) successful ping response with ready: true, OR
+      //   (b) marker-based readiness (__FLOW_SLATE_BRIDGE_READY__ true
+      //       or __FLOW_BRIDGE__ exists or __flowSlateBridgeCleanup set).
+      // Soft-fail: after 10 attempts (5s) we do NOT abort. We log the
+      // last probe and fall through to send RUN_FLOW_PROMPT. The content
+      // script's own waitBridgeReady will continue polling for up to 10s.
       var bridgeReady = false
+      var lastProbe: Record<string, unknown> = {}
       for (let i = 0; i < 10; i++) {
         try {
-          const readyCheck = await chrome.tabs.sendMessage(tabId, { action: 'FLOW_INJECT_BRIDGE' }).catch(() => null)
-          if (BG_DEBUG) console.log('[Background] Bridge ready check #' + (i + 1) + ':', readyCheck)
-          if (readyCheck?.bridgeReady === true) {
+          lastProbe = (await pingFlowBridgeViaMainWorld(tabId)) || {}
+          console.log('[FlowTrace][BG] BRIDGE_READY_POLL #' + (i + 1) + ' ' + JSON.stringify(lastProbe))
+          if (lastProbe?.bridgeReady === true) {
             bridgeReady = true
             if (BG_DEBUG) console.log('[Background] Bridge ready after', (i + 1) * 500, 'ms')
             break
           }
-        } catch (_) {}
+        } catch (e) {
+          console.log('[FlowTrace][BG] BRIDGE_READY_POLL #' + (i + 1) + ' error=' + (e as Error)?.message)
+        }
         await new Promise(r => setTimeout(r, 500))
         if (i === 9) {
-          return { success: false, error: 'Bridge failed to initialize. Try reloading the Flow tab.' }
+          // Layer B fallback: try content-script FLOW_INJECT_BRIDGE once
+          // more (deferral guard means flow-content.ts will respond).
+          console.warn('[FlowTrace][BG] BRIDGE_READY_POLL_EXHAUSTED — trying content-script ping as fallback')
+          try {
+            const csFallback = await chrome.tabs.sendMessage(tabId, { action: 'FLOW_INJECT_BRIDGE' }).catch(function () { return null })
+            console.log('[FlowTrace][BG] BRIDGE_READY_CS_FALLBACK_RAW ' + JSON.stringify({
+              csFallback: csFallback,
+              responseRaw: csFallback,
+            }))
+            if (csFallback?.bridgeReady === true) {
+              bridgeReady = true
+              console.log('[FlowTrace][BG] BRIDGE_READY_VIA_CS_FALLBACK_AFTER_POLLS')
+            }
+          } catch (e) {
+            console.log('[FlowTrace][BG] BRIDGE_READY_CS_FALLBACK_ERROR error=' + (e as Error)?.message)
+          }
+          if (!bridgeReady) {
+            // Soft-fail: log the failure but DO NOT abort. Fall through
+            // to send RUN_FLOW_PROMPT — flow-content.ts's runFlowPrompt
+            // internally waits up to 10s via waitBridgeReady.
+            console.warn('[FlowTrace][BG] BRIDGE_READY_POLL_TIMEOUT_SOFT_FAIL ' + JSON.stringify({
+              attempts: 10,
+              lastProbe: lastProbe,
+              willFallThroughTo: 'SEND_RUN_FLOW_PROMPT with content-script waitBridgeReady as last line of defense',
+            }))
+            console.error('[FlowTrace][Fail] ' + JSON.stringify({
+              step: 'BG.bridgeReadyPoll',
+              reason: 'FLOW_BRIDGE_NOT_READY',
+              rawResult: { attempts: 10, lastProbe: lastProbe },
+              extra: { hint: 'Reload the Flow tab — content script may be stale or stale generic content-script.ts is interfering. Soft-failed to RUN_FLOW_PROMPT.', softFailed: true },
+            }))
+          }
+          break
         }
       }
 
       if (!bridgeReady) {
-        return { success: false, error: 'Bridge not ready after injection. Try reloading the Flow tab.' }
+        // Soft-fail: log but continue. SEND_RUN_FLOW_PROMPT below will
+        // delegate the wait to flow-content.ts's runFlowPrompt which has
+        // its own 10s waitBridgeReady poll loop.
+        console.warn('[FlowTrace][BG] BRIDGE_NOT_READY_SOFT_FALLTHROUGH — sending RUN_FLOW_PROMPT and letting flow-content.ts waitBridgeReady take over')
+        console.error('[FlowTrace][Fail] ' + JSON.stringify({
+          step: 'BG.bridgeReady',
+          reason: 'FLOW_BRIDGE_NOT_READY',
+          rawResult: null,
+          extra: { hint: 'Reload the Flow tab — content script may be stale. Soft-failed to RUN_FLOW_PROMPT.', softFailed: true },
+        }))
       }
     }
+    console.log('[FlowTrace][BG] BRIDGE_READY tabId=' + tabId)
   } catch (e) {
     if (BG_DEBUG) console.warn('[Background] Bridge check/injection error:', e)
+    console.error('[FlowTrace][Fail] ' + JSON.stringify({
+      step: 'BG.bridgeCheck',
+      reason: 'FLOW_BRIDGE_CHECK_EXCEPTION',
+      rawResult: { message: (e as Error).message },
+    }))
   }
 
   if (payload.focusTab) {
@@ -1845,12 +1991,21 @@ async function runFlowPrompt(
   }
 
   try {
+    console.log('[FlowTrace][BG] SEND_RUN_FLOW_PROMPT tabId=' + tabId)
     const result = await chrome.tabs.sendMessage(tabId, {
       action: 'RUN_FLOW_PROMPT',
       payload,
       tabId
     })
     console.log('[Background] runFlowPrompt result:', result)
+    console.log('[FlowTrace][BG] SEND_RUN_FLOW_PROMPT_RAW ' + JSON.stringify({
+      tabId,
+      success: result?.success,
+      status: result?.status,
+      error: result?.error,
+      hasAutoDownload: !!(result?.autoDownload),
+      responseRaw: result,
+    }))
     return {
       success: result?.success ?? false,
       tabId,
@@ -1862,7 +2017,181 @@ async function runFlowPrompt(
     }
   } catch (e) {
     console.error('[Background] sendMessage failed:', e)
+    console.error('[FlowTrace][Fail] ' + JSON.stringify({
+      step: 'BG.sendMessage',
+      reason: 'FLOW_MESSAGE_NOT_DELIVERED',
+      rawResult: { message: (e as Error).message },
+    }))
     return { success: false, error: (e as Error).message }
+  }
+}
+
+// ── pingFlowBridgeViaMainWorld ───────────────────────────────────────────────
+// Bypasses the chrome.runtime.onMessage listener race by injecting a small
+// async function directly into the page's MAIN world. The probe:
+//   1. Reads bridge markers (window.__FLOW_BRIDGE_BUILD_TIME__,
+//      __FLOW_SLATE_BRIDGE_READY__, __FLOW_BRIDGE__, __flowSlateBridgeCleanup).
+//   2. Posts { source: 'flow-auto-slate', action: 'ping', requestId } to the
+//      page so the bridge's handleMessage responds.
+//   3. Awaits the response (chrome.scripting.executeScript supports async
+//      Promises natively — Chrome waits for the promise to settle).
+//
+// Why this is needed:
+//   - The generic src/contents/content-script.ts (matches <all_urls>) was
+//     previously intercepting FLOW_INJECT_BRIDGE messages and winning the
+//     listener race. That race is now fixed (content-script.ts defers
+//     FLOW_* and RUN_FLOW_PROMPT to flow-content.ts), but a MAIN-world
+//     probe is still more reliable and avoids content script overhead.
+//   - Previous version used a busy-wait loop, which blocked the main
+//     thread and prevented the message event from firing — bridgeReady
+//     was always false. The probe is now async with a proper Promise
+//     wait and a 1000ms timeout.
+async function pingFlowBridgeViaMainWorld(tabId: number): Promise<Record<string, unknown> | null> {
+  // Probe runs in MAIN world. It is an async function so Chrome waits for
+  // its Promise to settle before returning the result. This allows the
+  // postMessage listener to fire naturally between async ticks.
+  const probeFunc = async function () {
+    var w = window
+    var buildTime = (w as unknown as Record<string, unknown>).__FLOW_BRIDGE_BUILD_TIME__ || null
+    var slateReady = !!(w as unknown as Record<string, unknown>).__FLOW_SLATE_BRIDGE_READY__
+    var bridgeApi = !!(w as unknown as Record<string, unknown>).__FLOW_BRIDGE__
+    var cleanupMarker = !!(w as unknown as Record<string, unknown>).__flowSlateBridgeCleanup
+    var markers = {
+      bridgeBuildTime: buildTime,
+      slateReady: slateReady,
+      bridgeApi: bridgeApi,
+      cleanupMarker: cleanupMarker,
+    }
+    // Trace: PROBE_MARKERS — log all four markers at probe entry.
+    console.log('[FlowTrace][BG] PROBE_MARKERS ' + JSON.stringify({
+      url: w.location ? w.location.href : '',
+      markers: markers,
+    }))
+    var probeResult: Record<string, unknown> = {
+      bridgeLoaded: cleanupMarker || slateReady || bridgeApi,
+      bridgeReady: false,
+      bridgeReadyByMarker: false,
+      bridgeReadyByPing: false,
+      bridgeBuildTime: buildTime,
+      markers: markers,
+      url: w.location ? w.location.href : '',
+    }
+    // Marker-based readiness: if __FLOW_SLATE_BRIDGE_READY__ is true OR
+    // __FLOW_BRIDGE__ exists, the bridge has fully exposed its API and is
+    // ready to handle requests. Skip the ping round-trip.
+    if (slateReady || bridgeApi) {
+      ;(probeResult as Record<string, unknown>).bridgeReady = true
+      ;(probeResult as Record<string, unknown>).bridgeReadyByMarker = true
+      console.log('[FlowTrace][BG] PROBE_READY_BY_MARKER ' + JSON.stringify({
+        slateReady: slateReady,
+        bridgeApi: bridgeApi,
+      }))
+      return probeResult
+    }
+    // Otherwise, ping the bridge via postMessage and wait up to 1000ms
+    // for a { pong: true, ready: true, ... } response.
+    if (buildTime || cleanupMarker) {
+      try {
+        var reqId = 'probe_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8)
+        var pingTimedOut = false
+        var response: Record<string, unknown> | null = null
+        var responsePromiseResolve: (v: Record<string, unknown>) => void = function () { /* will be set below */ } as unknown as (v: Record<string, unknown>) => void
+        var responsePromise = new Promise<Record<string, unknown>>(function (resolve) {
+          responsePromiseResolve = resolve
+        })
+        var onceHandler = function (e: MessageEvent) {
+          try {
+            if (e.source !== w) return
+            var d = e.data as Record<string, unknown>
+            if (!d) return
+            if (d.source !== 'flow-auto-slate-result') return
+            if (d.requestId !== reqId) return
+            // Trace: PROBE_GOT_MESSAGE
+            console.log('[FlowTrace][BG] PROBE_GOT_MESSAGE ' + JSON.stringify({
+              reqId: reqId,
+              d: d,
+            }))
+            responsePromiseResolve(d)
+          } catch (err) {
+            // ignore
+          }
+        }
+        // CRITICAL: addEventListener MUST happen BEFORE postMessage so the
+        // listener is registered to receive the bridge's response.
+        w.addEventListener('message', onceHandler)
+        // Trace: PROBE_POST_PING — log just before posting the ping.
+        console.log('[FlowTrace][BG] PROBE_POST_PING ' + JSON.stringify({
+          reqId: reqId,
+          ping: { source: 'flow-auto-slate', action: 'ping', requestId: reqId },
+        }))
+        w.postMessage({
+          source: 'flow-auto-slate',
+          action: 'ping',
+          requestId: reqId,
+        }, w.location.origin)
+        // Wait up to 1000ms for the bridge to respond. Using await lets
+        // the message event fire on the event loop between ticks.
+        var timeoutPromise = new Promise<null>(function (resolve) {
+          setTimeout(function () {
+            pingTimedOut = true
+            console.log('[FlowTrace][BG] PROBE_TIMEOUT ' + JSON.stringify({
+              reqId: reqId,
+              timeoutMs: 1000,
+            }))
+            resolve(null)
+          }, 1000)
+        })
+        response = await Promise.race([responsePromise, timeoutPromise])
+        try { w.removeEventListener('message', onceHandler) } catch (_) {}
+        if (response) {
+          ;(probeResult as Record<string, unknown>).bridgeReadyByPing = true
+          if (response.ready === true) {
+            ;(probeResult as Record<string, unknown>).bridgeReady = true
+          }
+        } else if (pingTimedOut) {
+          // Ping timed out. Fall back to markers — if cleanupMarker is true
+          // (the bridge installed its teardown handler), the bridge IS
+          // loaded even though it didn't respond to this particular ping.
+          if (cleanupMarker) {
+            ;(probeResult as Record<string, unknown>).bridgeReadyByMarker = true
+            ;(probeResult as Record<string, unknown>).bridgeReady = true
+            console.log('[FlowTrace][BG] BRIDGE_READY_BY_MARKER_PING_TIMEOUT ' + JSON.stringify({
+              cleanupMarker: cleanupMarker,
+              buildTime: buildTime,
+              reqId: reqId,
+            }))
+          } else {
+            ;(probeResult as Record<string, unknown>).bridgePingTimedOut = true
+          }
+        }
+      } catch (e) {
+        ;(probeResult as Record<string, unknown>).bridgePingError = (e as Error)?.message || String(e)
+        console.log('[FlowTrace][BG] PROBE_ERROR ' + JSON.stringify({
+          error: (e as Error)?.message || String(e),
+        }))
+      }
+    } else {
+      // No buildTime, no slateReady, no bridgeApi, no cleanupMarker —
+      // the bridge is definitely not loaded.
+      ;(probeResult as Record<string, unknown>).bridgeLoaded = false
+      console.log('[FlowTrace][BG] PROBE_NO_MARKERS bridge not loaded')
+    }
+    return probeResult
+  }
+  try {
+    const injectionResults = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: probeFunc,
+    })
+    if (!injectionResults || injectionResults.length === 0) return null
+    return (injectionResults[0].result as Record<string, unknown>) || null
+  } catch (e) {
+    return {
+      bridgeLoaded: false,
+      bridgeReady: false,
+      probeError: (e as Error)?.message || String(e),
+    }
   }
 }
 

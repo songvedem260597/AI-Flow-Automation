@@ -25,7 +25,7 @@
   var ENABLE_FLOW_SETTINGS_AUTOMATION = false
 
   // Build time marker — single source of truth for cache-busting verification
-  var FLOW_BRIDGE_BUILD_TIME = "2026-06-26 01:15:00"
+  var FLOW_BRIDGE_BUILD_TIME = "2026-07-04 06:10:00"
   bridgeLog('[Bridge] BUILD_TIME ' + FLOW_BRIDGE_BUILD_TIME)
   ;(window as Record<string, unknown>).__FLOW_BRIDGE_BUILD_TIME__ = FLOW_BRIDGE_BUILD_TIME
 
@@ -83,6 +83,29 @@
 
   function sleep(ms: number): Promise<void> {
     return new Promise(function (r) { setTimeout(r, ms) })
+  }
+
+  // ── Visibility helper ──────────────────────────────────────────────
+  // Checks that an element is laid out with non-zero size, has computed
+  // visibility, and is actually inside the viewport (or its ancestor
+  // scroll container). Used by Google Flow editor / button discovery
+  // so we never pick a hidden / zero-sized contenteditable or button.
+  function isVisible(el: HTMLElement | null | undefined): boolean {
+    if (!el || !(el instanceof Element)) return false
+    try {
+      var rect = el.getBoundingClientRect()
+      if (rect.width <= 0 || rect.height <= 0) return false
+      var style = window.getComputedStyle(el)
+      if (!style) return false
+      if (style.display === 'none') return false
+      if (style.visibility === 'hidden' || style.visibility === 'collapse') return false
+      if (style.opacity === '0') return false
+      // connected to DOM
+      if (!el.isConnected) return false
+      return true
+    } catch (_) {
+      return false
+    }
   }
 
   function closeFlowSettingsPanelWithEscape() {
@@ -1458,6 +1481,214 @@
   }
 
   // ═══════════════════════════════════════════════════════════════
+  // GOOGLE FLOW — DOM-first editor + submit button discovery
+  // ═══════════════════════════════════════════════════════════════
+  //
+  // The existing findEditorElement() / insertText() / submit() helpers
+  // rely on Slate's React Fiber being reachable. On the current Google
+  // Flow composer the Slate instance is not always reachable through the
+  // editor element's fiber chain — but the DOM contenteditable is
+  // mounted, the Tạo button is rendered, and `document.execCommand(
+  // 'insertText', false, prompt)` correctly drives Flow's onChange.
+  //
+  // These helpers are a DOM-first, selector-first fallback path that
+  // only uses Flow's native DOM API + execCommand. They are wired up via
+  // a NEW bridge action (`submitGoogleFlow`) so we do NOT touch the
+  // existing Slate / submit pipeline that other flows depend on.
+
+  function findGoogleFlowEditor(): HTMLElement | null {
+    var selectors = [
+      '[data-slate-editor="true"][contenteditable="true"]',
+      '[role="textbox"][contenteditable="true"]',
+      '[aria-multiline="true"][contenteditable="true"]',
+      '[contenteditable="true"]',
+    ]
+
+    for (var si = 0; si < selectors.length; si++) {
+      try {
+        var found = Array.from(document.querySelectorAll(selectors[si]))
+          .find(function (el) { return isVisible(el as HTMLElement) }) as HTMLElement | undefined
+        if (found) return found
+      } catch (_) {}
+    }
+
+    return null
+  }
+
+  async function insertGoogleFlowPrompt(prompt: string): Promise<boolean> {
+    var editor = findGoogleFlowEditor()
+
+    if (!editor) {
+      console.warn('[Flow][GFlow] FLOW_EDITOR_NOT_FOUND')
+      return false
+    }
+
+    try { editor.scrollIntoView({ block: 'center', inline: 'center' }) } catch (_) {}
+    try { editor.click() } catch (_) {}
+    try { editor.focus() } catch (_) {}
+
+    await sleep(100)
+
+    var selection = window.getSelection()
+    var range = document.createRange()
+    range.selectNodeContents(editor)
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+
+    try { document.execCommand('delete', false) } catch (_) {}
+
+    await sleep(80)
+
+    var range2 = document.createRange()
+    range2.selectNodeContents(editor)
+    range2.collapse(false)
+    selection?.removeAllRanges()
+    selection?.addRange(range2)
+
+    var ok = false
+    try {
+      ok = document.execCommand('insertText', false, prompt)
+    } catch (_) {
+      ok = false
+    }
+
+    try {
+      editor.dispatchEvent(new InputEvent('beforeinput', {
+        bubbles: true,
+        cancelable: true,
+        inputType: 'insertText',
+        data: prompt,
+      }))
+    } catch (_) {}
+
+    try {
+      editor.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        cancelable: true,
+        inputType: 'insertText',
+        data: prompt,
+      }))
+    } catch (_) {
+      try {
+        editor.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }))
+      } catch (_) {}
+    }
+
+    await sleep(300)
+
+    var text = normalizeText(editor.innerText || editor.textContent || '')
+    if (!text.includes(normalizeText(prompt))) {
+      console.warn('[Flow][GFlow] FLOW_PROMPT_INSERT_FAILED', JSON.stringify({
+        ok: ok,
+        expected: prompt,
+        actual: text,
+      }))
+      return false
+    }
+
+    console.log('[Flow][GFlow] prompt inserted verified')
+    return true
+  }
+
+  function findGoogleFlowCreateButton(): HTMLElement | null {
+    var candidates: HTMLElement[] = []
+    try {
+      candidates = Array.from(document.querySelectorAll('button,[role="button"]'))
+        .filter(function (el) { return isVisible(el as HTMLElement) }) as HTMLElement[]
+    } catch (_) {
+      return null
+    }
+
+    for (var ci = 0; ci < candidates.length; ci++) {
+      var el = candidates[ci]
+      var text = normalizeText(el.innerText || el.textContent || '')
+      var aria = normalizeText(el.getAttribute('aria-label') || '')
+      if (/arrow_forward\s*Tạo|^Tạo$|Create|Generate/i.test(text + ' ' + aria)) {
+        return el
+      }
+    }
+    return null
+  }
+
+  async function waitGoogleFlowCreateButtonEnabled(timeoutMs = 5000): Promise<HTMLElement | null> {
+    var start = Date.now()
+    while (Date.now() - start < timeoutMs) {
+      var btn = findGoogleFlowCreateButton()
+      if (btn && !(btn as HTMLButtonElement).disabled && btn.getAttribute('aria-disabled') !== 'true') {
+        return btn
+      }
+      await sleep(100)
+    }
+    return null
+  }
+
+  // DOM-first submit pipeline for the current Google Flow composer.
+  // Inserts the prompt via execCommand, then clicks the visible Tạo button.
+  // This is independent from the existing submit() / insertText() Slate
+  // path and exists ONLY for the case where the Slate editor object is
+  // not reachable through React fiber.
+  //
+  // Production code MUST NOT use this combined path: it bypasses the
+  // pre-submit tile snapshot boundary and breaks the auto-download loop.
+  // Production fallbacks call `insertGoogleFlowPromptOnly` (insert step)
+  // and `submitGoogleFlowButtonOnly` (submit step) separately so that
+  // the pre-submit baseline is still captured before the Tạo button is
+  // clicked. This combined helper exists ONLY for manual smoke testing
+  // via `window.__flowTestSubmitGoogleFlow(text)` in the Flow page console.
+  async function submitGoogleFlow(prompt: string): Promise<{ ok: boolean; reason?: string; method?: string }> {
+    var inserted = await insertGoogleFlowPrompt(prompt)
+    if (!inserted) {
+      return { ok: false, reason: 'FLOW_PROMPT_INSERT_FAILED' }
+    }
+
+    var createButton = await waitGoogleFlowCreateButtonEnabled(5000)
+    if (!createButton) {
+      return { ok: false, reason: 'FLOW_SUBMIT_BUTTON_NOT_FOUND_OR_DISABLED' }
+    }
+
+    try { createButton.scrollIntoView({ block: 'center', inline: 'center' }) } catch (_) {}
+    await sleep(100)
+    try { createButton.click() } catch (_) {}
+
+    console.log('[Flow][GFlow] submitted')
+    return { ok: true, method: 'gflow-dom-submit' }
+  }
+
+  // Insert-only DOM fallback for the current Google Flow composer.
+  // Returns success/failure with a `method` field so the caller can
+  // synthesize a normal insertResult and continue the standard pipeline
+  // (verify → pre-submit baseline → submit → auto-download).
+  //
+  // This helper does NOT click Tạo. The submit step remains a separate
+  // boundary so the auto-download polling loop can still capture a
+  // pre-submit tile snapshot.
+  async function insertGoogleFlowPromptOnly(prompt: string): Promise<{ success: boolean; method?: string; error?: string }> {
+    var ok = await insertGoogleFlowPrompt(prompt)
+    if (!ok) {
+      return { success: false, error: 'FLOW_PROMPT_INSERT_FAILED' }
+    }
+    return { success: true, method: 'gflow-dom-insert' }
+  }
+
+  // Submit-only DOM fallback for the current Google Flow composer.
+  // Locates the Tạo button and clicks it. Does NOT touch the editor.
+  //
+  // Production usage: when the standard `submit` Slate path fails,
+  // flow-content calls this as a last-resort click while still passing
+  // the post-submit baseline to the auto-download loop.
+  async function submitGoogleFlowButtonOnly(): Promise<{ success: boolean; method?: string; error?: string }> {
+    var createButton = await waitGoogleFlowCreateButtonEnabled(5000)
+    if (!createButton) {
+      return { success: false, error: 'FLOW_SUBMIT_BUTTON_NOT_FOUND_OR_DISABLED' }
+    }
+    try { createButton.scrollIntoView({ block: 'center', inline: 'center' }) } catch (_) {}
+    await sleep(100)
+    try { createButton.click() } catch (_) {}
+    console.log('[Flow][GFlow] submitted')
+    return { success: true, method: 'gflow-dom-click' }
+  }
+
+  // ═══════════════════════════════════════════════════════════════
   // ADD FILE TO PROMPT (right-click tile → "Add to prompt")
   // ═══════════════════════════════════════════════════════════════
 
@@ -2381,6 +2612,11 @@
     insertText: insertText,
     submit: submit,
     verify: verifyEditor,
+    submitGoogleFlow: submitGoogleFlow,
+    submitGoogleFlowButtonOnly: submitGoogleFlowButtonOnly,
+    insertGoogleFlowPromptOnly: insertGoogleFlowPromptOnly,
+    findGoogleFlowEditor: findGoogleFlowEditor,
+    findGoogleFlowCreateButton: findGoogleFlowCreateButton,
     debugRunFlowPrompt: (window as Record<string, unknown>).debugRunFlowPrompt as typeof debugRunFlowPrompt,
   }
   ;(window as Record<string, unknown>).__FLOW_SLATE_BRIDGE_READY__ = true
@@ -2444,6 +2680,89 @@
       var submitResult = submit()
       bridgeLog('[Bridge] === SUBMIT END, success=' + submitResult.success + ' method=' + submitResult.method + ' ===')
       postResult(rid, submitResult)
+
+    } else if (action === 'submitGoogleFlow') {
+      // DOM-first submit path for the current Google Flow composer.
+      // Used when the Slate editor object is not reachable via React
+      // fiber. See submitGoogleFlow() + insertGoogleFlowPrompt() in
+      // the GOOGLE FLOW section above.
+      //
+      // NOTE: This combined insert+click action is exposed for manual
+      // testing only. The production fallback in flow-content.ts calls
+      // `insertGoogleFlowPromptOnly` and `submitGoogleFlowButtonOnly`
+      // separately to preserve the pre-submit tile snapshot boundary.
+      bridgeLog('[Bridge] === SUBMIT GOOGLE FLOW START ===')
+      var gflowText = (d.text as string) || (d.prompt as string) || ''
+      ;(async () => {
+        try {
+          var gflowResult = await submitGoogleFlow(gflowText)
+          bridgeLog('[Bridge] === SUBMIT GOOGLE FLOW END, ok=' + gflowResult.ok + ' reason=' + (gflowResult.reason || '') + ' ===')
+          postResult(rid, {
+            success: !!gflowResult.ok,
+            method: gflowResult.method || 'gflow-dom-submit',
+            error: gflowResult.ok ? '' : (gflowResult.reason || 'FLOW_SUBMIT_FAILED'),
+            buttonText: '',
+          })
+        } catch (err) {
+          bridgeError('[Bridge] submitGoogleFlow error:', (err as Error)?.message || String(err))
+          postResult(rid, {
+            success: false,
+            method: 'gflow-dom-submit',
+            error: (err as Error)?.message || 'FLOW_SUBMIT_FAILED',
+            buttonText: '',
+          })
+        }
+      })()
+
+    } else if (action === 'insertGoogleFlowPromptOnly') {
+      // Insert-only DOM fallback. Does NOT click Tạo — the submit step
+      // is a separate boundary so the auto-download loop can capture
+      // a pre-submit tile snapshot.
+      bridgeLog('[Bridge] === INSERT GOOGLE FLOW PROMPT START ===')
+      var gflowInsertText = (d.text as string) || (d.prompt as string) || ''
+      ;(async () => {
+        try {
+          var gflowInsertResult = await insertGoogleFlowPromptOnly(gflowInsertText)
+          bridgeLog('[Bridge] === INSERT GOOGLE FLOW PROMPT END, success=' + gflowInsertResult.success + ' ===')
+          postResult(rid, {
+            success: gflowInsertResult.success,
+            method: gflowInsertResult.method || 'gflow-dom-insert',
+            error: gflowInsertResult.success ? '' : (gflowInsertResult.error || 'FLOW_PROMPT_INSERT_FAILED'),
+          })
+        } catch (err) {
+          bridgeError('[Bridge] insertGoogleFlowPromptOnly error:', (err as Error)?.message || String(err))
+          postResult(rid, {
+            success: false,
+            method: 'gflow-dom-insert',
+            error: (err as Error)?.message || 'FLOW_PROMPT_INSERT_FAILED',
+          })
+        }
+      })()
+
+    } else if (action === 'submitGoogleFlowButtonOnly') {
+      // Click-only DOM fallback. Used when the standard `submit` Slate
+      // path fails. The prompt is assumed to already be inserted.
+      bridgeLog('[Bridge] === SUBMIT GOOGLE FLOW BUTTON START ===')
+      ;(async () => {
+        try {
+          var gflowButtonResult = await submitGoogleFlowButtonOnly()
+          bridgeLog('[Bridge] === SUBMIT GOOGLE FLOW BUTTON END, success=' + gflowButtonResult.success + ' ===')
+          postResult(rid, {
+            success: gflowButtonResult.success,
+            method: gflowButtonResult.method || 'gflow-dom-click',
+            error: gflowButtonResult.success ? '' : (gflowButtonResult.error || 'FLOW_SUBMIT_BUTTON_NOT_FOUND_OR_DISABLED'),
+            buttonText: '',
+          })
+        } catch (err) {
+          bridgeError('[Bridge] submitGoogleFlowButtonOnly error:', (err as Error)?.message || String(err))
+          postResult(rid, {
+            success: false,
+            method: 'gflow-dom-click',
+            error: (err as Error)?.message || 'FLOW_SUBMIT_BUTTON_NOT_FOUND_OR_DISABLED',
+            buttonText: '',
+          })
+        }
+      })()
 
     } else if (action === 'addRef') {
       var addRefFileId = safeText(d.fileId)
@@ -2562,11 +2881,36 @@
       }
 
     } else if (action === 'applySettings') {
+      // FlowTrace: explicit bridge-side APPLY_SETTINGS_ACTION_START (predictable grep key)
+      var applyRawPayload = d.payload || {}
+      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_ACTION_START', JSON.stringify({
+        mode: (applyRawPayload as Record<string, unknown>).mode,
+        model: (applyRawPayload as Record<string, unknown>).model,
+        ratio: (applyRawPayload as Record<string, unknown>).ratio || (applyRawPayload as Record<string, unknown>).aspectRatio,
+        quantity: (applyRawPayload as Record<string, unknown>).quantity,
+        duration: (applyRawPayload as Record<string, unknown>).duration || '',
+        url: window.location.href,
+        flag_ENABLE_FLOW_SETTINGS_AUTOMATION: ENABLE_FLOW_SETTINGS_AUTOMATION,
+      }))
       var rawPayload = d.payload
       if (!rawPayload) {
+        console.error('[FlowTrace][Fail]', JSON.stringify({
+          step: 'bridge.applySettings',
+          reason: 'FLOW_BRIDGE_NO_PAYLOAD',
+          rawResult: null,
+        }))
         postResult(rid, { success: false, error: 'no_payload' })
       } else {
         var applyResult = await applyFlowSettings(rawPayload)
+        // FlowTrace: explicit bridge-side APPLY_SETTINGS_ACTION_RESULT (predictable grep key)
+        console.log('[FlowTrace][Bridge] APPLY_SETTINGS_ACTION_RESULT', JSON.stringify({
+          success: !!(applyResult as Record<string, unknown>).success,
+          error: (applyResult as Record<string, unknown>).error || '',
+          method: (applyResult as Record<string, unknown>).method || '',
+          current: (applyResult as Record<string, unknown>).current || null,
+          hasDetails: !!(applyResult as Record<string, unknown>).details,
+          detailsKeys: Object.keys(((applyResult as Record<string, unknown>).details as Record<string, unknown>) || {}),
+        }))
         postResult(rid, applyResult)
       }
 
@@ -4243,7 +4587,17 @@
       }
 
       // ── Step 4: Select mode ───────────────────────────────────────
+      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_MODE_RESULT', JSON.stringify({
+        targetMode: target.mode,
+        beforeSettings: beforeSnapshot ? { mode: (beforeSnapshot as Record<string, unknown>).mode } : null,
+      }))
       var modeResult = await selectMode(activePanel, target.mode as string)
+      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_MODE_DONE', JSON.stringify({
+        success: !!modeResult.success,
+        method: modeResult.method || '',
+        error: modeResult.error || '',
+        clickedText: modeResult.clickedText || '',
+      }))
       if (!modeResult.success) {
         return modeResult
       }
@@ -4255,20 +4609,46 @@
       }
 
       // ── Step 5: Select ratio ────────────────────────────────────
+      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_RATIO_RESULT', JSON.stringify({
+        targetRatio: target.ratio,
+      }))
       var ratioResult = await selectRatio(activePanel, target.ratio as string)
+      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_RATIO_DONE', JSON.stringify({
+        success: !!ratioResult.success,
+        method: ratioResult.method || '',
+        error: ratioResult.error || '',
+      }))
       if (!ratioResult.success) {
         return ratioResult
       }
 
       // ── Step 6: Select quantity ─────────────────────────────────
+      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_QTY_RESULT', JSON.stringify({
+        targetQuantity: target.quantity,
+      }))
       var qtyResult = await selectFlowQuantity(target.quantity as number, settingsBtn)
+      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_QTY_DONE', JSON.stringify({
+        success: !!qtyResult.success,
+        method: qtyResult.method || '',
+        error: qtyResult.error || '',
+      }))
       if (!qtyResult.success) {
         return qtyResult
       }
 
       // ── Step 7: Select model ────────────────────────────────────
       bridgeLog('[Bridge][rs] select model START', target.model)
+      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_MODEL_RESULT', JSON.stringify({
+        targetModel: target.model,
+      }))
       var modelResult = await selectModelDropdown(activePanel, target.model as string)
+      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_MODEL_DONE', JSON.stringify({
+        success: !!modelResult.success,
+        method: modelResult.method || '',
+        error: modelResult.error || '',
+        clickedText: modelResult.clickedText || '',
+        detailsKeys: Object.keys((modelResult as Record<string, unknown>).details as Record<string, unknown> || {}),
+      }))
       if (!modelResult.success) {
         return modelResult
       }
@@ -4277,6 +4657,11 @@
       if (target.mode === 'video' && target.duration) {
         await sleep(400) // wait for duration list to render
         var durResult = await selectDuration(target.duration as string)
+        console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_DURATION_DONE', JSON.stringify({
+          targetDuration: target.duration,
+          success: !!durResult.success,
+          error: durResult.error || '',
+        }))
         // Duration errors are warnings — don't fail the whole flow
         if (!durResult.success) {
           bridgeWarn('[Bridge][rs] select duration FAILED', durResult)
@@ -4286,11 +4671,19 @@
       // ── Step 9: Verify current settings ──────────────────────────
       var current = readCurrentFlowSettings()
       bridgeDebug('[Bridge][rs] verify settings', current)
+      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_VERIFY_CURRENT', JSON.stringify({
+        current: current || null,
+      }))
 
       // ── Step 10: Close settings panel before returning ─────────
       var freshSettingsBtn = (typeof getFlowSettingsButton === 'function' ? getFlowSettingsButton() : null) || settingsBtn
       var afterSnapshot = readFlowSettingsSnapshot(freshSettingsBtn)
       var afterCompare = compareFlowSettings(target, afterSnapshot)
+      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_VERIFY_DONE', JSON.stringify({
+        target: target,
+        afterSnapshot: afterSnapshot,
+        compare: afterCompare,
+      }))
       if (afterCompare.ok) {
         bridgeLog('[Bridge][settings verify] OK')
       } else {
@@ -5720,6 +6113,22 @@
     var result = submit()
     bridgeDebug('[Bridge] __flowTestSubmit result:', JSON.stringify(result, null, 2))
     return result
+  }
+
+  // Manual test helper for the DOM-first Google Flow submit path.
+  // Usage from the Flow page console:
+  //   window.__flowTestSubmitGoogleFlow('rô bot chiến đấu')
+  ;(window as Record<string, unknown>).__flowTestSubmitGoogleFlow = async function (text?: string) {
+    var promptText = text || 'rô bot chiến đấu'
+    bridgeLog('[Bridge] __flowTestSubmitGoogleFlow()', JSON.stringify({ text: promptText }))
+    try {
+      var result = await submitGoogleFlow(promptText)
+      bridgeLog('[Bridge] __flowTestSubmitGoogleFlow result:', JSON.stringify(result))
+      return result
+    } catch (err) {
+      bridgeError('[Bridge] __flowTestSubmitGoogleFlow error:', (err as Error)?.message || String(err))
+      return { ok: false, reason: 'EXCEPTION', error: (err as Error)?.message || String(err) }
+    }
   }
 
   bridgeLog('[Bridge] Flow Slate Bridge loaded (MAIN world, deepScan + DOM fallback + submit + tileMonitor)')
