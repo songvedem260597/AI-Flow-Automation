@@ -3,8 +3,30 @@ import { getAdapter, type ProviderAdapter } from '@/providers'
 import { usePipelineStore } from '@/stores/pipelineStore'
 import { useHistoryStore } from '@/stores/dataStore'
 import { useSettingsStore } from '@/stores/settingsStore'
+import { hasExtensionContext, isContextInvalidated } from '@/lib/extensionContextGuard'
+
+// Same helpers, plain JS names (avoid TS-only `unknown` typing here)
+const hasExtensionContextSafe = (): boolean => hasExtensionContext()
+const isContextInvalidatedSafe = (err: unknown): boolean => isContextInvalidated(err)
 
 type MediaKind = 'image' | 'video'
+
+// ── Pipeline event callbacks ─────────────────────────────────────────────
+// Emitted during pipeline execution so the UI can update node/edge visual
+// state in real time. All callbacks are fire-and-forget — throwing from a
+// callback does NOT abort the pipeline.
+export interface PipelineCallbacks {
+  /** Fires immediately before a node starts executing. */
+  onNodeStart?: (nodeId: string, nodeType: string) => void
+  /** Fires immediately after a node succeeds. `output` is the value stored in pipeline context. */
+  onNodeComplete?: (nodeId: string, output: unknown) => void
+  /** Fires immediately after a node fails. */
+  onNodeFail?: (nodeId: string, error: string) => void
+  /** Fires when an edge starts carrying data to its target node. */
+  onEdgeActive?: (edgeId: string) => void
+  /** Fires when an edge stops carrying data. */
+  onEdgeInactive?: (edgeId: string) => void
+}
 
 interface ResolvedInput {
   edge: WorkflowEdge
@@ -100,10 +122,12 @@ export class PipelineRunner {
   private shouldStop = false
   private taskId: string
   private wakeLock: WakeLockSentinel | null = null
+  private callbacks: PipelineCallbacks
 
-  constructor(workflow: Workflow, taskId: string) {
+  constructor(workflow: Workflow, taskId: string, callbacks: PipelineCallbacks = {}) {
     this.workflow = workflow
     this.taskId = taskId
+    this.callbacks = callbacks
     this.adapter = getAdapter(this.detectProvider())
   }
 
@@ -127,6 +151,45 @@ export class PipelineRunner {
   private getEnabledEdges(nodes = this.getEnabledNodes()): WorkflowEdge[] {
     const ids = new Set(nodes.map((node) => node.id))
     return this.workflow.edges.filter((edge) => ids.has(edge.source) && ids.has(edge.target))
+  }
+
+  /** Returns all edge IDs that carry data INTO a node (incoming edges). */
+  private getIncomingEdgeIds(nodeId: string): string[] {
+    return this.workflow.edges.filter((e) => e.target === nodeId).map((e) => e.id)
+  }
+
+  /** Returns all edge IDs that carry data OUT OF a node (outgoing edges). */
+  private getOutgoingEdgeIds(nodeId: string): string[] {
+    return this.workflow.edges.filter((e) => e.source === nodeId).map((e) => e.id)
+  }
+
+  private emitStart(nodeId: string, nodeType: string) {
+    console.log('[GlowDebug][Runner] start', { nodeId })
+    try { this.callbacks.onNodeStart?.(nodeId, nodeType) } catch {}
+    for (const edge of this.workflow.edges.filter((e) => e.target === nodeId)) {
+      console.log('[GlowDebug][Runner] edgeActive', { edgeId: edge.id, source: edge.source, target: edge.target })
+      try { this.callbacks.onEdgeActive?.(edge.id) } catch {}
+    }
+  }
+
+  private emitComplete(nodeId: string, output: unknown) {
+    console.log('[GlowDebug][Runner] complete', { nodeId, output })
+    try { this.callbacks.onNodeComplete?.(nodeId, output) } catch {}
+    for (const edge of this.workflow.edges.filter((e) => e.source === nodeId)) {
+      console.log('[GlowDebug][Runner] edgeInactive', { edgeId: edge.id, source: edge.source, target: edge.target })
+      try { this.callbacks.onEdgeInactive?.(edge.id) } catch {}
+    }
+  }
+
+  private emitInactive(nodeId: string) {
+    for (const edge of this.workflow.edges.filter((e) => e.target === nodeId)) {
+      console.log('[GlowDebug][Runner] edgeInactive', { edgeId: edge.id, source: edge.source, target: edge.target })
+      try { this.callbacks.onEdgeInactive?.(edge.id) } catch {}
+    }
+    for (const edge of this.workflow.edges.filter((e) => e.source === nodeId)) {
+      console.log('[GlowDebug][Runner] edgeInactive', { edgeId: edge.id, source: edge.source, target: edge.target })
+      try { this.callbacks.onEdgeInactive?.(edge.id) } catch {}
+    }
   }
 
   private getSortedNodes(): WorkflowNode[] {
@@ -267,6 +330,9 @@ export class PipelineRunner {
           inputCount: inputs.items.length
         })
 
+        // Emit visual state events
+        this.emitStart(node.id, node.type)
+
         try {
           const result = await this.executeNode(node, inputs)
           this.context[node.id] = result
@@ -275,9 +341,47 @@ export class PipelineRunner {
             [node.id]: result
           })
           pipelineStore.addLog(this.taskId, 'success', `Completed: ${node.data.label}`, node.id)
+
+          // Emit success events
+          this.emitComplete(node.id, result)
+          this.emitInactive(node.id)
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : String(error)
           pipelineStore.addLog(this.taskId, 'error', `Failed: ${node.data.label} - ${errorMessage}`, node.id)
+
+          // Generate-node retries with media uploads are NOT idempotent:
+          // re-running the node re-uploads the reference images into the
+          // ChatGPT composer / Flow tab, producing N×attempts duplicate
+          // attachments. Disable node-level retry for any Generate Node
+          // whose media-input count is > 0. Per-step recovery (tab
+          // complete, content-script ping, find composer, find send
+          // button) still happens inside the provider path; the gate
+          // here only closes the cross-node retry loop.
+          let isNonRetryableGenerate = false
+          try {
+            isNonRetryableGenerate = this.isNonRetryableGenerateNode(node)
+          } catch (_) {
+            isNonRetryableGenerate = false
+          }
+          if (isNonRetryableGenerate) {
+            pipelineStore.addLog(
+              this.taskId,
+              'warn',
+              `Generate node has media uploads — skipping node-level retry to avoid duplicate attachments. ` +
+                `Cause: ${errorMessage}`,
+              node.id
+            )
+            try { this.callbacks.onNodeFail?.(node.id, errorMessage) } catch {}
+            console.log('[GlowDebug][Runner] fail', { nodeId: node.id, error: errorMessage })
+            this.emitInactive(node.id)
+            pipelineStore.failPipeline(this.taskId, {
+              nodeId: node.id,
+              message: errorMessage,
+              timestamp: Date.now(),
+              recoverable: false
+            })
+            break
+          }
 
           const retries = retryByNode.get(node.id) || 0
           if (retries < settings.maxRetries) {
@@ -288,6 +392,9 @@ export class PipelineRunner {
             continue
           }
 
+          try { this.callbacks.onNodeFail?.(node.id, errorMessage) } catch {}
+          console.log('[GlowDebug][Runner] fail', { nodeId: node.id, error: errorMessage })
+          this.emitInactive(node.id)
           pipelineStore.failPipeline(this.taskId, {
             nodeId: node.id,
             message: errorMessage,
@@ -475,20 +582,74 @@ export class PipelineRunner {
     })
   }
 
+  // Returns true when a Generate Node has media inputs that would be
+  // side-effect-reuploaded by a node-level retry. Used by the runner's
+  // catch block to disable retries for Generate Nodes with media.
+  //
+  // Provider rules (mirrors resolveGenerateMediaInputs above):
+  //   - chatgpt: any image media in inputs
+  //   - google-flow: any media that would survive the per-provider filter
+  //
+  // Inputs are re-derived from the current context (this.context) which
+  // is set by the time the catch block runs, so the result is faithful
+  // to what executeGenerateNode would have computed.
+  private isNonRetryableGenerateNode(node: WorkflowNode): boolean {
+    if (!node || node.type !== 'generate') return false
+    const fallbackProvider = this.detectProvider()
+    const data = (node.data || {}) as Record<string, unknown>
+    const provider = normalizeProvider(data.provider, fallbackProvider)
+    if (provider !== 'chatgpt' && provider !== 'google-flow') return false
+
+    const mediaType = provider === 'google-flow' && normalizeMediaType(data.mediaType) === 'video'
+      ? 'video'
+      : 'image'
+
+    const inputs = this.getNodeInputs(node)
+    const mediaInputs = this.resolveGenerateMediaInputs(provider, mediaType, data, inputs)
+    if (mediaInputs.length === 0) return false
+
+    // Extra defensive filter: only count media that has actual upload
+    // payload. Media without `data` cannot be uploaded, so retrying
+    // would not re-trigger an upload (safe to retry).
+    const uploadable = mediaInputs.filter((m) => Boolean(m.data))
+    return uploadable.length > 0
+  }
+
   private async runChatGPTGenerate(
     data: Record<string, unknown>,
     prompt: string,
     mediaInputs: MediaInput[]
   ): Promise<unknown> {
     const settings = useSettingsStore.getState()
-    const timeoutMs = Number(data.timeout || settings.timeoutDuration || 300000)
+    const configuredTimeoutMs = Number(data.timeout || settings.timeoutDuration || 300000)
+    const timeoutMs = Math.max(configuredTimeoutMs > 0 ? configuredTimeoutMs : 300000, 300000)
 
-    if (mediaInputs.length > 0) {
-      await this.switchAdapter('chatgpt')
-      for (const media of mediaInputs) {
-        if (media.data) await this.adapter.uploadImage?.(media.data)
-      }
-    }
+    // Route ChatGPT media uploads through the background's
+    // RUN_CHATGPT_PROMPT path instead of the direct provider adapter path.
+    // The adapter path is unreliable: it tries to inject a hardcoded
+    // 'content-scripts/content-script.js' (which does not exist in the
+    // built extension) and then send chrome.tabs.sendMessage to a tab
+    // whose content script may not yet be registered, producing
+    // "Could not establish connection. Receiving end does not exist."
+    //
+    // The background's runChatGPTPrompt already calls
+    // ensureChatGPTContentReady (wait tab complete + CHATGPT_PING retry
+    // + runtime-resolved content script injection) before sending
+    // CHATGPT_SUBMIT_AND_WAIT, so the tab is guaranteed to have a
+    // listener when the upload + submit fires.
+    const mediaUploads = mediaInputs
+      .filter((media) => Boolean(media.data))
+      .map((media, index) => {
+        const payload = dataUrlToUploadPayload(
+          media,
+          `workflow_media_${index}_${Date.now()}`
+        )
+        return {
+          name: payload.name,
+          type: payload.type,
+          base64: payload.base64,
+        }
+      })
 
     const response = await this.sendRuntimeMessage({
       action: 'RUN_CHATGPT_PROMPT',
@@ -496,7 +657,11 @@ export class PipelineRunner {
         prompt,
         ratio: asString(data.aspectRatio) || DEFAULT_IMAGE_RATIO,
         autoDownload: false,
-        timeoutMs
+        timeoutMs,
+        mediaUploads,
+        // Workflow Editor / Side Panel callers — keep the user's tab
+        // visible while the ChatGPT tab runs in the background.
+        focus: false
       }
     })
 
@@ -511,11 +676,13 @@ export class PipelineRunner {
         mediaType: 'image',
         prompt,
         jobId: response.jobId,
-        triggered: true
+        triggered: true,
+        images: []
       }
     }
 
     const job = await this.waitForChatGPTJob(String(response.jobId), timeoutMs)
+    const imageUrls = Array.isArray(job.imageUrls) ? job.imageUrls : []
     return {
       type: 'generation',
       provider: 'chatgpt',
@@ -523,7 +690,9 @@ export class PipelineRunner {
       aspectRatio: asString(data.aspectRatio) || DEFAULT_IMAGE_RATIO,
       prompt,
       jobId: response.jobId,
-      imageUrls: Array.isArray(job.imageUrls) ? job.imageUrls : [],
+      imageUrls,
+      // Normalized media array for downstream nodes (Download, etc.)
+      images: imageUrls.map((url: string) => ({ url, source: 'chatgpt' })),
       result: job
     }
   }
@@ -544,7 +713,7 @@ export class PipelineRunner {
     const quantity = Math.max(1, Math.min(4, Number(data.quantity || 1)))
     const opened = await this.sendRuntimeMessage({
       action: 'OPEN_PROVIDER_TAB',
-      payload: { provider: 'google-flow' }
+      payload: { provider: 'google-flow', focus: false }
     })
 
     if (!opened.success) {
@@ -591,7 +760,9 @@ export class PipelineRunner {
       resolution: '1k',
       videoResolution: '720p',
       videoDownloadResolution: '720p',
-      focusTab: true,
+      // Workflow Editor / Side Panel callers — keep the user's tab
+      // visible while the Flow tab runs in the background.
+      focusTab: false,
       debugGenState: {
         mode: mediaType,
         isVideoMode: mediaType === 'video',
@@ -766,32 +937,220 @@ export class PipelineRunner {
     return { type: 'generation', provider, mediaType, aspectRatio, prompt, triggered: true }
   }
 
+  // Heartbeat-based wait for a ChatGPT job to terminate.
+  //
+  // Two distinct time signals are read from the job record:
+  //
+  //   * `lastHeartbeatAt`  — bumped on EVERY CHATGPT_JOB_PROGRESS
+  //                          message (proves the content script is
+  //                          alive and the message channel works).
+  //   * `lastProgressAt`   — bumped ONLY when the content script
+  //                          reports a real generation advance.
+  //
+  // Three gates decide when to fail:
+  //
+  //   GATE A — dead content script / tab crash / context loss.
+  //       now - lastHeartbeatAt > heartbeatStaleMs
+  //
+  //   GATE B — initial no-progress budget exceeded.
+  //       never saw progress AND elapsedMs > initialNoProgressTimeoutMs
+  //
+  //   GATE C — generation has stalled (no active signal).
+  //       ever saw progress AND now - lastProgressAt > staleMs
+  //       AND !generating AND !hasPendingImage AND candidateImages === 0
+  //       throw "progress stale".
+  //       With an active signal we extend grace to staleMs * 2.
+  //
+  // maxWaitMs = max(payload.timeoutMs, 600000). The runner-side
+  // Generate Node retry gate is untouched: this wait never asks
+  // the runner to retry the node.
   private async waitForChatGPTJob(jobId: string, timeoutMs: number): Promise<Record<string, unknown>> {
     const startedAt = Date.now()
+    const configuredTimeoutMs = Number(timeoutMs) > 0 ? Number(timeoutMs) : 300000
+    const initialNoProgressTimeoutMs = Math.max(configuredTimeoutMs, 300000)
+    const maxWaitMs = Math.max(initialNoProgressTimeoutMs, 600000)
+    const staleMs = 90000
+    const heartbeatStaleMs = 40000
+    let everSawProgress = false
+    let lastLogAt = 0
 
-    while (Date.now() - startedAt < timeoutMs) {
+    while (Date.now() - startedAt < maxWaitMs) {
       const response = await this.sendRuntimeMessage({
         action: 'GET_CHATGPT_JOB_STATUS',
-        payload: { jobId }
+        payload: { jobId },
       })
 
+      if (!response.success && response.error === 'context_invalidated') {
+        throw new Error(
+          'ChatGPT job aborted: extension context invalidated. ' +
+          'Reload the chatgpt.com tab and re-run the workflow.'
+        )
+      }
       if (!response.success) throw new Error(response.error || 'Could not read ChatGPT job status')
 
       const job = response.job
+      const elapsedMs = Date.now() - startedAt
+      const now = Date.now()
+
       if (isRecord(job)) {
-        if (job.status === 'done') return job
-        if (job.status === 'failed') throw new Error(asString(job.error) || 'ChatGPT generation failed')
+        const lastHeartbeatAt = typeof job.lastHeartbeatAt === 'number' ? job.lastHeartbeatAt : 0
+        const lastProgressAt = typeof job.lastProgressAt === 'number' ? job.lastProgressAt : 0
+        const progress = isRecord(job.progress) ? job.progress : null
+        const hasPendingImage = !!(job.hasPendingImage || (progress && progress.hasPendingImage))
+        const phase = progress && typeof progress.phase === 'string' ? progress.phase : 'unknown'
+        const generating = !!(progress && progress.generating)
+        const candidateImages = (progress && Number(progress.candidateImages)) || 0
+        const acceptedImages = (progress && Number(progress.acceptedImages)) || 0
+        const stillActive = generating || hasPendingImage || candidateImages > 0
+
+        if (lastProgressAt > 0) everSawProgress = true
+        const lastHeartbeatAgoMs = lastHeartbeatAt > 0 ? now - lastHeartbeatAt : -1
+        const lastProgressAgoMs = lastProgressAt > 0 ? now - lastProgressAt : -1
+
+        if (Date.now() - lastLogAt > 1500) {
+          lastLogAt = Date.now()
+          console.log('[Runner] wait chatgpt job', {
+            jobId,
+            elapsedMs,
+            lastHeartbeatAgoMs,
+            lastProgressAgoMs,
+            phase,
+            generating,
+            candidateImages,
+            acceptedImages,
+            hasPendingImage,
+            status: job.status,
+          })
+        }
+
+        if (job.status === 'done') {
+          console.log('[Runner] chatgpt job done', {
+            jobId,
+            imageCount: Array.isArray(job.imageUrls) ? job.imageUrls.length : 0,
+            elapsedMs,
+          })
+          return job
+        }
+
+        if (job.status === 'failed') {
+          const errMsg = asString(job.error) || 'ChatGPT generation failed'
+          // TIMEOUT + hasPendingImage → keep waiting. Re-running the
+          // Generate Node would re-upload refs and ChatGPT would
+          // duplicate the attachments. The heartbeat-stale gate is
+          // the real authority on when to give up.
+          if (/timeout/i.test(errMsg) && hasPendingImage) {
+            console.log(
+              '[Runner] ChatGPT timeout but image still pending — not retrying ' +
+              'to avoid duplicate submit; continuing to wait for asset render.',
+              { jobId, elapsedMs, lastHeartbeatAgoMs, lastProgressAgoMs, hasPendingImage }
+            )
+            await new Promise((resolve) => setTimeout(resolve, 1500))
+            continue
+          }
+          throw new Error(errMsg)
+        }
+
+        // ── GATE A — dead content script / lost message channel. ──
+        // No heartbeat for > heartbeatStaleMs means the polling loop
+        // died or the tab crashed. Even if lastProgressAt is recent,
+        // we cannot trust future updates.
+        if (lastHeartbeatAt > 0 && lastHeartbeatAgoMs > heartbeatStaleMs) {
+          console.log('[Runner] chatgpt job heartbeat lost', {
+            jobId,
+            elapsedMs,
+            lastHeartbeatAgoMs,
+            lastProgressAgoMs,
+            heartbeatStaleMs,
+            phase,
+          })
+          throw new Error(
+            'ChatGPT content script heartbeat lost: no update for ' +
+            Math.round(lastHeartbeatAgoMs / 1000) + 's. ' +
+            'The chatgpt.com tab or content script may have been unloaded.'
+          )
+        }
+
+        // ── GATE B — initial no-progress budget. ────────────────────
+        if (!everSawProgress) {
+          if (elapsedMs > initialNoProgressTimeoutMs) {
+            console.log('[Runner] chatgpt job no-progress timeout', {
+              jobId,
+              elapsedMs,
+              initialNoProgressTimeoutMs,
+            })
+            throw new Error(
+              'Timeout waiting for ChatGPT result: no generation progress within ' +
+              Math.round(initialNoProgressTimeoutMs / 1000) + 's'
+            )
+          }
+        } else {
+          // ── GATE C — generation has stalled. ────────────────────
+          if (lastProgressAgoMs > staleMs && !stillActive) {
+            console.log('[Runner] chatgpt job stale timeout', {
+              jobId,
+              elapsedMs,
+              lastHeartbeatAgoMs,
+              lastProgressAgoMs,
+              staleMs,
+              phase,
+            })
+            throw new Error(
+              'Timeout waiting for ChatGPT result: progress stale for ' +
+              Math.round(lastProgressAgoMs / 1000) + 's'
+            )
+          }
+          // Heartbeat keeps coming but real progress hasn't moved
+          // for 2x staleMs — even with an active signal we should
+          // not wait forever.
+          if (lastProgressAgoMs > staleMs * 2) {
+            console.log('[Runner] chatgpt job hard stale timeout', {
+              jobId,
+              elapsedMs,
+              lastHeartbeatAgoMs,
+              lastProgressAgoMs,
+              phase,
+            })
+            throw new Error(
+              'Timeout waiting for ChatGPT result: progress stale for ' +
+              Math.round(lastProgressAgoMs / 1000) + 's despite heartbeat'
+            )
+          }
+        }
+      } else {
+        if (elapsedMs > initialNoProgressTimeoutMs) {
+          throw new Error('Timeout waiting for ChatGPT result: job record not found')
+        }
       }
 
-      await new Promise((resolve) => setTimeout(resolve, 1000))
+      await new Promise((resolve) => setTimeout(resolve, 1500))
     }
 
-    throw new Error('Timeout waiting for ChatGPT result')
+    console.log('[Runner] chatgpt job max-wait timeout', {
+      jobId,
+      elapsedMs: Date.now() - startedAt,
+      maxWaitMs,
+    })
+    throw new Error('Timeout waiting for ChatGPT result: max wait reached after ' + Math.round(maxWaitMs / 1000) + 's')
   }
 
   private async sendRuntimeMessage(message: Record<string, unknown>): Promise<RuntimeResponse> {
-    const response = await chrome.runtime.sendMessage(message)
-    return (response || {}) as RuntimeResponse
+    try {
+      // Sidepanel / extension context. After a reload, `chrome.runtime`
+      // itself throws "Extension context invalidated". Translate that
+      // into a tagged error so callers (waitForChatGPTJob) can stop
+      // polling instead of hanging.
+      if (!hasExtensionContextSafe()) {
+        return { success: false, error: 'context_invalidated' }
+      }
+      const response = await chrome.runtime.sendMessage(message)
+      return (response || {}) as RuntimeResponse
+    } catch (err) {
+      if (isContextInvalidatedSafe(err)) {
+        return { success: false, error: 'context_invalidated' }
+      }
+      const msg = err instanceof Error ? err.message : String(err)
+      return { success: false, error: msg }
+    }
   }
 
   private hasDirectDownstreamType(sourceId: string, type: WorkflowNode['type']): boolean {
@@ -921,13 +1280,16 @@ export class PipelineRunner {
 
 let currentRunner: PipelineRunner | null = null
 
-export async function runPipeline(workflow: Workflow): Promise<void> {
+export async function runPipeline(
+  workflow: Workflow,
+  callbacks: PipelineCallbacks = {}
+): Promise<void> {
   if (currentRunner?.isRunning) {
     throw new Error('A pipeline is already running')
   }
   const pipelineStore = usePipelineStore.getState()
   const task = pipelineStore.createTask(workflow.id)
-  currentRunner = new PipelineRunner(workflow, task.id)
+  currentRunner = new PipelineRunner(workflow, task.id, callbacks)
   await currentRunner.run()
 }
 

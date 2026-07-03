@@ -2,6 +2,7 @@ import type { AIProvider, ProviderAdapter } from '@/types'
 import { GoogleFlowAdapter } from './googleFlow'
 import { ChatGPTAdapter } from './chatgpt'
 import { GrokAdapter } from './grok'
+import { PROVIDER_TABS } from '@/constants'
 
 export type { ProviderAdapter }
 
@@ -12,7 +13,7 @@ const adapters: Record<AIProvider, ProviderAdapter> = {
   'claude': {
     name: 'claude',
     async detect() { return false },
-    async open() { await chrome.tabs.create({ url: 'https://claude.ai', active: true }) },
+    async open() { await chrome.tabs.create({ url: PROVIDER_TABS.claude.createUrl, active: true }) },
     async insertPrompt(prompt) { /* Claude integration */ },
     async clickGenerate() {},
     async waitForResult() { return '' },
@@ -22,7 +23,7 @@ const adapters: Record<AIProvider, ProviderAdapter> = {
   'gemini': {
     name: 'gemini',
     async detect() { return false },
-    async open() { await chrome.tabs.create({ url: 'https://gemini.google.com', active: true }) },
+    async open() { await chrome.tabs.create({ url: PROVIDER_TABS.gemini.createUrl, active: true }) },
     async insertPrompt(prompt) {},
     async clickGenerate() {},
     async waitForResult() { return '' },

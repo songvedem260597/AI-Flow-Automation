@@ -93,7 +93,7 @@ const createDefaultNodeData = (type: FlowNodeType): Record<string, unknown> => {
         model: '',
         autoGenerate: true,
         waitForCompletion: true,
-        timeout: 60000
+        timeout: 300000
       }
     case 'delay':
       return { ...base, duration: 1000 }

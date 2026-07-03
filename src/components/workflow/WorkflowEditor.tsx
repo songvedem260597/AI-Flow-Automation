@@ -39,6 +39,7 @@ import {
   Settings2
 } from 'lucide-react'
 import { runPipeline, stopPipeline, pausePipeline, resumePipeline } from '@/pipeline'
+import type { PipelineCallbacks } from '@/pipeline'
 import { usePipelineStore } from '@/stores/pipelineStore'
 
 const SUPPORTED_NODE_TYPES: FlowNodeType[] = [
@@ -954,6 +955,8 @@ interface DrawflowInstance {
   canvas_y: number
   precanvas: HTMLElement
   node_selected: HTMLElement | null
+  ele_selected?: HTMLElement | null
+  drag?: boolean
   start: () => void
   clear: () => void
   import: (data: unknown, notify?: boolean) => void
@@ -1240,9 +1243,6 @@ function renderDrawflowNode(node: WorkflowNode) {
             : `<div class="df-node-preview-placeholder">${DF_ICONS.image}</div>`
         }
       </div>
-      <div class="df-node-settings-bar">
-        ${renderPillTrigger('aspectRatio', aspectRatio, ASPECT_RATIO_OPTIONS)}
-      </div>
     `
   } else if (node.type === 'generate') {
     const mediaType = getGenerateMediaType(generateData)
@@ -1255,20 +1255,39 @@ function renderDrawflowNode(node: WorkflowNode) {
     const generateDuration = String(generateData.videoDuration || durationOptions[0] || VIDEO_DURATION_OPTIONS[1])
     const supportsVideo = generateProviderSupportsVideo(generateData.provider)
     const mode = data.autoGenerate === false ? 'Manual' : 'Auto'
+
+    // Output preview: if node completed and has images, show first image
+    const output = data._output as Record<string, unknown> | undefined
+    const outputImages: Array<{ url: string; source: string }> = (
+      output?.images as Array<{ url: string; source: string }> | undefined
+    ) || []
+    const firstImageUrl = outputImages.length > 0 ? outputImages[0].url : ''
+    const hasOutput = firstImageUrl.length > 0
+    const outputBadge = outputImages.length > 1
+      ? `<span class="df-node-output-badge">+${outputImages.length - 1}</span>`
+      : ''
+
     body = `
-      <div class="df-node-preview-wrap">
-        <div class="df-node-preview ${generateRatioClass}">
-          <div class="df-node-preview-placeholder">${mediaType === 'video' ? DF_ICONS.generate : DF_ICONS.image}</div>
-        </div>
+      <div class="df-node-preview-wrap df-node-generate-preview-wrap">
+        ${hasOutput ? `
+          <div class="df-node-output-preview">
+            <img src="${escapeHtml(firstImageUrl)}" alt="Generated output" draggable="false">
+            ${outputBadge}
+          </div>
+        ` : `
+          <div class="df-node-preview ${generateRatioClass}">
+            <div class="df-node-preview-placeholder">${mediaType === 'video' ? DF_ICONS.generate : DF_ICONS.image}</div>
+          </div>
+        `}
         ${prompt ? `<div class="df-node-prompt df-node-prompt-overlay nodrag">${prompt}</div>` : ''}
-      </div>
-      <div class="df-node-settings-bar">
-        ${renderPillTrigger('provider', String(generateData.provider || 'chatgpt'), PROVIDER_OPTIONS)}
-        ${supportsVideo ? renderPillTrigger('mediaType', mediaType, GENERATE_MEDIA_TYPE_OPTIONS) : ''}
-        ${modelOptions.length ? renderPillTrigger('model', generateModel, modelOptions) : ''}
-        ${mediaType === 'video' ? renderPillTrigger('videoDuration', generateDuration, durationOptions) : ''}
-        ${renderPillTrigger('aspectRatio', generateAspectRatio, ratioOptions)}
-        <button type="button" class="df-node-tag df-node-tag-editable"><span>${mode}</span></button>
+        <div class="df-node-settings-bar df-node-settings-bar-overlay">
+          ${renderPillTrigger('provider', String(generateData.provider || 'chatgpt'), PROVIDER_OPTIONS)}
+          ${supportsVideo ? renderPillTrigger('mediaType', mediaType, GENERATE_MEDIA_TYPE_OPTIONS) : ''}
+          ${modelOptions.length ? renderPillTrigger('model', generateModel, modelOptions) : ''}
+          ${mediaType === 'video' ? renderPillTrigger('videoDuration', generateDuration, durationOptions) : ''}
+          ${renderPillTrigger('aspectRatio', generateAspectRatio, ratioOptions)}
+          <button type="button" class="df-node-tag df-node-tag-editable"><span>${mode}</span></button>
+        </div>
       </div>
     `
   } else if (node.type === 'delay') {
@@ -1734,6 +1753,10 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const workflowRef = useRef(workflow)
   const suppressEdgeEventRef = useRef(false)
   const connectionSyncFrameRef = useRef<number | null>(null)
+  const connectionRefreshFrameRef = useRef<number | null>(null)
+  const pendingConnectionRefreshIdsRef = useRef<Set<string>>(new Set())
+  const refreshAllConnectionsRef = useRef(false)
+  const nodeResizeObserversRef = useRef<Map<string, ResizeObserver>>(new Map())
   const overlayObserversRef = useRef<WeakMap<SVGPathElement, MutationObserver>>(new WeakMap())
   const nodePickerSpawnRef = useRef<{ x: number; y: number } | null>(null)
   const nodePickerRef = useRef<HTMLDivElement | null>(null)
@@ -1750,6 +1773,316 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const [zoomLevel, setZoomLevel] = useState(100)
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null)
   const [inspectorNodeId, setInspectorNodeId] = useState<string | null>(null)
+
+  // ── Pipeline run visual state ─────────────────────────────────────────
+  type NodeRunStatus = 'idle' | 'running' | 'completed' | 'failed'
+  const [nodeRunStates, setNodeRunStates] = useState<Record<string, NodeRunStatus>>({})
+  const [activeEdges, setActiveEdges] = useState<Record<string, { source: string; target: string; sourceHandle?: string; targetHandle?: string }>>({})
+  const [nodeOutputs, setNodeOutputs] = useState<Record<string, unknown>>({})
+
+  // ── Pipeline visual callbacks ─────────────────────────────────────────
+  const pipelineCallbacks = useMemo(() => ({
+    onNodeStart: (nodeId: string) => {
+      console.log('[GlowDebug][Editor] onNodeStart', { nodeId })
+      setNodeRunStates((prev) => ({ ...prev, [nodeId]: 'running' }))
+      // Activate incoming edges (data flowing into this node)
+      const incoming = (workflow.edges || [])
+        .filter((e: WorkflowEdge) => e.target === nodeId)
+      if (incoming.length > 0) {
+        setActiveEdges((prev) => {
+          const next = { ...prev }
+          for (const edge of incoming) {
+            next[edge.id] = {
+              source: edge.source,
+              target: edge.target,
+              sourceHandle: edge.sourceHandle || 'output_1',
+              targetHandle: edge.targetHandle || 'input_1'
+            }
+          }
+          return next
+        })
+      }
+    },
+    onNodeComplete: (nodeId: string, output: unknown) => {
+      console.log('[GlowDebug][Editor] onNodeComplete', { nodeId, output })
+      // Minimum visible duration so Media/Prompt that finish in <50ms
+      // still flash the running glow before settling into the completed purple state.
+      const startedAt = Date.now()
+      setNodeRunStates((prev) => prev) // ensure state subscription
+      const elapsed = Date.now() - startedAt
+      const minRunningMs = 500
+      const delayMs = Math.max(0, minRunningMs - elapsed)
+      const finalize = () => {
+        setNodeRunStates((prev) => ({ ...prev, [nodeId]: 'completed' }))
+        setNodeOutputs((prev) => ({ ...prev, [nodeId]: output }))
+      const completedNode = workflow.nodes.find((n: WorkflowNode) => n.id === nodeId)
+      if (completedNode?.type === 'generate') {
+        updateNode(nodeId, { _output: output } as Partial<FlowNodeData>)
+      }
+        // Activate outgoing edges (data flowing out of this node)
+        const outgoing = (workflow.edges || [])
+          .filter((e: WorkflowEdge) => e.source === nodeId)
+        if (outgoing.length > 0) {
+          setActiveEdges((prev) => {
+            const next = { ...prev }
+            for (const edge of outgoing) {
+              next[edge.id] = {
+                source: edge.source,
+                target: edge.target,
+                sourceHandle: edge.sourceHandle || 'output_1',
+                targetHandle: edge.targetHandle || 'input_1'
+              }
+            }
+            return next
+          })
+        }
+            // Refresh node DOM so Generate node shows output preview
+        requestAnimationFrame(() => {
+          const domNode = document.querySelector(`[data-workflow-node-id="${CSS.escape(nodeId)}"]`)
+          if (domNode) {
+            // Re-render node HTML with updated output data
+            const node = workflow.nodes.find((n: WorkflowNode) => n.id === nodeId)
+            if (node) {
+              const updatedNode = { ...node, data: { ...node.data, _output: output } }
+              const content = domNode.closest('.drawflow_content_node') || domNode.parentElement
+              if (content) {
+                content.innerHTML = renderDrawflowNode(updatedNode)
+                applyPortAttributesForNode(updatedNode)
+                attachNodeResizeObserver(nodeId)
+                scheduleDrawflowConnectionRefresh(nodeId)
+              }
+            }
+          }
+        })
+      }
+      if (delayMs > 0) setTimeout(finalize, delayMs)
+      else finalize()
+    },
+    onNodeFail: (nodeId: string, error: string) => {
+      console.log('[GlowDebug][Editor] onNodeFail', { nodeId, error })
+      setNodeRunStates((prev) => ({ ...prev, [nodeId]: 'failed' }))
+      // Deactivate ALL active edges so nothing glows forever
+      setActiveEdges({})
+    },
+    onEdgeActive: (edgeId: string) => {
+      console.log('[GlowDebug][Editor] onEdgeActive', { edgeId })
+      // Resolve source/target from workflow.edges — callback only ships edgeId.
+      const edge = (workflow.edges || []).find((e: WorkflowEdge) => e.id === edgeId)
+      if (!edge) return
+      setActiveEdges((prev) => ({
+        ...prev,
+        [edgeId]: {
+          source: edge.source,
+          target: edge.target,
+          sourceHandle: edge.sourceHandle || 'output_1',
+          targetHandle: edge.targetHandle || 'input_1'
+        }
+      }))
+    },
+    onEdgeInactive: (edgeId: string) => {
+      console.log('[GlowDebug][Editor] onEdgeInactive', { edgeId })
+      setActiveEdges((prev) => {
+        if (!(edgeId in prev)) return prev
+        const next = { ...prev }
+        delete next[edgeId]
+        return next
+      })
+    },
+  }), [workflow, updateNode]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Apply node run state classes to DOM nodes
+  const syncNodeRunStates = () => {
+    const container = document.querySelector('.parent-drawflow')
+    if (!container) return
+    for (const [nodeId, status] of Object.entries(nodeRunStates)) {
+      const selectorTried = `[data-workflow-node-id="${CSS.escape(nodeId)}"]`
+      const el = container.querySelector(selectorTried)
+      if (!el) {
+        console.log('[GlowDebug][DOM] apply node state', {
+          nodeId,
+          state: status,
+          found: false,
+          selectorTried,
+          classNameBefore: '',
+          classNameAfter: ''
+        })
+        continue
+      }
+      // Find the inner card/body so the box-shadow renders inside the
+      // node box (Drawflow's .drawflow-node wrapper is an outer shell
+      // whose box-shadow is clipped by overflow).
+      const card =
+        (el.querySelector<HTMLElement>('.df-node-body'))
+        || (el.querySelector<HTMLElement>('.df-node-card'))
+        || (el.querySelector<HTMLElement>('.node-card'))
+        || (el.querySelector<HTMLElement>('.workflow-node-card'))
+        || el
+      const wrapper = el.closest<HTMLElement>('.drawflow-node')
+      const classNameBefore = el.className
+      // Remove all previous states on both wrapper and card
+      for (const target of [wrapper, el, card]) {
+        if (!target) continue
+        target.classList.remove('ai-node-running', 'ai-node-completed', 'ai-node-failed')
+        target.removeAttribute('data-run-state')
+      }
+      if (status !== 'idle') {
+        for (const target of [wrapper, el, card]) {
+          if (!target) continue
+          target.classList.add(`ai-node-${status}`)
+          target.setAttribute('data-run-state', status)
+        }
+      }
+      const classNameAfter = el.className
+      const computedBoxShadow = (() => {
+        try { return getComputedStyle(card).boxShadow } catch { return 'error' }
+      })()
+      console.log('[GlowDebug][DOM] apply node state', {
+        nodeId,
+        state: status,
+        found: true,
+        selectorTried,
+        classNameBefore,
+        classNameAfter,
+        cardTagName: card.tagName,
+        cardClassName: card.className,
+        computedBoxShadow
+      })
+    }
+  }
+
+  // Apply active edge animations to Drawflow SVG paths.
+  // Drawflow SVG connections don't have stable IDs — we locate them by
+  // (1) data-edge-id attribute if present, (2) source/target port
+  // containment via SVG output/input markers.
+  const syncActiveEdges = () => {
+    const container = document.querySelector('.parent-drawflow')
+    if (!container) return
+
+    // Deactivate ALL first, then re-activate matching ones.
+    const allSvgs = container.querySelectorAll<SVGSVGElement>('.connection')
+    allSvgs.forEach((svg) => {
+      svg.classList.remove('ai-edge-running', 'ai-edge-completed', 'connection-active')
+      svg.querySelectorAll<SVGPathElement>('path').forEach((path) => {
+        path.style.strokeDasharray = ''
+        path.style.animation = ''
+      })
+    })
+
+    // Activate edges that are in the activeEdges map.
+    for (const [edgeId, meta] of Object.entries(activeEdges)) {
+      const sourceId = meta.source
+      const targetId = meta.target
+      if (!sourceId || !targetId) {
+        console.log('[GlowDebug][DOM] apply edge state', {
+          edgeId,
+          source: sourceId,
+          target: targetId,
+          found: false,
+          classNameBefore: '',
+          classNameAfter: ''
+        })
+        continue
+      }
+
+      // (1) Try data-edge-id attribute first — added below by Drawflow
+      // monkey-patch if available.
+      let targetSvg: SVGSVGElement | null = null
+      let candidates: { svg: SVGSVGElement; reason: string }[] = []
+      for (const svg of allSvgs) {
+        const dataId = svg.getAttribute('data-edge-id')
+        if (dataId === edgeId) {
+          targetSvg = svg
+          candidates.push({ svg, reason: 'data-edge-id-match' })
+          break
+        }
+      }
+
+      // (2) Exact Drawflow classes: connection node_in_node-<target> node_out_node-<source> output_X input_X.
+      if (!targetSvg) {
+        const sourceHandle = meta.sourceHandle || 'output_1'
+        const targetHandle = meta.targetHandle || 'input_1'
+        const sourceClass = CSS.escape(`node_out_node-${sourceId}`)
+        const targetClass = CSS.escape(`node_in_node-${targetId}`)
+        targetSvg = container.querySelector<SVGSVGElement>(
+          `svg.connection.${targetClass}.${sourceClass}.${CSS.escape(sourceHandle)}.${CSS.escape(targetHandle)}`
+        )
+        if (targetSvg) candidates.push({ svg: targetSvg, reason: 'drawflow-class-exact-match' })
+      }
+
+      // (3) Fallback: locate by source/target Drawflow classes.
+      if (!targetSvg) {
+        const sourceClass = CSS.escape(`node_out_node-${sourceId}`)
+        const targetClass = CSS.escape(`node_in_node-${targetId}`)
+        targetSvg = container.querySelector<SVGSVGElement>(
+          `svg.connection.${targetClass}.${sourceClass}`
+        )
+        if (targetSvg) candidates.push({ svg: targetSvg, reason: 'drawflow-class-node-match' })
+      }
+
+      // (4) Last fallback: locate by source/target via .output/.input containment.
+      if (!targetSvg) {
+        for (const svg of allSvgs) {
+          const sourceNode = svg.closest(`[id="node-${CSS.escape(sourceId)}"]`)
+          const targetNode = svg.closest(`[id="node-${CSS.escape(targetId)}"]`)
+          if (!sourceNode || !targetNode) continue
+          if (sourceNode === targetNode) continue
+          // Verify the .output/.input endpoints belong to the right nodes
+          const sourcePort = svg.querySelector('.output')
+          const targetPort = svg.querySelector('.input')
+          const sourceOk = sourcePort
+            ? sourcePort.closest(`[id="node-${CSS.escape(sourceId)}"]`) !== null
+            : sourceNode !== null
+          const targetOk = targetPort
+            ? targetPort.closest(`[id="node-${CSS.escape(targetId)}"]`) !== null
+            : targetNode !== null
+          if (!sourceOk || !targetOk) continue
+          candidates.push({ svg, reason: 'port-containment' })
+          if (!targetSvg) targetSvg = svg
+        }
+      }
+
+      // Diagnostic: log candidate scan when nothing matched
+      if (!targetSvg) {
+        const debugCandidates = Array.from(allSvgs).slice(0, 8).map((svg) => ({
+          dataEdgeId: svg.getAttribute('data-edge-id'),
+          classes: svg.getAttribute('class'),
+          childClasses: Array.from(svg.children).map((c) => c.getAttribute('class')).join('|')
+        }))
+        console.log('[GlowDebug][DOM] apply edge state', {
+          edgeId,
+          source: sourceId,
+          target: targetId,
+          found: false,
+          classNameBefore: '',
+          classNameAfter: '',
+          debugCandidates,
+          triedSourceSelector: `[id="node-${CSS.escape(sourceId)}"]`,
+          triedTargetSelector: `[id="node-${CSS.escape(targetId)}"]`,
+          triedDataEdgeId: edgeId
+        })
+        continue
+      }
+
+      const classNameBefore = targetSvg.getAttribute('class') || ''
+      targetSvg.classList.add('connection-active')
+      targetSvg.setAttribute('data-edge-id', edgeId)
+      const classNameAfter = targetSvg.getAttribute('class') || ''
+      console.log('[GlowDebug][DOM] apply edge state', {
+        edgeId,
+        source: sourceId,
+        target: targetId,
+        found: true,
+        classNameBefore,
+        classNameAfter,
+        candidateCount: candidates.length,
+        reason: candidates[0]?.reason
+      })
+    }
+  }
+
+  // React side-effect: sync DOM whenever state changes
+  useEffect(() => { syncNodeRunStates() }, [nodeRunStates])
+  useEffect(() => { syncActiveEdges() }, [activeEdges])
 
   const activeTask = tasks.find((task) => task.id === activeTaskId)
   const taskLogs = logs.filter((log) => log.pipelineId === activeTaskId).slice(0, 24)
@@ -1958,6 +2291,108 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     }
   }
 
+  function toDrawflowElementId(nodeId: string | number) {
+    const value = String(nodeId)
+    return value.startsWith('node-') ? value : `node-${value}`
+  }
+
+  function toWorkflowNodeId(nodeId: string | number) {
+    return String(nodeId).replace(/^node-/, '')
+  }
+
+  function mountedWorkflowNodeIds() {
+    const ids = new Set(workflowRef.current.nodes.map((node) => node.id))
+    canvasRef.current?.querySelectorAll<HTMLElement>('.drawflow-node[id^="node-"]').forEach((nodeEl) => {
+      ids.add(toWorkflowNodeId(nodeEl.id))
+    })
+    return ids
+  }
+
+  function updateDrawflowConnectionNodeNow(nodeId: string | number) {
+    const editor = editorRef.current
+    if (!editor) return
+
+    try {
+      editor.updateConnectionNodes(toDrawflowElementId(nodeId))
+    } catch {
+      // Drawflow can briefly miss DOM nodes while React/Drawflow are rehydrating.
+    }
+  }
+
+  function refreshDrawflowConnectionsNow(nodeIds?: Iterable<string | number> | null) {
+    const editor = editorRef.current
+    if (!editor) return
+
+    const ids = nodeIds
+      ? Array.from(nodeIds, (nodeId) => toWorkflowNodeId(nodeId)).filter(Boolean)
+      : Array.from(mountedWorkflowNodeIds())
+
+    for (const nodeId of new Set(ids)) {
+      updateDrawflowConnectionNodeNow(nodeId)
+    }
+    scheduleConnectionSync()
+  }
+
+  function scheduleDrawflowConnectionRefresh(nodeId?: string | number | null, options?: { all?: boolean }) {
+    if (options?.all || nodeId == null) {
+      refreshAllConnectionsRef.current = true
+    } else {
+      pendingConnectionRefreshIdsRef.current.add(toWorkflowNodeId(nodeId))
+    }
+
+    if (connectionRefreshFrameRef.current !== null) return
+
+    connectionRefreshFrameRef.current = window.requestAnimationFrame(() => {
+      connectionRefreshFrameRef.current = window.requestAnimationFrame(() => {
+        connectionRefreshFrameRef.current = null
+        const forceAll = refreshAllConnectionsRef.current
+        const pendingIds = new Set(pendingConnectionRefreshIdsRef.current)
+
+        refreshAllConnectionsRef.current = false
+        pendingConnectionRefreshIdsRef.current.clear()
+        applyPortAttributes()
+        attachNodeResizeObservers()
+        refreshDrawflowConnectionsNow(forceAll ? null : pendingIds)
+      })
+    })
+  }
+
+  function disconnectNodeResizeObservers() {
+    for (const observer of nodeResizeObserversRef.current.values()) {
+      observer.disconnect()
+    }
+    nodeResizeObserversRef.current.clear()
+  }
+
+  function attachNodeResizeObserver(nodeId: string | number) {
+    if (typeof ResizeObserver === 'undefined') return
+
+    const workflowNodeId = toWorkflowNodeId(nodeId)
+    if (nodeResizeObserversRef.current.has(workflowNodeId)) return
+
+    const nodeEl = canvasRef.current?.querySelector<HTMLElement>(`#node-${CSS.escape(workflowNodeId)}`)
+    if (!nodeEl) return
+
+    const observer = new ResizeObserver(() => {
+      scheduleDrawflowConnectionRefresh(workflowNodeId)
+    })
+    observer.observe(nodeEl)
+    nodeResizeObserversRef.current.set(workflowNodeId, observer)
+  }
+
+  function attachNodeResizeObservers() {
+    const mountedIds = mountedWorkflowNodeIds()
+
+    for (const [nodeId, observer] of nodeResizeObserversRef.current.entries()) {
+      if (!mountedIds.has(nodeId)) {
+        observer.disconnect()
+        nodeResizeObserversRef.current.delete(nodeId)
+      }
+    }
+
+    mountedIds.forEach((nodeId) => attachNodeResizeObserver(nodeId))
+  }
+
   const rerenderDrawflowNode = (nodeId: string) => {
     const editor = editorRef.current
     const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
@@ -1966,8 +2401,9 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     const content = canvasRef.current?.querySelector(`#node-${CSS.escape(node.id)} .drawflow_content_node`)
     if (content) content.innerHTML = renderDrawflowNode(node)
     applyPortAttributesForNode(node)
-    editor.updateConnectionNodes(`node-${node.id}`)
-    scheduleConnectionSync()
+    syncNodeRunStates()
+    attachNodeResizeObserver(node.id)
+    scheduleDrawflowConnectionRefresh(node.id)
   }
 
   const getPortDragInfo = (target: EventTarget | null): DrawflowPortDragInfo | null => {
@@ -2153,15 +2589,15 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     const editor = editorRef.current
     if (!editor) return
 
+    disconnectNodeResizeObservers()
     suppressEdgeEventRef.current = true
     editor.import(buildDrawflowData(workflowRef.current), false)
     suppressEdgeEventRef.current = false
 
     requestAnimationFrame(() => {
       applyPortAttributes()
-      for (const node of workflowRef.current.nodes) {
-        editor.updateConnectionNodes(`node-${node.id}`)
-      }
+      attachNodeResizeObservers()
+      scheduleDrawflowConnectionRefresh(null, { all: true })
       syncSelectedNodeDom()
       scheduleConnectionSync()
       refreshZoom()
@@ -2210,7 +2646,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     editor.on('nodeMoved', (id: string | number) => {
       const node = editor.getNodeFromId(id)
       updateNodePosition(String(id), { x: node.pos_x, y: node.pos_y })
-      scheduleConnectionSync()
+      refreshDrawflowConnectionsNow([String(id)])
+      scheduleDrawflowConnectionRefresh(String(id))
     })
 
     editor.on('nodeRemoved', (id: string | number) => {
@@ -2275,7 +2712,13 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     editor.on('addReroute', scheduleConnectionSync)
     editor.on('removeReroute', scheduleConnectionSync)
 
-    const syncOnPointerMove = () => scheduleConnectionSync()
+    const syncOnPointerMove = () => {
+      const activeNodeId = editor.drag
+        ? editor.ele_selected?.id || editor.node_selected?.id
+        : editor.node_selected?.id
+      if (activeNodeId) updateDrawflowConnectionNodeNow(activeNodeId)
+      scheduleConnectionSync()
+    }
     const canvasPointFromClient = (clientX: number, clientY: number) => {
       const rect = editor.precanvas.getBoundingClientRect()
       const zoom = editor.zoom || 1
@@ -2393,8 +2836,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       const resize = () => {
         textarea.style.height = '0px'
         textarea.style.height = `${Math.min(170, Math.max(74, textarea.scrollHeight))}px`
-        editor.updateConnectionNodes(`node-${nodeId}`)
-        scheduleConnectionSync()
+        refreshDrawflowConnectionsNow([nodeId])
+        scheduleDrawflowConnectionRefresh(nodeId)
       }
       const finish = (commit: boolean) => {
         if (finished) return
@@ -2523,6 +2966,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
               videoHeight: fileMediaType === 'video' ? height : undefined,
               videoPoster: fileMediaType === 'video' ? poster || '' : ''
             } as Partial<FlowNodeData>)
+            scheduleDrawflowConnectionRefresh(nodeId)
             cleanup()
           }
 
@@ -2691,6 +3135,11 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         cancelAnimationFrame(connectionSyncFrameRef.current)
         connectionSyncFrameRef.current = null
       }
+      if (connectionRefreshFrameRef.current !== null) {
+        cancelAnimationFrame(connectionRefreshFrameRef.current)
+        connectionRefreshFrameRef.current = null
+      }
+      disconnectNodeResizeObservers()
       canvasEl.removeEventListener('mousemove', syncOnPointerMove)
       canvasEl.removeEventListener('pointermove', syncOnPointerMove)
       canvasEl.removeEventListener('touchmove', syncOnPointerMove)
@@ -2724,12 +3173,16 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         const content = canvasRef.current?.querySelector(`#node-${CSS.escape(node.id)} .drawflow_content_node`)
         if (content) content.innerHTML = renderDrawflowNode(node)
         applyPortAttributesForNode(node)
-        editor.updateConnectionNodes(`node-${node.id}`)
-        scheduleConnectionSync()
+        attachNodeResizeObserver(node.id)
+        scheduleDrawflowConnectionRefresh(node.id)
       } catch {
         // Node may not be mounted yet; the structural hydrate will catch it.
       }
     }
+    requestAnimationFrame(() => {
+      syncNodeRunStates()
+      syncActiveEdges()
+    })
   }, [dataSignature, workflow.nodes])
 
   useEffect(() => {
@@ -2759,8 +3212,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     if (node) setSelectedNode(node.id)
     if (editor && node) {
       requestAnimationFrame(() => {
-        editor.updateConnectionNodes(`node-${node.id}`)
-        scheduleConnectionSync()
+        attachNodeResizeObserver(node.id)
+        scheduleDrawflowConnectionRefresh(node.id)
       })
     }
   }
@@ -2772,11 +3225,19 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       return
     }
 
-    await runPipeline(workflow)
+    // Clear previous run visual state before starting
+    setNodeRunStates({})
+    setActiveEdges({})
+    setNodeOutputs({})
+
+    await runPipeline(workflow, pipelineCallbacks)
   }
 
   const handleStop = () => {
     stopPipeline()
+    // Clear all visual state on stop so nothing glows
+    setNodeRunStates({})
+    setActiveEdges({})
   }
 
   const zoomInCanvas = () => {

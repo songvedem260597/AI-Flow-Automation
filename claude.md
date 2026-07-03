@@ -13,6 +13,125 @@ Core automation manipulates the Google Flow UI via:
 
 Reliability is more important than code elegance. Google Flow changes frequently — the goal is reliable automation with clear debugging and safe fallbacks.
 
+## Karpathy-Inspired Coding Agent Rules — Stable
+
+These rules are adapted for this project from the behavior principles in `multica-ai/andrej-karpathy-skills`.
+
+The goal is to prevent AI coding agents from making broad, speculative, or unverified changes.
+
+### 1. Think Before Coding
+
+Before editing any file, inspect the current implementation and identify the actual root cause.
+
+Do not guess selectors, payload fields, message actions, state names, or runtime behavior.
+
+For every non-trivial change, first determine:
+
+- Which file owns the behavior.
+- Which function owns the behavior.
+- What the current data flow is.
+- What evidence proves the bug or missing behavior.
+- Whether the issue is UI state, background routing, content script orchestration, bridge behavior, or Flow DOM drift.
+
+Never start by rewriting code.
+
+### 2. Simplicity First
+
+Prefer the smallest reliable fix.
+
+Do not add new abstraction, global state, config layer, queue system, retry system, or fallback path unless the current task explicitly requires it.
+
+For this project, reliability is more important than elegance, but reliability does not mean adding unnecessary complexity.
+
+Use the existing architecture:
+
+- GenPanel owns UI state and multi-prompt orchestration.
+- background/index.ts owns service worker routing.
+- flow-content.ts owns isolated-world orchestration.
+- flow-slate-bridge.ts owns MAIN-world Flow DOM / React Fiber interaction.
+- ChatGPT automation must stay separate from Flow automation.
+
+Do not move responsibilities between layers unless explicitly requested.
+
+### 3. Surgical Changes
+
+Make precise edits only where needed.
+
+Rules:
+
+- Do not rewrite `flow-slate-bridge.ts` unless explicitly required.
+- Do not delete fallback logic, retries, guards, or verification unless there is clear evidence they are obsolete.
+- Do not touch ChatGPT files when fixing Flow behavior.
+- Do not touch Flow files when fixing ChatGPT behavior.
+- Do not change payload contracts unless all call sites are inspected and updated.
+- Do not rename actions, fields, or functions casually.
+- Do not introduce breaking changes to `RUN_FLOW_PROMPT`, `FLOW_UPLOAD_IMAGE`, `CHATGPT_SUBMIT_AND_WAIT`, or download pipeline contracts.
+
+When editing, preserve existing behavior outside the target bug or feature.
+
+### 4. Goal-Driven Execution
+
+Every change must map directly to the user's requested goal.
+
+Do not opportunistically refactor.
+Do not clean unrelated code.
+Do not improve style while fixing runtime behavior.
+Do not change logs unless the task is about logging.
+Do not change UI unless the task is about UI.
+
+Before finishing, verify that the implemented change actually addresses the original request.
+
+Build passing is not runtime verification.
+
+For Flow runtime changes, runtime verification still requires:
+
+- Reload unpacked extension in `chrome://extensions`.
+- Hard reload Google Flow tab.
+- Check `window.__FLOW_BRIDGE_BUILD_TIME__`.
+- Run the affected browser flow.
+- Confirm expected logs and behavior.
+
+### 5. Anti-Assumption Rule
+
+If the code does not prove something, do not treat it as true.
+
+Bad behavior examples:
+
+- Assuming Flow generated a tile just because submit was clicked.
+- Assuming a reference image is attached without verifying attach count or prompt state.
+- Assuming `upload_xxx` is valid inside the bridge.
+- Assuming build success means browser runtime success.
+- Assuming a selector still works because it worked before.
+- Assuming partial auto-download is a hard failure.
+
+When uncertain, inspect, log minimally, or return a clear diagnostic.
+
+### 6. Required Agent Behavior
+
+For each task, the coding agent must:
+
+1. Inspect relevant files first.
+2. State the root cause before editing if it is a bug fix.
+3. Modify the smallest possible code surface.
+4. Preserve stable rules already documented in CLAUDE.md.
+5. Run `npm run build` only when source code changes.
+6. For documentation-only edits, report that build was not run because no runtime source changed.
+7. Provide the required completion report already defined in this CLAUDE.md.
+
+### 7. Do Not Regress
+
+Do not regress any existing stable behavior, especially:
+
+- Reference image upload resolution before `RUN_FLOW_PROMPT`.
+- `upload_xxx` defensive gates.
+- Flow bridge build time verification.
+- Multi-prompt queue ownership in GenPanel.
+- Auto-download partial success handling.
+- Duplicate download guards.
+- Separate Flow and ChatGPT automation paths.
+- Debug logs staying behind debug flags.
+- Runtime verification requirements.
+
 ## Tech Stack
 
 - **Plasmo** Framework (Chrome Extension SDK, v0.90.5)
@@ -544,6 +663,37 @@ interface ChatGPTJobState {
 
 Stored under key `chatgptJobs` in `chrome.storage.session` (Chrome 102+ MV3). Falls back to `chrome.storage.local` if session fails. Terminal jobs (done/failed) are dropped after 30 minutes by `chatgptCleanupExpiredJobs()` on SW startup.
 
+### Reference images for ChatGPT
+
+GenPanel lets the user attach reference images to a ChatGPT run. The flow is
+**different from Flow** — there is no intermediate tileId; the content script
+uploads the bytes directly to the ChatGPT composer.
+
+```
+GenPanel (activeProvider='chatgpt', refImages.length > 0)
+ └─ For each refImage with id === 'upload_xxx':
+    └─ fileToBase64Payload(pendingUploads[id]) → { base64, type }
+ └─ chrome.runtime.sendMessage({ action: 'RUN_CHATGPT_PROMPT', payload: { ... , mediaUploads } })
+ └─ background/index.ts — runChatGPTPrompt()
+    └─ forward payload.mediaUploads as-is in CHATGPT_SUBMIT_AND_WAIT
+ └─ content-script.ts — runChatGPTJob()
+    ├─ chatgptWaitForIdle(30s)
+    ├─ chatgptRemoveComposerAttachments() — clear stale attachments
+    ├─ uploadImage(dataUrl) per mediaUploads[i]
+    ├─ post-upload verify: attached === expected
+    ├─ continue with prompt insert + submit + image collection
+```
+
+**`ChatGPTPromptPayload.mediaUploads`** is `{ base64: string; type: string }[]`.
+**Real tileIds (non-`upload_xxx` refs) are NOT forwarded** — the bytes are not
+available on the GenPanel side, so re-sending them is impossible. The Flow
+`resolveReferenceImagesBeforeRun()` path must NOT be reused for ChatGPT.
+
+**Reference Images UI in GenPanel** is now shown for both providers. The
+Flow-only sub-pieces (`refMode` select, "Drag to reorder" hint) are internally
+gated by `activeProvider === 'flow'`. The upload bar, count, image grid, and
+remove button work for both providers.
+
 ### GenPanel polling contract
 
 ```
@@ -579,7 +729,6 @@ Stored under key `chatgptJobs` in `chrome.storage.session` (Chrome 102+ MV3). Fa
 - `src/contents/chatgpt-bridge.ts`
 - `FLOW_*` actions
 - `RUN_FLOW_PROMPT` from ChatGPT path
-- Reference Images UI for ChatGPT (hidden in v1)
 
 ---
 

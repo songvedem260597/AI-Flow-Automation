@@ -2,13 +2,11 @@ import type { FlowNodeType, AIProvider } from '@/types'
 
 export type { FlowNodeType, AIProvider }
 
-export const PROVIDER_URLS: Record<string, string> = {
-  'google-flow': 'https://labs.google/fx/tools/flow',
-  'chatgpt': 'https://chatgpt.com',
-  'grok': 'https://grok.com',
-  'claude': 'https://claude.ai',
-  'gemini': 'https://gemini.google.com'
-}
+// Re-export the shared per-provider tab config. Each entry holds:
+//   - queryUrl: Chrome match pattern for `chrome.tabs.query({ url })` (must end in '/*' for origins)
+//   - createUrl: navigable URL for `chrome.tabs.create({ url })`
+// See src/constants/providerTabs.ts for full details and rationale.
+export { PROVIDER_TABS, type ProviderTabConfig } from './providerTabs'
 
 export const PROVIDER_LABELS: Record<string, string> = {
   'google-flow': 'Google Flow',
@@ -46,7 +44,7 @@ export const DEFAULT_SETTINGS = {
   defaultProvider: 'chatgpt' as const,
   maxRetries: 3,
   retryDelay: 2000,
-  timeoutDuration: 60000,
+  timeoutDuration: 300000,
   wakeLockEnabled: true,
   notifications: {
     onComplete: true,

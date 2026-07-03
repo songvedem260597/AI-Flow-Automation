@@ -1,5 +1,40 @@
 import type { ProviderAdapter } from '@/types'
-import { PROVIDER_URLS } from '@/constants'
+import { PROVIDER_TABS } from '@/constants'
+
+// Resolves the runtime-bundled flow content script file name by
+// inspecting the live manifest. Plasmo emits hashed bundle names
+// (e.g. `flow-content.aabbccdd.js`), so we cannot hardcode the path.
+//
+// We pick the entry whose JS file starts with `flow-content.` — NOT
+// any <all_urls>-matching entry. Other <all_urls> entries exist in the
+// manifest (debug-bridge.*.js, content-script.*.js, flow-debug.*.js)
+// and the previous resolver returned the FIRST match, which happened to
+// be debug-bridge — the wrong bundle.
+//
+// Returns null if no entry matches.
+async function resolveFlowContentScriptFile(): Promise<string | null> {
+  try {
+    const manifest = chrome.runtime.getManifest() as {
+      content_scripts?: Array<{ matches?: string[]; js?: string[] }>
+    }
+    const scripts = manifest.content_scripts || []
+    for (let i = 0; i < scripts.length; i++) {
+      const entry = scripts[i]
+      const matches = entry.matches || []
+      const covers = matches.some(function (m) {
+        return m.indexOf('labs.google') !== -1 || m === '<all_urls>' || m === '*://*/*'
+      })
+      if (!covers) continue
+      const js = entry.js || []
+      for (let j = 0; j < js.length; j++) {
+        if (js[j].indexOf('flow-content.') === 0) return js[j]
+      }
+    }
+  } catch (err) {
+    console.warn('[GoogleFlowAdapter] resolveFlowContentScriptFile error:', (err as Error).message)
+  }
+  return null
+}
 
 export class GoogleFlowAdapter implements ProviderAdapter {
   name = 'google-flow' as const
@@ -19,36 +54,42 @@ export class GoogleFlowAdapter implements ProviderAdapter {
   }
 
   async open(): Promise<void> {
-    const tabs = await chrome.tabs.query({ url: PROVIDER_URLS['google-flow'] })
+    // queryUrl is a Chrome match pattern (must end in '/*' for origins);
+    // createUrl is a navigable URL passed to chrome.tabs.create.
+    const { queryUrl, createUrl } = PROVIDER_TABS['google-flow']
+    const tabs = await chrome.tabs.query({ url: queryUrl })
     if (tabs.length > 0 && tabs[0].id) {
       this.tabId = tabs[0].id
       await chrome.tabs.update(this.tabId, { active: true }).catch(() => {})
     } else {
-      const tab = await chrome.tabs.create({ url: PROVIDER_URLS['google-flow'], active: true })
+      const tab = await chrome.tabs.create({ url: createUrl, active: true })
       this.tabId = tab.id ?? null
     }
     await this.injectScript()
   }
 
   async insertPrompt(prompt: string): Promise<void> {
+    const tabId = this.requireTabId()
     await this.injectScript()
-    await chrome.tabs.sendMessage(this.tabId!, {
+    await chrome.tabs.sendMessage(tabId, {
       action: 'INSERT_PROMPT',
       payload: { prompt }
     })
   }
 
   async uploadImage(imageData: string): Promise<void> {
+    const tabId = this.requireTabId()
     await this.injectScript()
-    await chrome.tabs.sendMessage(this.tabId!, {
+    await chrome.tabs.sendMessage(tabId, {
       action: 'UPLOAD_IMAGE',
       payload: { imageData }
     })
   }
 
   async clickGenerate(): Promise<void> {
+    const tabId = this.requireTabId()
     await this.injectScript()
-    await chrome.tabs.sendMessage(this.tabId!, {
+    await chrome.tabs.sendMessage(tabId, {
       action: 'CLICK_GENERATE'
     })
   }
@@ -77,8 +118,9 @@ export class GoogleFlowAdapter implements ProviderAdapter {
   }
 
   async downloadResult(): Promise<string> {
+    const tabId = this.requireTabId()
     await this.injectScript()
-    const response = await chrome.tabs.sendMessage(this.tabId!, {
+    const response = await chrome.tabs.sendMessage(tabId, {
       action: 'DOWNLOAD_RESULT'
     })
     return response.data as string
@@ -98,32 +140,36 @@ export class GoogleFlowAdapter implements ProviderAdapter {
   }
 
   async setModel(modelId: string): Promise<void> {
+    const tabId = this.requireTabId()
     await this.injectScript()
-    await chrome.tabs.sendMessage(this.tabId!, {
+    await chrome.tabs.sendMessage(tabId, {
       action: 'SET_MODEL',
       payload: { model: modelId }
     })
   }
 
   async setAspectRatio(ratio: string): Promise<void> {
+    const tabId = this.requireTabId()
     await this.injectScript()
-    await chrome.tabs.sendMessage(this.tabId!, {
+    await chrome.tabs.sendMessage(tabId, {
       action: 'SET_ASPECT_RATIO',
       payload: { ratio }
     })
   }
 
   async setMediaType(mediaType: 'image' | 'video'): Promise<void> {
+    const tabId = this.requireTabId()
     await this.injectScript()
-    await chrome.tabs.sendMessage(this.tabId!, {
+    await chrome.tabs.sendMessage(tabId, {
       action: 'SET_MEDIA_TYPE',
       payload: { mediaType }
     })
   }
 
   async setDuration(duration: string): Promise<void> {
+    const tabId = this.requireTabId()
     await this.injectScript()
-    await chrome.tabs.sendMessage(this.tabId!, {
+    await chrome.tabs.sendMessage(tabId, {
       action: 'SET_DURATION',
       payload: { duration }
     })
@@ -133,15 +179,33 @@ export class GoogleFlowAdapter implements ProviderAdapter {
     this.tabId = null
   }
 
+  private requireTabId(): number {
+    if (typeof this.tabId !== 'number') {
+      throw new Error('Google Flow tab not opened yet — call open() first')
+    }
+    return this.tabId
+  }
+
+  // Resolves the flow content script file at runtime from the live
+  // manifest and injects it. NEVER swallows the error: if injection
+  // fails the caller learns about it via the thrown exception.
   private async injectScript(): Promise<void> {
     if (!this.tabId) return
+    const scriptFile = await resolveFlowContentScriptFile()
+    if (!scriptFile) {
+      throw new Error('Flow content script not declared in manifest')
+    }
     try {
       await chrome.scripting.executeScript({
         target: { tabId: this.tabId },
-        files: ['content-scripts/content-script.js']
+        files: [scriptFile]
       })
-    } catch {
-      // Script may already be injected
+    } catch (err) {
+      const msg = (err as Error).message || ''
+      if (msg.indexOf('already') !== -1 || msg.indexOf('specified') !== -1) {
+        return
+      }
+      throw err
     }
   }
 }

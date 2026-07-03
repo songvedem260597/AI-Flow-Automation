@@ -1003,12 +1003,33 @@ const handleGenerate = useCallback(async () => {
 
   // ── ChatGPT path (independent of Flow) ──────────────────────────────────
   if (activeProvider === 'chatgpt') {
-    console.log('[ChatGPT][GenPanel] handleGenerate start, prompt len:', prompt.length)
+    console.log('[ChatGPT][GenPanel] handleGenerate start, prompt len:', prompt.length, 'refs:', refImages.length)
     let jobId: string | undefined
     try {
       setIsGenerating(true)
       setGenStatus('generating')
       setFlowStep('[ChatGPT] Starting...')
+
+      // 0. Build mediaUploads from any pending local files. We do NOT
+      // route through resolveReferenceImagesBeforeRun — that helper is
+      // Flow-specific (uploads to Flow's tile system to get a tileId).
+      // ChatGPT wants raw base64 + mime type, and the content script
+      // uploads them via the DOM file input.
+      // Files without a matching pendingUploads entry (e.g. a real
+      // tileId from a previous Flow run) are skipped — they cannot be
+      // re-sent to ChatGPT without re-reading the bytes.
+      const mediaUploads: { base64: string; type: string }[] = []
+      for (const ref of refImages) {
+        if (!ref.id.startsWith('upload_')) continue
+        const file = pendingUploads[ref.id]
+        if (!file) continue
+        const payload = await fileToBase64Payload(file)
+        mediaUploads.push({ base64: payload.base64, type: payload.type })
+      }
+      if (mediaUploads.length > 0) {
+        console.log('[ChatGPT][GenPanel] mediaUploads prepared:', mediaUploads.length)
+        setFlowStep(`[ChatGPT] Uploading ${mediaUploads.length} reference image${mediaUploads.length !== 1 ? 's' : ''}...`)
+      }
 
       // 1. Submit: returns { accepted: true, jobId } immediately.
       const submitResult = await chrome.runtime.sendMessage({
@@ -1017,6 +1038,7 @@ const handleGenerate = useCallback(async () => {
           prompt,
           autoDownload,
           outputFolder: subFolder,
+          mediaUploads,
         },
       }) as { success: boolean; accepted?: boolean; jobId?: string; error?: string } | undefined
 
@@ -1117,7 +1139,7 @@ const handleGenerate = useCallback(async () => {
     return
   }
 
-}, [prompt, multiPrompt, activeProvider, isGenerating, runPromptQueue, mode, aspectRatio, quantity, videoDuration, imageModel, videoModel, refImages, frameFileIds, styleId, subFolder, autoDownload, downloadRes, videoDownloadRes])
+}, [prompt, multiPrompt, activeProvider, isGenerating, runPromptQueue, mode, aspectRatio, quantity, videoDuration, imageModel, videoModel, refImages, pendingUploads, frameFileIds, styleId, subFolder, autoDownload, downloadRes, videoDownloadRes])
 
   return (
     <div className="flex flex-col h-full bg-[#0A0A0A]">
@@ -1373,8 +1395,8 @@ const handleGenerate = useCallback(async () => {
           </div>
         </div>
 
-        {/* ── Reference Images (Google Flow only — not supported for ChatGPT v1) ── */}
-        {activeProvider === 'flow' && (
+        {/* ── Reference Images (Flow + ChatGPT) ── */}
+        {(
           <div className="px-4 pb-3">
             <div className="flex items-center gap-2 mb-2">
               <div className="flex items-center gap-1.5">
@@ -1391,19 +1413,21 @@ const handleGenerate = useCallback(async () => {
             >
               <Search className="w-3.5 h-3.5" />
             </button>
-            <div className="relative">
-              <select
-                value={refMode}
-                onChange={(e) => setRefMode(e.target.value)}
-                className="appearance-none pl-2 pr-5 py-1 bg-[#141414] rounded-lg text-[11px] text-white/40 outline-none border border-white/5 cursor-pointer"
-              >
-                <option value="all">All</option>
-                <option value="mention">@Mention</option>
-                <option value="sequential">Sequential</option>
-                <option value="none">None</option>
-              </select>
-              <ChevronDown className="absolute right-1 top-1/2 -translate-y-1/2 w-3 h-3 text-white/30 pointer-events-none" />
-            </div>
+            {activeProvider === 'flow' && (
+              <div className="relative">
+                <select
+                  value={refMode}
+                  onChange={(e) => setRefMode(e.target.value)}
+                  className="appearance-none pl-2 pr-5 py-1 bg-[#141414] rounded-lg text-[11px] text-white/40 outline-none border border-white/5 cursor-pointer"
+                >
+                  <option value="all">All</option>
+                  <option value="mention">@Mention</option>
+                  <option value="sequential">Sequential</option>
+                  <option value="none">None</option>
+                </select>
+                <ChevronDown className="absolute right-1 top-1/2 -translate-y-1/2 w-3 h-3 text-white/30 pointer-events-none" />
+              </div>
+            )}
           </div>
 
           {/* Upload bar */}
@@ -1429,7 +1453,7 @@ const handleGenerate = useCallback(async () => {
 
           {/* Drag hint + count */}
           <div className="flex items-center justify-between mt-1.5">
-            {refImages.length > 0 && (
+            {refImages.length > 0 && activeProvider === 'flow' && (
               <span className="text-[10px] text-white/25 flex items-center gap-1">
                 <GripVertical className="w-3 h-3" />
                 Drag to reorder

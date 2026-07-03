@@ -6,6 +6,71 @@
 const SOURCE = 'flow-auto-slate'
 const RESULT_SOURCE = SOURCE + '-result'
 
+// ── Safe sendMessage helpers (extension context invalidated resilience) ──────
+// After chrome.runtime.reload() the old content script bundle keeps running
+// in the page. Subsequent chrome.runtime.sendMessage calls throw
+// "Extension context invalidated". These helpers silently skip those
+// scenarios and tag errors so the polling loops can exit instead of
+// retrying forever.
+const CTX_INVALIDATED = 'Extension context invalidated'
+
+function _isContextInvalidatedMsg(msg: string): boolean {
+  return typeof msg === 'string' && msg.includes(CTX_INVALIDATED)
+}
+
+function safeRuntimeContext(): boolean {
+  try {
+    if (!chrome?.runtime?.id) return false
+    if (typeof chrome.runtime.connect !== 'function') return false
+    const port = chrome.runtime.connect({ name: '__ai_flow_ctx_probe__' })
+    try { port.disconnect() } catch {}
+    return true
+  } catch {
+    return Boolean(chrome?.runtime?.id)
+  }
+}
+
+function safeSendFireAndForget(message: unknown): void {
+  try {
+    if (!safeRuntimeContext()) return
+    chrome.runtime.sendMessage(message, () => {
+      // Drain lastError so Chrome doesn't keep logging the rejected reply.
+      void chrome.runtime.lastError
+    })
+  } catch {
+    // silent — context invalid or message channel gone
+  }
+}
+
+async function safeSendAwait(message: unknown): Promise<{ ok: boolean; response?: unknown; error?: string }> {
+  if (!safeRuntimeContext()) {
+    return { ok: false, error: 'context_invalidated' }
+  }
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(message, (response) => {
+        const err = chrome.runtime.lastError
+        if (err) {
+          if (_isContextInvalidatedMsg(err.message || '')) {
+            resolve({ ok: false, error: 'context_invalidated' })
+          } else {
+            resolve({ ok: false, error: err.message || 'sendMessage error' })
+          }
+          return
+        }
+        resolve({ ok: true, response })
+      })
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      if (_isContextInvalidatedMsg(msg)) {
+        resolve({ ok: false, error: 'context_invalidated' })
+      } else {
+        resolve({ ok: false, error: msg })
+      }
+    }
+  })
+}
+
 let _pendingRequests = new Map<number, { resolve: (v: unknown) => void; timeout: ReturnType<typeof setTimeout> }>()
 let _requestId = 0
 
@@ -656,6 +721,26 @@ async function runFlowPrompt(payload: {
     }
 
     while (waitedMs < maxWaitMs) {
+      // Stop polling if the extension context was invalidated mid-generation.
+      // There's no live receiver for any further status updates, and the
+      // timer/observer would keep the page busy for no reason. Mark
+      // autoDownloadResult as a contextual failure and break so the
+      // existing post-loop return path emits a graceful failure with
+      // autoDownload populated — callers downstream (GenPanel) distinguish
+      // by the autoDownload successCount/failCount and the propagated
+      // `error` field.
+      if (!safeRuntimeContext()) {
+        cleanupObserver()
+        console.warn('[FlowContent] waitForGeneratedTiles aborted: extension context invalidated')
+        autoDownloadResult = {
+          successCount: 0,
+          failCount: 0,
+          error: 'context_invalidated',
+          abortedReason: 'extension_context_invalidated_reload_chatgpt_tab',
+        }
+        break
+      }
+
       // ── Adaptive sleep ────────────────────────────────────────────────
       // - If the MutationObserver fired recently, sleep ~200ms then take
       //   a fresh snapshot. This is the fast-path that lets us react
@@ -1540,7 +1625,7 @@ async function runFlowPrompt(payload: {
 
       // Prepare rename in background
       try {
-        await chrome.runtime.sendMessage({
+        await safeSendAwait({
           action: 'PREPARE_DOWNLOAD_RENAME',
           payload: {
             folder: normOutputFolder || 'tobyflow-01',
@@ -1627,10 +1712,10 @@ async function runFlowPrompt(payload: {
   }
 
 function notifyStatus(status: string, data: Record<string, unknown> = {}) {
-  chrome.runtime.sendMessage({
+  safeSendFireAndForget({
     action: 'FLOW_STATUS',
     payload: { status, timestamp: Date.now(), ...data }
-  }).catch(() => {})
+  })
 }
 
 // ── Message Handler ──────────────────────────────────────────────────────────
@@ -1645,6 +1730,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       bridgeLoaded: isBridgeLoaded(),
       currentUrl: window.location.href,
       scan: scan,
+    })
+    return true
+  }
+
+  // Lightweight ping used by the background's FLOW_UPLOAD_IMAGES path
+  // to confirm the flow-content onMessage listener is attached before
+  // firing the upload. Mirrors ChatGPT's CHATGPT_PING pattern. Returns
+  // immediately — does NOT wait for the bridge, since FLOW_UPLOAD_IMAGES
+  // uploads via this content script and the bridge is not required for
+  // that path. The full bridge handshake is still performed by
+  // RUN_FLOW_PROMPT.
+  if (action === 'FLOW_CONTENT_PING') {
+    sendResponse({
+      success: true,
+      provider: 'google-flow',
+      contentLoaded: true,
+      currentUrl: window.location.href,
     })
     return true
   }

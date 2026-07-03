@@ -1,4 +1,5 @@
 import type { ChromeMessage } from '@/types'
+import { PROVIDER_TABS } from '@/constants'
 
 console.log('[Background] index.ts loaded')
 
@@ -16,34 +17,345 @@ function readBgDebugFlag(): boolean {
 }
 var BG_DEBUG = readBgDebugFlag()
 var workflowEditorWindowId: number | null = null
+var workflowEditorTabId: number | null = null
+
+const WORKFLOW_EDITOR_WINDOW_ID_KEY = 'workflowEditorWindowId'
+const WORKFLOW_EDITOR_TAB_ID_KEY = 'workflowEditorTabId'
+
+function toPositiveNumber(value: unknown): number | null {
+  const numeric = Number(value)
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : null
+}
+
+async function readStoredWorkflowEditorIds(): Promise<{ windowIds: Set<number>; tabIds: Set<number> }> {
+  const windowIds = new Set<number>()
+  const tabIds = new Set<number>()
+
+  if (workflowEditorWindowId !== null) windowIds.add(workflowEditorWindowId)
+  if (workflowEditorTabId !== null) tabIds.add(workflowEditorTabId)
+
+  const readArea = async (area?: chrome.storage.StorageArea) => {
+    if (!area?.get) return
+    try {
+      const stored = await area.get([WORKFLOW_EDITOR_WINDOW_ID_KEY, WORKFLOW_EDITOR_TAB_ID_KEY])
+      const storedWindowId = toPositiveNumber(stored?.[WORKFLOW_EDITOR_WINDOW_ID_KEY])
+      const storedTabId = toPositiveNumber(stored?.[WORKFLOW_EDITOR_TAB_ID_KEY])
+      if (storedWindowId !== null) windowIds.add(storedWindowId)
+      if (storedTabId !== null) tabIds.add(storedTabId)
+    } catch {}
+  }
+
+  await readArea(chrome.storage.session)
+  await readArea(chrome.storage.local)
+
+  return { windowIds, tabIds }
+}
+
+async function rememberWorkflowEditorWindow(windowId?: number | null, tabId?: number | null): Promise<void> {
+  const normalizedWindowId = toPositiveNumber(windowId)
+  const normalizedTabId = toPositiveNumber(tabId)
+
+  workflowEditorWindowId = normalizedWindowId
+  workflowEditorTabId = normalizedTabId
+
+  const payload: Record<string, number> = {}
+  if (normalizedWindowId !== null) payload[WORKFLOW_EDITOR_WINDOW_ID_KEY] = normalizedWindowId
+  if (normalizedTabId !== null) payload[WORKFLOW_EDITOR_TAB_ID_KEY] = normalizedTabId
+  if (Object.keys(payload).length === 0) return
+
+  await chrome.storage.session?.set?.(payload).catch(() => {})
+  await chrome.storage.local?.set?.(payload).catch(() => {})
+}
+
+async function clearStoredWorkflowEditorIds(): Promise<void> {
+  workflowEditorWindowId = null
+  workflowEditorTabId = null
+  const keys = [WORKFLOW_EDITOR_WINDOW_ID_KEY, WORKFLOW_EDITOR_TAB_ID_KEY]
+  await chrome.storage.session?.remove?.(keys).catch(() => {})
+  await chrome.storage.local?.remove?.(keys).catch(() => {})
+}
 
 async function closeWorkflowEditorTabsOnExtensionReload() {
   const editorUrl = chrome.runtime.getURL('tabs/workflow-editor.html')
+  const { windowIds, tabIds } = await readStoredWorkflowEditorIds()
   try {
     const tabs = await chrome.tabs.query({})
-    const editorTabIds = tabs
-      .filter((tab) => tab.id !== undefined && typeof tab.url === 'string' && tab.url.startsWith(editorUrl))
-      .map((tab) => tab.id as number)
 
-    if (editorTabIds.length > 0) {
-      await chrome.tabs.remove(editorTabIds).catch(() => {})
+    for (const tab of tabs) {
+      const tabId = toPositiveNumber(tab.id)
+      const tabUrl = typeof tab.url === 'string' ? tab.url : ''
+      const pendingUrl = typeof tab.pendingUrl === 'string' ? tab.pendingUrl : ''
+
+      if (tabUrl.startsWith(editorUrl) || pendingUrl.startsWith(editorUrl)) {
+        if (tabId !== null) tabIds.add(tabId)
+        if (toPositiveNumber(tab.windowId) !== null) windowIds.add(tab.windowId)
+      }
+
+      if (tabId !== null && tabIds.has(tabId) && toPositiveNumber(tab.windowId) !== null) {
+        windowIds.add(tab.windowId)
+      }
+    }
+
+    const closedWindowIds = new Set<number>()
+    for (const windowId of windowIds) {
+      try {
+        const win = await chrome.windows.get(windowId, { populate: true })
+        const winTabs = win.tabs || []
+        const hasEditorUrl = winTabs.some((tab) => {
+          const url = typeof tab.url === 'string' ? tab.url : ''
+          const pendingUrl = typeof tab.pendingUrl === 'string' ? tab.pendingUrl : ''
+          return url.startsWith(editorUrl) || pendingUrl.startsWith(editorUrl)
+        })
+        const hasStoredTab = winTabs.some((tab) => {
+          const tabId = toPositiveNumber(tab.id)
+          return tabId !== null && tabIds.has(tabId)
+        })
+
+        // The workflow editor is opened as a popup. After extension reload
+        // Chrome can convert the invalid extension page into a blank/New Tab
+        // page, so URL matching alone is too late. If this is the stored
+        // popup window, close the whole popup instead of leaving a white tab.
+        if (win.type === 'popup' && (hasEditorUrl || hasStoredTab || windowIds.has(windowId))) {
+          await chrome.windows.remove(windowId).catch(() => {})
+          closedWindowIds.add(windowId)
+        }
+      } catch {}
+    }
+
+    const remainingTabIds = Array.from(tabIds).filter((tabId) => {
+      const tab = tabs.find((item) => item.id === tabId)
+      return !tab || !closedWindowIds.has(tab.windowId)
+    })
+
+    if (remainingTabIds.length > 0) {
+      await chrome.tabs.remove(remainingTabIds).catch(() => {})
     }
   } finally {
-    workflowEditorWindowId = null
-    await chrome.storage.session?.remove?.('workflowEditorWindowId').catch(() => {})
+    await clearStoredWorkflowEditorIds()
   }
 }
 
+/**
+ * Reload (do NOT remove) every open provider tab on extension install /
+ * update / reload. After `chrome.runtime.reload()` (or after clicking
+ * "Reload" in chrome://extensions), existing provider tabs
+ * (chatgpt.com / grok.com / labs.google/fx/*) still hold the previous
+ * bundle's content scripts. Those scripts subsequently throw
+ * `Extension context invalidated` whenever they touch chrome.runtime or
+ * chrome.storage. The only safe remedy is to reload the tab itself; this
+ * function triggers that.
+ *
+ * Provider URLs come from the shared `PROVIDER_TABS` constant so the
+ * pattern list stays in sync with the adapter implementations.
+ *
+ * IMPORTANT: this is ONLY called from real extension lifecycle events
+ * (`onInstalled`, `onStartup`, gated version-mismatch check). Service
+ * worker wake-ups alone do NOT call this — otherwise we'd reload tabs
+ * during normal usage and disrupt in-flight generations.
+ */
+async function reloadProviderTabsOnExtensionReload() {
+  // Query one provider at a time so an invalid URL pattern in one entry
+  // can't take down the others. This is a defensive guard — today's
+  // patterns are validated, but future additions may not be.
+  const providerTabs = PROVIDER_TABS as unknown as Record<
+    string,
+    { queryUrl: string; createUrl: string } | undefined
+  >
+  const providerKeys = Object.keys(providerTabs).filter(
+    (k) => k !== 'claude' && k !== 'gemini'
+  )
+
+  for (const key of providerKeys) {
+    const cfg = providerTabs[key]
+    if (!cfg) continue
+
+    let tabs: chrome.tabs.Tab[] = []
+    try {
+      tabs = await chrome.tabs.query({ url: cfg.queryUrl })
+    } catch (e) {
+      // Invalid URL pattern (regression): log and skip this provider only.
+      console.warn(
+        `[Background] reloadProviderTabsOnExtensionReload: chrome.tabs.query failed for provider=${key}:`,
+        e
+      )
+      continue
+    }
+
+    for (const tab of tabs) {
+      if (!tab || tab.id === undefined) continue
+      // Don't reload the editor / side panel / extension pages by accident.
+      const url = typeof tab.url === 'string' ? tab.url : ''
+      if (url.startsWith('chrome-extension://') || url.startsWith('chrome://')) continue
+      chrome.tabs.reload(tab.id).catch((err) => {
+        console.warn(
+          `[Background] reloadProviderTabsOnExtensionReload: chrome.tabs.reload failed for tabId=${tab.id}:`,
+          err
+        )
+      })
+    }
+  }
+}
+
+// ── Lifecycle-gated cleanup ──────────────────────────────────────────────
+// Reloading provider tabs is potentially disruptive (any open ChatGPT /
+// Flow page that is mid-generation will lose its state). It must only
+// happen on REAL lifecycle events — never on ordinary SW wake-ups.
+//
+// We additionally gate the reload behind a stored version/build marker so
+// the very first wake-up after an extension update gets exactly one clean
+// reload pass, and subsequent wakes (no version change) don't touch tabs.
+
+const VERSION_KEY = 'ai-flow-installed-version'
+const BUILD_KEY = 'ai-flow-installed-build'
+
+interface ManifestLike {
+  version?: string
+  version_name?: string
+}
+
+function readCurrentExtensionMarkers(): { version: string; buildId: string } {
+  // Prefer fields that are actually unique across rebuilds: manifest
+  // `version` + `version_name`. If a build pipeline sets `version_name`
+  // (e.g. timestamps) we use it as the build id; otherwise we fall back
+  // to `version`. Both come from chrome.runtime.getManifest() — they're
+  // stable for the lifetime of the installed bundle.
+  const manifest = (chrome.runtime.getManifest() as unknown as ManifestLike) || {}
+  const version = String(manifest.version || '')
+  const buildId = String(manifest.version_name || manifest.version || '')
+  return { version, buildId }
+}
+
+async function readStoredExtensionMarkers(): Promise<{ version: string; buildId: string } | null> {
+  try {
+    // chrome.storage.session is wiped when Chrome exits, so a "missing"
+    // entry means either a fresh install OR a different lifecycle path.
+    // We also fall back to chrome.storage.local so the marker survives
+    // a service-worker suspension / browser restart.
+    const session = await chrome.storage.session?.get?.([VERSION_KEY, BUILD_KEY]).catch(() => null)
+    const local = await chrome.storage.local?.get?.([VERSION_KEY, BUILD_KEY]).catch(() => null)
+    const map = (session && typeof session === 'object' ? session : null) ||
+      (local && typeof local === 'object' ? local : null) ||
+      null
+    if (!map) return null
+    const version = typeof map[VERSION_KEY] === 'string' ? (map[VERSION_KEY] as string) : ''
+    const buildId = typeof map[BUILD_KEY] === 'string' ? (map[BUILD_KEY] as string) : ''
+    if (!version && !buildId) return null
+    return { version, buildId }
+  } catch {
+    return null
+  }
+}
+
+async function writeStoredExtensionMarkers(markers: { version: string; buildId: string }): Promise<void> {
+  // Write to BOTH session and local. The local copy is the authoritative
+  // one for "have we ever seen this version?" — session is just a fast
+  // path for the common case where the SW didn't recycle.
+  try {
+    await chrome.storage.session?.set?.({ [VERSION_KEY]: markers.version, [BUILD_KEY]: markers.buildId })
+  } catch {}
+  try {
+    await chrome.storage.local?.set?.({ [VERSION_KEY]: markers.version, [BUILD_KEY]: markers.buildId })
+  } catch {}
+}
+
+/**
+ * Returns true if the installed bundle's version/build differs from
+ * what's stored. ALWAYS updates the stored value before returning, so
+ * that subsequent SW wake-ups with the same bundle see "no mismatch" and
+ * skip the cleanup pass.
+ *
+ * The "always update" semantic is what makes the version-gated reload
+ * idempotent — by the time the SW calls `reloadProviderTabsOnExtensionReload`
+ * a second time on the same bundle, the stored markers already match
+ * the current ones.
+ */
+async function shouldRunLifecycleReload(): Promise<boolean> {
+  const current = readCurrentExtensionMarkers()
+  const stored = await readStoredExtensionMarkers()
+
+  const sameVersion = !!stored && stored.version === current.version
+  const sameBuild = !!stored && stored.buildId === current.buildId
+
+  if (sameVersion && sameBuild) return false
+
+  // Persist current markers regardless so subsequent wake-ups are clean.
+  await writeStoredExtensionMarkers(current)
+  return true
+}
+
+/**
+ * The actual cleanup orchestrator. Differs from the previous version in
+ * that the workflow-editor tab closing is unconditional (it can never
+ * point to a real session ID because the previous SW is gone), but the
+ * provider-tab reload is gated behind a version mismatch so it only
+ * fires when the bundle has actually changed.
+ *
+ * Wrapped so a single failure never crashes the SW.
+ */
+async function runExtensionReloadCleanup(options: { closeEditorsImmediately?: boolean } = {}): Promise<void> {
+  const closeEditorsImmediately = options.closeEditorsImmediately !== false
+
+  // Workflow-editor cleanup is always safe — there's no in-flight state
+  // to disrupt (the editor's persist layer uses chrome.storage which
+  // survives a reload), and any open editor window is pointing at the
+  // old bundle.
+  if (closeEditorsImmediately) {
+    try {
+      await closeWorkflowEditorTabsOnExtensionReload()
+    } catch (error) {
+      console.warn('[Background] failed to close stale workflow editor tabs:', error)
+    }
+  }
+
+  // Provider-tab reload is gated. If the stored version/build already
+  // matches, this is just a regular SW wake (no reload happened) and we
+  // skip the reload to avoid interrupting active generations.
+  try {
+    const should = await shouldRunLifecycleReload()
+    if (!should) {
+      console.log('[Background] provider-tab reload skipped (no version/build mismatch)')
+      return
+    }
+    if (!closeEditorsImmediately) {
+      await closeWorkflowEditorTabsOnExtensionReload()
+    }
+    await reloadProviderTabsOnExtensionReload()
+  } catch (error) {
+    // Defensive — never let SW crash because of cleanup issues.
+    console.warn('[Background] failed to reload stale provider tabs:', error)
+  }
+}
+
+// First listener: side panel behavior.
 chrome.runtime.onInstalled.addListener(() => {
-  closeWorkflowEditorTabsOnExtensionReload().catch((error) => {
-    console.warn('[Background] failed to close stale workflow editor tabs:', error)
+  chrome.sidePanel?.setPanelBehavior({ openPanelOnActionClick: true })
+})
+
+// Second listener: cleanup on install / update.
+// `onInstalled` fires for `install`, `update`, and `chrome_update` —
+// all three are real bundle changes where the old provider tabs hold
+// stale scripts. The version-gated guard inside
+// `runExtensionReloadCleanup` keeps this idempotent if a user
+// double-taps the Reload button.
+chrome.runtime.onInstalled.addListener(() => {
+  runExtensionReloadCleanup().catch((error) => {
+    console.warn('[Background] extension-reload cleanup failed:', error)
+  })
+})
+
+// Third listener: cleanup on browser startup.
+// `onStartup` fires once when the browser launches and the SW spins up.
+// On a session where the user did not reload the extension, the stored
+// markers already match — so the inner gate makes this a no-op.
+chrome.runtime.onStartup?.addListener(() => {
+  runExtensionReloadCleanup({ closeEditorsImmediately: false }).catch((error) => {
+    console.warn('[Background] extension-reload cleanup failed:', error)
   })
 })
 
 chrome.windows.onRemoved.addListener((windowId) => {
   if (workflowEditorWindowId === windowId) {
-    workflowEditorWindowId = null
-    chrome.storage.session?.remove?.('workflowEditorWindowId').catch(() => {})
+    clearStoredWorkflowEditorIds().catch(() => {})
   }
 })
 
@@ -64,18 +376,37 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
       return openProviderTab(message.payload as string)
 
     case 'OPEN_PROVIDER_TAB': {
-      const payload = message.payload as { provider?: string } | undefined
+      const payload = message.payload as { provider?: string; focus?: boolean } | undefined
       const provider = payload?.provider
       if (!provider) return { success: false, error: 'provider is required' }
-      return openProviderTab(provider)
+      // Default behavior: focus the provider tab so GenPanel users see
+      // the active generation. Workflow-run callers pass focus:false
+      // so their tab (Workflow Editor / Side Panel) stays on screen.
+      const shouldFocus = payload?.focus !== false
+      return openProviderTab(provider, shouldFocus)
     }
 
     case 'INJECT_SCRIPT':
       if (message.tabId) {
-        await chrome.scripting.executeScript({
-          target: { tabId: message.tabId },
-          files: ['content-scripts/content-script.js']
-        })
+        // Use the runtime-resolved content script file (matches
+        // <all_urls>) instead of a hardcoded bundle path that may not
+        // exist in the built extension.
+        const scriptFile = resolveChatGPTContentScriptFile()
+        if (!scriptFile) {
+          return { success: false, error: 'No content script entry matches in manifest' }
+        }
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: message.tabId },
+            files: [scriptFile]
+          })
+        } catch (err) {
+          const msg = (err as Error).message || ''
+          if (msg.indexOf('already') !== -1 || msg.indexOf('specified') !== -1) {
+            return { success: true }
+          }
+          return { success: false, error: msg }
+        }
         return { success: true }
       }
       break
@@ -104,6 +435,15 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
     case 'OPEN_WORKFLOW_EDITOR_WINDOW':
       return openWorkflowEditorWindow(message.payload as { workflowId?: string } | undefined)
 
+    case 'REGISTER_WORKFLOW_EDITOR_TAB': {
+      const tab = sender.tab
+      if (!tab?.id || tab.windowId === undefined) {
+        return { success: false, error: 'Workflow editor tab sender is missing' }
+      }
+      await rememberWorkflowEditorWindow(tab.windowId, tab.id)
+      return { success: true }
+    }
+
     case 'RUN_FLOW_PROMPT':
       return runFlowPrompt(message.payload as RunFlowPromptPayload, sender.tab?.id)
 
@@ -112,6 +452,76 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
 
     case 'GET_CHATGPT_JOB_STATUS':
       return getChatGPTJobStatus(message.payload as { jobId?: string })
+
+    case 'CHATGPT_JOB_PROGRESS': {
+      // Heartbeat from the content-script polling loop. We split:
+      //   * `lastHeartbeatAt` — bumped on EVERY message (proves the
+      //      content script is alive and the message channel works).
+      //   * `lastProgressAt`  — bumped ONLY when the payload actually
+      //      indicates a generation advance (phase change, spinner
+      //      flip, image/turn/text count bump, or an explicit
+      //      `progressChanged: true` from the content script).
+      //
+      // The runner's waitForChatGPTJob uses `lastProgressAt` for the
+      // "progress stale" gate and `lastHeartbeatAt` for the dead-tab
+      // gate.
+      const payload = message.payload as ChatGPTJobProgress & { jobId?: string }
+      const jobId = payload?.jobId
+      if (!jobId) return { success: false, error: 'jobId required' }
+      const now = Date.now()
+
+      const jobs = await chatgptReadJobs()
+      const existing = jobs[jobId]
+      if (!existing) {
+        console.log('[ChatGPT][Background] job heartbeat for unknown jobId:', jobId)
+        return { success: false, error: 'unknown jobId' }
+      }
+
+      const prevProgress = isRecordObject(existing.progress) ? existing.progress : null
+      const progressChanged =
+        payload.progressChanged === true ||
+        progressAdvanced(payload, prevProgress)
+
+      const progressPayload: ChatGPTJobProgress = {
+        phase: payload.phase,
+        generating: payload.generating,
+        assistantTurns: payload.assistantTurns,
+        candidateImages: payload.candidateImages,
+        acceptedImages: payload.acceptedImages,
+        hasPendingImage: payload.hasPendingImage,
+        elapsedMs: payload.elapsedMs,
+        lastAssistantTextLength: payload.lastAssistantTextLength,
+        progressChanged,
+        lastMessage: payload.lastMessage,
+      }
+
+      const patch: Partial<ChatGPTJobState> = {
+        lastHeartbeatAt: now,
+        progress: progressPayload,
+        hasPendingImage: payload.hasPendingImage ? true : undefined,
+      }
+      // lastProgressAt bumps ONLY on real advance. A heartbeat that
+      // carries the same counters / phase as the previous one does
+      // not count.
+      if (progressChanged) {
+        patch.lastProgressAt = now
+      }
+
+      const merged = await chatgptUpdateJob(jobId, patch)
+      console.log('[ChatGPT][Background] job heartbeat', {
+        jobId,
+        phase: payload.phase,
+        progressChanged,
+        lastHeartbeatAt: now,
+        lastProgressAt: progressChanged ? now : (existing.lastProgressAt || null),
+        lastProgressDeltaMs: existing.lastProgressAt ? now - existing.lastProgressAt : null,
+        generating: payload.generating,
+        candidateImages: payload.candidateImages,
+        acceptedImages: payload.acceptedImages,
+        hasPendingImage: payload.hasPendingImage,
+      })
+      return { success: true }
+    }
 
     case 'FLOW_STATUS':
       return handleFlowStatus(message.payload as FlowStatusPayload)
@@ -169,8 +579,7 @@ async function openWorkflowEditorWindow(
       await chrome.tabs.update(tab.id, { url, active: true }).catch(() => {})
     }
     await chrome.windows.update(windowId, { focused: true }).catch(() => {})
-    workflowEditorWindowId = windowId
-    await chrome.storage.session?.set?.({ workflowEditorWindowId: windowId }).catch(() => {})
+    await rememberWorkflowEditorWindow(windowId, tab?.id ?? null)
     return { success: true, windowId }
   }
 
@@ -183,13 +592,13 @@ async function openWorkflowEditorWindow(
   }
 
   try {
-    const stored = await chrome.storage.session?.get?.('workflowEditorWindowId').catch(() => null)
-    const storedWindowId = stored?.workflowEditorWindowId as number | undefined
+    const stored = await readStoredWorkflowEditorIds()
+    const storedWindowId = Array.from(stored.windowIds)[0]
     if (storedWindowId) {
       return await focusExisting(storedWindowId)
     }
   } catch {
-    workflowEditorWindowId = null
+    await clearStoredWorkflowEditorIds()
   }
 
   try {
@@ -214,9 +623,8 @@ async function openWorkflowEditorWindow(
     })
 
     workflowEditorWindowId = win.id ?? null
-    if (workflowEditorWindowId !== null) {
-      await chrome.storage.session?.set?.({ workflowEditorWindowId }).catch(() => {})
-    }
+    workflowEditorTabId = win.tabs?.[0]?.id ?? null
+    await rememberWorkflowEditorWindow(workflowEditorWindowId, workflowEditorTabId)
 
     return { success: true, windowId: workflowEditorWindowId ?? undefined }
   } catch (error) {
@@ -224,58 +632,46 @@ async function openWorkflowEditorWindow(
   }
 }
 
-// Per-provider tab configuration.
-//   queryUrl:  match pattern for chrome.tabs.query({ url }) — must end in '/*' for an origin
-//   createUrl: navigable URL for chrome.tabs.create
+// Per-provider tab configuration lives in src/constants/providerTabs.ts so it
+// can be shared with the provider adapters. See that file for the contract:
+//   - queryUrl: Chrome match pattern for chrome.tabs.query({ url }) (must end in '/*' for origins)
+//   - createUrl: navigable URL for chrome.tabs.create
 // Bare origins like 'https://chatgpt.com' are invalid match patterns and would
 // throw "Invalid url pattern" at query time.
-const PROVIDER_TABS: Record<string, { queryUrl: string; createUrl: string }> = {
-  'google-flow': {
-    queryUrl: 'https://labs.google/fx/*',
-    createUrl: 'https://labs.google/fx/tools/flow',
-  },
-  'chatgpt': {
-    queryUrl: 'https://chatgpt.com/*',
-    createUrl: 'https://chatgpt.com/',
-  },
-  'grok': {
-    queryUrl: 'https://grok.com/*',
-    createUrl: 'https://grok.com/',
-  },
-  'claude': {
-    queryUrl: 'https://claude.ai/*',
-    createUrl: 'https://claude.ai/',
-  },
-  'gemini': {
-    queryUrl: 'https://gemini.google.com/*',
-    createUrl: 'https://gemini.google.com/',
-  },
-}
 
-async function openProviderTab(provider: string): Promise<{ success: boolean; tabId?: number; error?: string }> {
-  const config = PROVIDER_TABS[provider]
+async function openProviderTab(
+  provider: string,
+  shouldFocus: boolean = true
+): Promise<{ success: boolean; tabId?: number; error?: string }> {
+  const config = (PROVIDER_TABS as Record<string, { queryUrl: string; createUrl: string } | undefined>)[provider]
   if (!config) {
     console.log(`[Provider][BG] openProviderTab provider=${provider} error=Unknown provider`)
     return { success: false, error: 'Unknown provider' }
   }
-  console.log(`[Provider][BG] openProviderTab provider=${provider} queryUrl=${config.queryUrl}`)
+  console.log(`[Provider][BG] openProviderTab provider=${provider} queryUrl=${config.queryUrl} shouldFocus=${shouldFocus}`)
 
   try {
     const existing = await chrome.tabs.query({ url: config.queryUrl })
     console.log(`[Provider][BG] found existing count=${existing.length}`)
     if (existing.length > 0 && existing[0].id) {
       const tabId = existing[0].id
-      await chrome.tabs.update(tabId, { active: true }).catch(() => {})
-      const winId = (existing[0] as { windowId?: number }).windowId
-      if (winId !== undefined) {
-        await chrome.windows.update(winId, { focused: true }).catch(() => {})
+      if (shouldFocus) {
+        await chrome.tabs.update(tabId, { active: true }).catch(() => {})
+        const winId = (existing[0] as { windowId?: number }).windowId
+        if (winId !== undefined) {
+          await chrome.windows.update(winId, { focused: true }).catch(() => {})
+        }
+        console.log(`[Provider][BG] focused existing tabId=${tabId}`)
+      } else {
+        console.log(`[Provider][BG] skip focus existing tabId=${tabId} (focus=false)`)
       }
-      console.log(`[Provider][BG] focused existing tabId=${tabId}`)
       return { success: true, tabId }
     }
 
-    const tab = await chrome.tabs.create({ url: config.createUrl, active: true })
-    console.log(`[Provider][BG] created tabId=${tab.id}`)
+    // No existing provider tab — create one. active=false keeps the
+    // user's current tab (Workflow Editor / Side Panel) visible.
+    const tab = await chrome.tabs.create({ url: config.createUrl, active: shouldFocus })
+    console.log(`[Provider][BG] created tabId=${tab.id} active=${shouldFocus}`)
     return { success: true, tabId: tab.id }
   } catch (err) {
     console.log(`[Provider][BG] openProviderTab provider=${provider} error=${(err as Error).message}`)
@@ -306,7 +702,7 @@ async function openProviderTab(provider: string): Promise<{ success: boolean; ta
 //   }
 
 const CHATGPT_JOB_STORAGE_KEY = 'chatgptJobs'
-const CHATGPT_JOB_TTL_MS = 600000 // 10 minutes hard cap
+const CHATGPT_JOB_TTL_MS = 30 * 60 * 1000 // Long ChatGPT jobs stay alive while heartbeat/progress is active
 
 interface ChatGPTJobState {
   status: 'running' | 'done' | 'failed'
@@ -320,6 +716,39 @@ interface ChatGPTJobState {
   error: string
   message?: string
   tabId?: number
+  /** Wall-clock at the moment the most recent CHATGPT_JOB_PROGRESS
+   *  message was received — set unconditionally on every heartbeat.
+   *  Used by the runner to detect a dead content script (no
+   *  heartbeats in 30-45s = extension context lost or tab crashed). */
+  lastHeartbeatAt?: number
+  /** Wall-clock at the moment the content script last reported a
+   *  REAL generation advance (phase change, count change, spinner
+   *  flip, etc.). Heartbeats alone do NOT bump this. Used by the
+   *  runner to detect that the generation itself has stalled. */
+  lastProgressAt?: number
+  progress?: ChatGPTJobProgress
+  /** Set true when content script detected a partial image render that
+   *  never completed within the polling window. The runner reads this
+   *  to skip node-level retry even when the error is "TIMEOUT" — uploading
+   *  again would create duplicate attachments. */
+  hasPendingImage?: boolean
+}
+
+interface ChatGPTJobProgress {
+  phase?: 'pre_upload' | 'uploading' | 'submitting' | 'waiting_result' | 'generating' | 'rendering' | 'done' | 'failed'
+  generating?: boolean
+  assistantTurns?: number
+  candidateImages?: number
+  acceptedImages?: number
+  hasPendingImage?: boolean
+  elapsedMs?: number
+  lastAssistantTextLength?: number
+  /** True when the content script considers this heartbeat to
+   *  represent a real generation advance — phase change, spinner
+   *  flip, count bump, etc. The runner's waitForChatGPTJob uses
+   *  this to decide whether to bump `lastProgressAt`. */
+  progressChanged?: boolean
+  lastMessage?: string
 }
 
 interface ChatGPTPromptPayload {
@@ -328,6 +757,8 @@ interface ChatGPTPromptPayload {
   autoDownload: boolean
   outputFolder?: string
   timeoutMs?: number
+  /** When false, do not focus the ChatGPT tab — keep the caller's tab visible. */
+  focus?: boolean
 }
 
 async function chatgptReadJobs(): Promise<Record<string, ChatGPTJobState>> {
@@ -348,6 +779,59 @@ async function chatgptWriteJobs(jobs: Record<string, ChatGPTJobState>): Promise<
     console.warn('[ChatGPT][Background] session storage write failed, falling back to local:', e)
     await chrome.storage.local.set({ [CHATGPT_JOB_STORAGE_KEY]: jobs })
   }
+}
+
+// Narrow a value to a plain object record. Used by the heartbeat
+// path to compare current and previous progress payloads.
+function isRecordObject(v: unknown): Record<string, unknown> | null {
+  if (!v || typeof v !== 'object') return null
+  return v as Record<string, unknown>
+}
+
+// Compare a fresh heartbeat to the previous one and decide whether
+// the generation has actually advanced. A heartbeat that reports
+// the same counters / phase / spinner state as the prior one does
+// NOT bump lastProgressAt — heartbeats alone prove liveness, not
+// advance. The function returns true if any of the watched fields
+// changed in a direction that indicates progress.
+function progressAdvanced(
+  next: { phase?: string; generating?: boolean; assistantTurns?: number; candidateImages?: number; acceptedImages?: number; hasPendingImage?: boolean; lastAssistantTextLength?: number },
+  prev: Record<string, unknown> | null
+): boolean {
+  if (!prev) {
+    // First heartbeat — treat as a real advance so the runner can
+    // transition out of the "no progress yet" gate as soon as the
+    // content script registers that it has entered the polling
+    // phase. This prevents the runner from failing a job whose only
+    // heartbeat arrived after the initial no-progress budget had
+    // already elapsed (storage write race).
+    return true
+  }
+  const phaseNow = typeof next.phase === 'string' ? next.phase : null
+  const phasePrev = typeof prev.phase === 'string' ? prev.phase : null
+  if (phaseNow && phasePrev && phaseNow !== phasePrev) return true
+  // Phase appeared for the first time (e.g. undefined → 'waiting_result').
+  if (phaseNow && !phasePrev) return true
+  const genNow = !!next.generating
+  const genPrev = !!prev.generating
+  // Spinner turning on is a real advance.
+  if (genNow && !genPrev) return true
+  const turnsNow = Number(next.assistantTurns) || 0
+  const turnsPrev = Number(prev.assistantTurns) || 0
+  if (turnsNow > turnsPrev) return true
+  const candNow = Number(next.candidateImages) || 0
+  const candPrev = Number(prev.candidateImages) || 0
+  if (candNow > candPrev) return true
+  const accNow = Number(next.acceptedImages) || 0
+  const accPrev = Number(prev.acceptedImages) || 0
+  if (accNow > accPrev) return true
+  const pendNow = !!next.hasPendingImage
+  const pendPrev = !!prev.hasPendingImage
+  if (pendNow && !pendPrev) return true
+  const textNow = Number(next.lastAssistantTextLength) || 0
+  const textPrev = Number(prev.lastAssistantTextLength) || 0
+  if (textNow > textPrev) return true
+  return false
 }
 
 async function chatgptUpdateJob(jobId: string, patch: Partial<ChatGPTJobState>): Promise<ChatGPTJobState | null> {
@@ -531,9 +1015,16 @@ function waitForTabComplete(tabId: number, timeoutMs: number): Promise<void> {
 // Resolve the actual hashed file name of the ChatGPT content script at
 // runtime by inspecting the live manifest. Plasmo emits bundles with
 // content hashes (e.g. `content-script.aabbccdd.js`) so we cannot hard-code
-// the path. We pick the content_scripts entry whose matches cover
-// https://chatgpt.com/* and return its first JS file. Returns null if
-// no entry matches — caller should treat that as a fatal configuration error.
+// the path.
+//
+// IMPORTANT: We must pick the entry whose JS file starts with
+// `content-script.` — NOT any <all_urls>-matching entry. Other <all_urls>
+// entries exist in the manifest (debug-bridge.ed396080.js, flow-debug.*.js)
+// and the previous resolver returned the FIRST match, which happened to be
+// debug-bridge — the wrong bundle.
+//
+// Returns null if no entry matches — caller should treat that as a fatal
+// configuration error.
 function resolveChatGPTContentScriptFile(): string | null {
   try {
     var manifest = chrome.runtime.getManifest()
@@ -544,7 +1035,14 @@ function resolveChatGPTContentScriptFile(): string | null {
       var covers = matches.some(function (m) {
         return m === '<all_urls>' || m === '*://*/*' || m.indexOf('chatgpt.com') !== -1
       })
-      if (covers && entry.js && entry.js.length > 0) return entry.js[0]
+      if (!covers) continue
+      var js = entry.js || []
+      for (var j = 0; j < js.length; j++) {
+        // Pick the entry whose primary JS file is the generic content
+        // script bundle. Excludes debug-bridge, flow-debug,
+        // flow-content, and flow-slate-bridge.
+        if (js[j].indexOf('content-script.') === 0) return js[j]
+      }
     }
   } catch (err) {
     console.warn('[ChatGPT][Background] resolveChatGPTContentScriptFile error: ' + (err as Error).message)
@@ -562,6 +1060,19 @@ async function ensureChatGPTContentReady(tabId: number): Promise<void> {
 
   if (tab.status !== 'complete') {
     await waitForTabComplete(tabId, 30000)
+  }
+
+  for (var prePingI = 0; prePingI < 3; prePingI++) {
+    try {
+      var existingPong = await chrome.tabs.sendMessage(tabId, { action: 'CHATGPT_PING' })
+      if (existingPong && existingPong.success) {
+        console.log('[ChatGPT][Background] content ping ok before inject provider=' + (existingPong.provider || 'unknown'))
+        return
+      }
+    } catch (_) {
+      // Listener is not attached yet. We will inject below.
+    }
+    await new Promise(function (r) { setTimeout(r, 200) })
   }
 
   var scriptFile = resolveChatGPTContentScriptFile()
@@ -606,8 +1117,10 @@ async function runChatGPTPrompt(
 ): Promise<{ success: boolean; accepted?: boolean; jobId?: string; error?: string }> {
   console.log('[ChatGPT][Background] runChatGPTPrompt called, prompt len:', payload.prompt?.length)
 
-  // 1. Find or create ChatGPT tab (reuse existing helper)
-  const opened = await openProviderTab('chatgpt')
+  // 1. Find or create ChatGPT tab (reuse existing helper).
+  // Default behavior focuses the tab (GenPanel). Workflow-run
+  // callers pass focus:false so the user's tab stays visible.
+  const opened = await openProviderTab('chatgpt', payload.focus !== false)
   if (!opened.success || !opened.tabId) {
     return { success: false, error: opened.error || 'Failed to open ChatGPT tab' }
   }
@@ -658,6 +1171,12 @@ async function runChatGPTPrompt(
         autoDownload: payload.autoDownload,
         timeoutMs,
         jobId,
+        // mediaUploads is optional; workflow Generate Node sends it so the
+        // content script can attach reference images before submitting the
+        // prompt. The adapter path was removed because its manual
+        // executeScript('content-scripts/content-script.js') referenced a
+        // file that does not exist in the built extension.
+        mediaUploads: Array.isArray(payload.mediaUploads) ? payload.mediaUploads : [],
       },
     })
     .then(() => {
@@ -779,10 +1298,6 @@ async function showNotification(payload: { title: string; message: string; type?
   })
   return { success: true }
 }
-
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.sidePanel?.setPanelBehavior({ openPanelOnActionClick: true })
-})
 
 // ── Flow Integration ────────────────────────────────────────────────────────────
 
@@ -911,6 +1426,29 @@ async function uploadImageToFlow(
     }
   } catch {
     // Continue — bridge may still work
+  }
+
+  // FLOW_UPLOAD_IMAGES only requires the flow-content onMessage listener
+  // to be attached — it does not need the bridge. The previous bridge
+  // ping is not a reliable proxy for "content script listener is alive"
+  // (the bridge handshake is async and can complete before or after
+  // the listener registration). Add a direct content ping with retry
+  // to avoid "Could not establish connection. Receiving end does not
+  // exist." when the listener hasn't been wired yet.
+  for (let pingI = 0; pingI < 10; pingI++) {
+    let contentPong: Record<string, unknown> | null = null
+    try {
+      contentPong = await chrome.tabs.sendMessage(tabId, { action: 'FLOW_CONTENT_PING' })
+    } catch (_) { /* not yet */ }
+    if (contentPong && (contentPong as { success?: boolean }).success) {
+      break
+    }
+    await new Promise(function (r) { setTimeout(r, 300) })
+    if (pingI === 9) {
+      const err = 'Flow content script not ready after FLOW_CONTENT_PING retry'
+      console.error('[Background][FLOW_UPLOAD_IMAGE_RESULT]', JSON.stringify({ key: payload.key, success: false, error: err }))
+      return { success: false, key: payload.key, error: err }
+    }
   }
 
   try {
