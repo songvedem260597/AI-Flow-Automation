@@ -57,3 +57,8 @@ reference/
 # Local debug / scratch
 *.log
 *.tsbuildinfo
+.playwright-mcp/
+.pw-chatgpt-profile/
+artifacts/
+build_log.txt
+diagnostic-upload.js
