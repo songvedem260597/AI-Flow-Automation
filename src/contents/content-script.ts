@@ -1036,6 +1036,29 @@ const AIFlowContentScript = {
       })
       return { accepted: true, jobId, duplicate: true }
     }
+    const activeDifferentJob = Object.entries(jobMap).find(([id, job]) => {
+      return id !== jobId && job && job.status === 'running'
+    })
+    if (activeDifferentJob) {
+      const activeJobId = activeDifferentJob[0]
+      console.warn('[ChatGPT][Job] concurrent CHATGPT_SUBMIT_AND_WAIT rejected', {
+        jobId,
+        activeJobId,
+      })
+      safeSendFireAndForget({
+        action: 'CHATGPT_JOB_DONE',
+        jobId,
+        payload: {
+          success: false,
+          error: 'CHATGPT_BUSY: another ChatGPT automation job is already running',
+        },
+      })
+      return {
+        accepted: false,
+        jobId,
+        error: 'CHATGPT_BUSY: another ChatGPT automation job is already running',
+      }
+    }
     jobMap[jobId] = { status: 'running', startedAt: Date.now() }
 
     // Acknowledge to background immediately so it can release the tabs.sendMessage
@@ -1364,15 +1387,22 @@ const AIFlowContentScript = {
     if (sendButton && this.chatgptIsButtonUsable(sendButton)) {
       log('send click attempted')
       this.chatgptPointerClickButton(sendButton)
-      await this.chatgptSleep(1500)
-      submitted = this.chatgptDidSubmit(
+      submitted = await this.chatgptWaitForSubmitSignal(
         editor,
         baselineAssistantTurnCountForClick,
         baselineFileIdsForClick,
-        { allowFileIdSignal: false, baselineUserTurnCount: baselineUserTurnCountForClick }
+        { allowFileIdSignal: false, baselineUserTurnCount: baselineUserTurnCountForClick },
+        7000,
+        250
       )
-    }
-    if (!submitted) {
+      if (!submitted) {
+        log('send click not verified; skipping fallback to avoid duplicate submit')
+        return sendDone({
+          success: false,
+          error: 'CHATGPT_SUBMIT_UNVERIFIED: send click did not produce a submit signal',
+        })
+      }
+    } else {
       log('send fallback attempted')
       const fallbackResult = await this.chatgptSubmitExistingComposerFallbacks(
         editor,
@@ -1728,28 +1758,34 @@ const AIFlowContentScript = {
     }
 
     const tryWaitVerify = async (strategy, waitMs) => {
-      await this.chatgptSleep(waitMs)
-      return verify(strategy)
+      const ok = await this.chatgptWaitForSubmitSignal(
+        editor,
+        baselineAssistantTurnCount,
+        baselineFileIds,
+        options,
+        waitMs,
+        250
+      )
+      if (ok) return { success: true, strategy }
+      return null
     }
 
     try { editor && editor.focus && editor.focus() } catch (_) {}
 
     console.log('[ChatGPT-submit] workflow fallback try enterKey')
     this.chatgptDispatchEnter(editor)
-    let result = await tryWaitVerify('enterKey', 1500)
+    let result = await tryWaitVerify('enterKey', 4000)
     if (result) return result
 
     const button = await this.chatgptFindSubmitButtonWithRetry(3000, 200)
     if (button && this.chatgptIsButtonUsable(button)) {
       console.log('[ChatGPT-submit] workflow fallback try pointer click')
       this.chatgptPointerClickButton(button)
-      result = await tryWaitVerify('pointerClick', 1500)
+      result = await tryWaitVerify('pointerClick', 5000)
       if (result) return result
-
-      console.log('[ChatGPT-submit] workflow fallback try react onClick')
-      if (this.chatgptInvokeReactOnClick(button)) {
-        result = await tryWaitVerify('reactOnClick', 1500)
-        if (result) return result
+      return {
+        success: false,
+        error: 'CHATGPT_SUBMIT_UNVERIFIED: pointer click did not produce a submit signal',
       }
     } else {
       console.log('[ChatGPT-submit] workflow fallback no usable button')
@@ -1767,11 +1803,6 @@ const AIFlowContentScript = {
         console.warn('[ChatGPT-submit] workflow fallback form.requestSubmit threw:', e)
       }
     }
-
-    console.log('[ChatGPT-submit] workflow fallback final enterKey')
-    this.chatgptDispatchEnter(editor)
-    result = await tryWaitVerify('enterKeyFinal', 1500)
-    if (result) return result
 
     return {
       success: false,
@@ -1813,9 +1844,7 @@ const AIFlowContentScript = {
     // ── Primary: Enter key dispatch ───────────────────────────────────────
     console.log('[ChatGPT-submit] try enterKey')
     this.chatgptDispatchEnter(editor)
-    await this.chatgptSleep(1500)
-
-    if (this.chatgptDidSubmit(editor, baselineAssistantTurnCount, baselineFileIds)) {
+    if (await this.chatgptWaitForSubmitSignal(editor, baselineAssistantTurnCount, baselineFileIds, undefined, 4000, 250)) {
       console.log('[ChatGPT-submit] submitted via enterKey')
       return true
     }
@@ -1826,22 +1855,12 @@ const AIFlowContentScript = {
     if (button) {
       console.log('[ChatGPT-submit] submit button found')
       this.chatgptPointerClickButton(button)
-      await this.chatgptSleep(1500)
-      if (this.chatgptDidSubmit(editor, baselineAssistantTurnCount, baselineFileIds)) {
+      if (await this.chatgptWaitForSubmitSignal(editor, baselineAssistantTurnCount, baselineFileIds, undefined, 5000, 250)) {
         console.log('[ChatGPT-submit] submitted via pointer click')
         return true
       }
-
-      // React onClick fallback. React 18 stores props on a key starting with
-      // __reactProps$<id> on the DOM node.
-      const reactInvoked = this.chatgptInvokeReactOnClick(button)
-      if (reactInvoked) {
-        await this.chatgptSleep(1500)
-        if (this.chatgptDidSubmit(editor, baselineAssistantTurnCount, baselineFileIds)) {
-          console.log('[ChatGPT-submit] submitted via react onClick')
-          return true
-        }
-      }
+      console.warn('[ChatGPT-submit] pointer click not verified; skipping extra submit strategies')
+      return false
     } else {
       console.log('[ChatGPT-submit] submit button not found, trying form.requestSubmit')
     }
@@ -1852,23 +1871,13 @@ const AIFlowContentScript = {
     if (form && typeof form.requestSubmit === 'function') {
       try {
         form.requestSubmit(button || undefined)
-        await this.chatgptSleep(1000)
-        if (this.chatgptDidSubmit(editor, baselineAssistantTurnCount, baselineFileIds)) {
+        if (await this.chatgptWaitForSubmitSignal(editor, baselineAssistantTurnCount, baselineFileIds, undefined, 3000, 250)) {
           console.log('[ChatGPT-submit] submitted via form.requestSubmit')
           return true
         }
       } catch (e) {
         console.warn('[ChatGPT-submit] form.requestSubmit threw:', e)
       }
-    }
-
-    // Final attempt: re-Enter after button click — sometimes the focus moves
-    // away from the editor when the button click is dispatched.
-    this.chatgptDispatchEnter(editor)
-    await this.chatgptSleep(1500)
-    if (this.chatgptDidSubmit(editor, baselineAssistantTurnCount, baselineFileIds)) {
-      console.log('[ChatGPT-submit] submitted via enterKey (post-button retry)')
-      return true
     }
 
     return false
@@ -2491,6 +2500,19 @@ const AIFlowContentScript = {
     } catch (_) {}
   },
 
+  async chatgptWaitForSubmitSignal(editor, baselineAssistantTurnCount, baselineFileIds, options, maxMs, stepMs) {
+    const start = Date.now()
+    const maxWait = Math.max(0, Number(maxMs) || 0)
+    const interval = Math.max(100, Number(stepMs) || 250)
+    while (Date.now() - start < maxWait) {
+      if (this.chatgptDidSubmit(editor, baselineAssistantTurnCount, baselineFileIds, options)) {
+        return true
+      }
+      await this.chatgptSleep(interval)
+    }
+    return this.chatgptDidSubmit(editor, baselineAssistantTurnCount, baselineFileIds, options)
+  },
+
   chatgptDidSubmit(editor, baselineAssistantTurnCount, baselineFileIds, options) {
     // options = { allowFileIdSignal: boolean }
     //   - true (default): Signal 4 (new file_id) is treated as a
@@ -2615,9 +2637,6 @@ const AIFlowContentScript = {
     try { btn.dispatchEvent(new PointerEvent('pointerup', baseInit)) } catch (_) {}
     try { btn.dispatchEvent(new MouseEvent('mouseup', baseInit)) } catch (_) {}
     try { btn.dispatchEvent(new MouseEvent('click', baseInit)) } catch (_) {}
-    // Native .click() as last resort inside this branch — does NOT raise
-    // synthetic pointer events but is universally accepted.
-    try { btn.click() } catch (_) {}
   },
 
   chatgptInvokeReactOnClick(btn) {

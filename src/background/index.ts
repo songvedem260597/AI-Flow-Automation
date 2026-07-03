@@ -703,6 +703,17 @@ async function openProviderTab(
 
 const CHATGPT_JOB_STORAGE_KEY = 'chatgptJobs'
 const CHATGPT_JOB_TTL_MS = 30 * 60 * 1000 // Long ChatGPT jobs stay alive while heartbeat/progress is active
+const CHATGPT_DEDUPE_FLIGHT_TTL_MS = 5 * 1000
+
+type ChatGPTPromptStartResult = {
+  success: boolean
+  accepted?: boolean
+  jobId?: string
+  error?: string
+  deduped?: boolean
+}
+
+const chatgptSubmitFlights = new Map<string, Promise<ChatGPTPromptStartResult>>()
 
 interface ChatGPTJobState {
   status: 'running' | 'done' | 'failed'
@@ -716,6 +727,7 @@ interface ChatGPTJobState {
   error: string
   message?: string
   tabId?: number
+  requestFingerprint?: string
   /** Wall-clock at the moment the most recent CHATGPT_JOB_PROGRESS
    *  message was received — set unconditionally on every heartbeat.
    *  Used by the runner to detect a dead content script (no
@@ -757,6 +769,7 @@ interface ChatGPTPromptPayload {
   autoDownload: boolean
   outputFolder?: string
   timeoutMs?: number
+  mediaUploads?: Array<{ name?: string; type?: string; base64?: string }>
   /** When false, do not focus the ChatGPT tab — keep the caller's tab visible. */
   focus?: boolean
 }
@@ -779,6 +792,72 @@ async function chatgptWriteJobs(jobs: Record<string, ChatGPTJobState>): Promise<
     console.warn('[ChatGPT][Background] session storage write failed, falling back to local:', e)
     await chrome.storage.local.set({ [CHATGPT_JOB_STORAGE_KEY]: jobs })
   }
+}
+
+function chatgptHashString(input: string): string {
+  let h1 = 0x811c9dc5
+  let h2 = 0x45d9f3b
+  for (let i = 0; i < input.length; i++) {
+    const c = input.charCodeAt(i)
+    h1 = Math.imul(h1 ^ c, 16777619)
+    h2 = Math.imul(h2 ^ c, 1597334677)
+  }
+  h1 = (h1 ^ (h1 >>> 16)) >>> 0
+  h2 = (h2 ^ (h2 >>> 16)) >>> 0
+  return h1.toString(36) + h2.toString(36)
+}
+
+function chatgptBuildRequestFingerprint(payload: ChatGPTPromptPayload): string {
+  const mediaUploads = Array.isArray(payload.mediaUploads) ? payload.mediaUploads : []
+  const mediaSignatures = mediaUploads.map((media, index) => {
+    const base64 = typeof media?.base64 === 'string' ? media.base64 : ''
+    return {
+      index,
+      type: typeof media?.type === 'string' ? media.type : '',
+      size: base64.length,
+      head: base64.slice(0, 96),
+      tail: base64.slice(-96),
+    }
+  })
+  const signature = JSON.stringify({
+    prompt: typeof payload.prompt === 'string' ? payload.prompt.trim() : '',
+    ratio: payload.ratio || '',
+    autoDownload: !!payload.autoDownload,
+    outputFolder: payload.outputFolder || '',
+    mediaUploads: mediaSignatures,
+  })
+  return chatgptHashString(signature)
+}
+
+async function chatgptFindRunningJobByFingerprint(
+  requestFingerprint: string
+): Promise<{ jobId: string; job: ChatGPTJobState } | null> {
+  const jobs = await chatgptReadJobs()
+  const now = Date.now()
+  for (const [jobId, job] of Object.entries(jobs)) {
+    if (
+      job.requestFingerprint === requestFingerprint &&
+      job.status === 'running' &&
+      now - job.startedAt < CHATGPT_JOB_TTL_MS
+    ) {
+      return { jobId, job }
+    }
+  }
+  return null
+}
+
+function chatgptRememberSubmitFlight(
+  requestFingerprint: string,
+  promise: Promise<ChatGPTPromptStartResult>
+): void {
+  chatgptSubmitFlights.set(requestFingerprint, promise)
+  promise.finally(() => {
+    setTimeout(() => {
+      if (chatgptSubmitFlights.get(requestFingerprint) === promise) {
+        chatgptSubmitFlights.delete(requestFingerprint)
+      }
+    }, CHATGPT_DEDUPE_FLIGHT_TTL_MS)
+  }).catch(() => {})
 }
 
 // Narrow a value to a plain object record. Used by the heartbeat
@@ -1114,8 +1193,39 @@ async function ensureChatGPTContentReady(tabId: number): Promise<void> {
 
 async function runChatGPTPrompt(
   payload: ChatGPTPromptPayload
-): Promise<{ success: boolean; accepted?: boolean; jobId?: string; error?: string }> {
+): Promise<ChatGPTPromptStartResult> {
+  const requestFingerprint = chatgptBuildRequestFingerprint(payload)
+  const existingFlight = chatgptSubmitFlights.get(requestFingerprint)
+  if (existingFlight) {
+    const result = await existingFlight
+    if (result.success && result.jobId) {
+      console.warn('[ChatGPT][Background] duplicate submit coalesced to in-flight job:', result.jobId)
+      return { ...result, deduped: true }
+    }
+    return result
+  }
+
+  const flight = runChatGPTPromptLocked(payload, requestFingerprint)
+  chatgptRememberSubmitFlight(requestFingerprint, flight)
+  return flight
+}
+
+async function runChatGPTPromptLocked(
+  payload: ChatGPTPromptPayload,
+  requestFingerprint: string
+): Promise<ChatGPTPromptStartResult> {
   console.log('[ChatGPT][Background] runChatGPTPrompt called, prompt len:', payload.prompt?.length)
+
+  const runningDuplicate = await chatgptFindRunningJobByFingerprint(requestFingerprint)
+  if (runningDuplicate) {
+    console.warn('[ChatGPT][Background] duplicate submit reused running job:', runningDuplicate.jobId)
+    return {
+      success: true,
+      accepted: true,
+      jobId: runningDuplicate.jobId,
+      deduped: true,
+    }
+  }
 
   // 1. Find or create ChatGPT tab (reuse existing helper).
   // Default behavior focuses the tab (GenPanel). Workflow-run
@@ -1153,6 +1263,7 @@ async function runChatGPTPrompt(
     downloaded: 0,
     error: '',
     tabId,
+    requestFingerprint,
   }
   await chatgptWriteJobs(jobs)
   console.log('[ChatGPT][Background] job persisted:', jobId)

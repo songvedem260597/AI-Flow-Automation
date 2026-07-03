@@ -1192,6 +1192,44 @@ function renderPillTrigger(
   `
 }
 
+function getGenerateOutputImageUrls(output: unknown): string[] {
+  const urls: string[] = []
+  const seenObjects = new WeakSet<object>()
+
+  const pushUrl = (value: unknown) => {
+    if (typeof value === 'string' && value.length > 0) urls.push(value)
+  }
+
+  const visit = (value: unknown, depth = 0) => {
+    if (depth > 3 || !value) return
+
+    if (typeof value === 'string') {
+      pushUrl(value)
+      return
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, depth + 1)
+      return
+    }
+
+    if (typeof value !== 'object') return
+    if (seenObjects.has(value)) return
+    seenObjects.add(value)
+
+    const record = value as Record<string, unknown>
+    pushUrl(record.url)
+    pushUrl(record.imageUrl)
+    pushUrl(record.mediaUrl)
+    visit(record.images, depth + 1)
+    visit(record.imageUrls, depth + 1)
+    visit(record.result, depth + 1)
+  }
+
+  visit(output)
+  return Array.from(new Set(urls))
+}
+
 function renderDrawflowNode(node: WorkflowNode) {
   const data = node.data as Record<string, unknown>
   const generateData = node.type === 'generate'
@@ -1258,21 +1296,22 @@ function renderDrawflowNode(node: WorkflowNode) {
 
     // Output preview: if node completed and has images, show first image
     const output = data._output as Record<string, unknown> | undefined
-    const outputImages: Array<{ url: string; source: string }> = (
-      output?.images as Array<{ url: string; source: string }> | undefined
-    ) || []
-    const firstImageUrl = outputImages.length > 0 ? outputImages[0].url : ''
+    const outputImageUrls = getGenerateOutputImageUrls(output)
+    const firstImageUrl = outputImageUrls[0] || ''
     const hasOutput = firstImageUrl.length > 0
-    const outputBadge = outputImages.length > 1
-      ? `<span class="df-node-output-badge">+${outputImages.length - 1}</span>`
+    const outputBadge = outputImageUrls.length > 1
+      ? `<span class="df-node-output-badge">+${outputImageUrls.length - 1}</span>`
       : ''
 
     body = `
       <div class="df-node-preview-wrap df-node-generate-preview-wrap">
         ${hasOutput ? `
-          <div class="df-node-output-preview">
-            <img src="${escapeHtml(firstImageUrl)}" alt="Generated output" draggable="false">
+          <div class="df-node-output-preview df-node-image-upload-target has-image" data-generated-output-preview="true">
+            <img class="df-node-preview-media" src="${escapeHtml(firstImageUrl)}" alt="Generated output" draggable="false">
             ${outputBadge}
+            <button type="button" class="df-node-image-preview-button nodrag" data-node-action="preview-image" title="Preview output" aria-label="Preview output">
+              ${DF_ICONS.zoom}
+            </button>
           </div>
         ` : `
           <div class="df-node-preview ${generateRatioClass}">
@@ -1780,6 +1819,39 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const [activeEdges, setActiveEdges] = useState<Record<string, { source: string; target: string; sourceHandle?: string; targetHandle?: string }>>({})
   const [nodeOutputs, setNodeOutputs] = useState<Record<string, unknown>>({})
 
+  function applyNodeVisualRunState(nodeId: string, status: NodeRunStatus) {
+    const container = document.querySelector('.parent-drawflow')
+    if (!container) return false
+
+    const selectorTried = `[data-workflow-node-id="${CSS.escape(nodeId)}"]`
+    const el = container.querySelector<HTMLElement>(selectorTried)
+    if (!el) return false
+
+    const card =
+      (el.querySelector<HTMLElement>('.df-node-body'))
+      || (el.querySelector<HTMLElement>('.df-node-card'))
+      || (el.querySelector<HTMLElement>('.node-card'))
+      || (el.querySelector<HTMLElement>('.workflow-node-card'))
+      || el
+    const wrapper = el.closest<HTMLElement>('.drawflow-node')
+
+    for (const target of [wrapper, el, card]) {
+      if (!target) continue
+      target.classList.remove('ai-node-running', 'ai-node-completed', 'ai-node-failed')
+      target.removeAttribute('data-run-state')
+    }
+
+    if (status !== 'idle') {
+      for (const target of [wrapper, el, card]) {
+        if (!target) continue
+        target.classList.add(`ai-node-${status}`)
+        target.setAttribute('data-run-state', status)
+      }
+    }
+
+    return true
+  }
+
   // ── Pipeline visual callbacks ─────────────────────────────────────────
   const pipelineCallbacks = useMemo(() => ({
     onNodeStart: (nodeId: string) => {
@@ -1848,6 +1920,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
               if (content) {
                 content.innerHTML = renderDrawflowNode(updatedNode)
                 applyPortAttributesForNode(updatedNode)
+                applyNodeVisualRunState(nodeId, 'completed')
                 attachNodeResizeObserver(nodeId)
                 scheduleDrawflowConnectionRefresh(nodeId)
               }
@@ -1895,12 +1968,19 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     const container = document.querySelector('.parent-drawflow')
     if (!container) return
     for (const [nodeId, status] of Object.entries(nodeRunStates)) {
+      const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
+      const data = (node?.data || {}) as Record<string, unknown>
+      const output = data._output || nodeOutputs[nodeId]
+      const hasSuccessfulOutput =
+        node?.type === 'generate' &&
+        getGenerateOutputImageUrls(output).length > 0
+      const visualStatus: NodeRunStatus = status === 'running' && hasSuccessfulOutput ? 'completed' : status
       const selectorTried = `[data-workflow-node-id="${CSS.escape(nodeId)}"]`
-      const el = container.querySelector(selectorTried)
+      const el = container.querySelector<HTMLElement>(selectorTried)
       if (!el) {
         console.log('[GlowDebug][DOM] apply node state', {
           nodeId,
-          state: status,
+          state: visualStatus,
           found: false,
           selectorTried,
           classNameBefore: '',
@@ -1917,28 +1997,15 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         || (el.querySelector<HTMLElement>('.node-card'))
         || (el.querySelector<HTMLElement>('.workflow-node-card'))
         || el
-      const wrapper = el.closest<HTMLElement>('.drawflow-node')
       const classNameBefore = el.className
-      // Remove all previous states on both wrapper and card
-      for (const target of [wrapper, el, card]) {
-        if (!target) continue
-        target.classList.remove('ai-node-running', 'ai-node-completed', 'ai-node-failed')
-        target.removeAttribute('data-run-state')
-      }
-      if (status !== 'idle') {
-        for (const target of [wrapper, el, card]) {
-          if (!target) continue
-          target.classList.add(`ai-node-${status}`)
-          target.setAttribute('data-run-state', status)
-        }
-      }
+      applyNodeVisualRunState(nodeId, visualStatus)
       const classNameAfter = el.className
       const computedBoxShadow = (() => {
         try { return getComputedStyle(card).boxShadow } catch { return 'error' }
       })()
       console.log('[GlowDebug][DOM] apply node state', {
         nodeId,
-        state: status,
+        state: visualStatus,
         found: true,
         selectorTried,
         classNameBefore,
@@ -2081,7 +2148,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   }
 
   // React side-effect: sync DOM whenever state changes
-  useEffect(() => { syncNodeRunStates() }, [nodeRunStates])
+  useEffect(() => { syncNodeRunStates() }, [nodeRunStates, nodeOutputs])
   useEffect(() => { syncActiveEdges() }, [activeEdges])
 
   const activeTask = tasks.find((task) => task.id === activeTaskId)
@@ -2099,6 +2166,32 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   useEffect(() => {
     workflowRef.current = workflow
   }, [workflow])
+
+  useEffect(() => {
+    const completedGenerateNodeIds = workflow.nodes
+      .filter((node) => node.type === 'generate' && getGenerateOutputImageUrls((node.data as Record<string, unknown>)._output).length > 0)
+      .map((node) => node.id)
+      .filter((nodeId) => nodeRunStates[nodeId] === 'running')
+
+    if (completedGenerateNodeIds.length === 0) return
+
+    setNodeRunStates((prev) => {
+      let changed = false
+      const next = { ...prev }
+
+      for (const nodeId of completedGenerateNodeIds) {
+        if (next[nodeId] !== 'running') continue
+        next[nodeId] = 'completed'
+        changed = true
+      }
+
+      return changed ? next : prev
+    })
+
+    requestAnimationFrame(() => {
+      completedGenerateNodeIds.forEach((nodeId) => applyNodeVisualRunState(nodeId, 'completed'))
+    })
+  }, [dataSignature, nodeRunStates])
 
   useEffect(() => {
     if (inspectorNodeId && !workflow.nodes.some((node) => node.id === inspectorNodeId)) {
@@ -3069,21 +3162,33 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       event.preventDefault()
       event.stopPropagation()
 
-      const nodeEl = button.closest<HTMLElement>('.df-node[data-workflow-node-id][data-node-type="image"]')
+      const nodeEl = button.closest<HTMLElement>('.df-node[data-workflow-node-id]')
       const nodeId = nodeEl?.dataset.workflowNodeId
       if (!nodeId) return
 
       const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
       const data = (node?.data || {}) as Record<string, unknown>
-      const mediaSrc = getMediaNodeSource(data)
-      if (!node || node.type !== 'image' || !mediaSrc) return
+      let mediaSrc = ''
+      let mediaType: MediaNodeType = 'image'
+      let name = String(data.mediaName || data.videoName || data.imageName || data.label || 'Media')
+
+      if (node?.type === 'image') {
+        mediaSrc = getMediaNodeSource(data)
+        mediaType = getMediaNodeType(data)
+      } else if (node?.type === 'generate') {
+        mediaSrc = getGenerateOutputImageUrls(data._output)[0] || ''
+        mediaType = 'image'
+        name = String(data.label || 'Generated output')
+      }
+
+      if (!node || !mediaSrc) return
 
       closeNodePillMenu()
       setSelectedNode(nodeId)
       setImagePreview({
         src: mediaSrc,
-        name: String(data.mediaName || data.videoName || data.imageName || data.label || 'Media'),
-        mediaType: getMediaNodeType(data)
+        name,
+        mediaType
       })
     }
     const preventNativeMediaDrag = (event: DragEvent) => {
