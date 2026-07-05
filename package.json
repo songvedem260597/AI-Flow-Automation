@@ -48,7 +48,8 @@
       "activeTab",
       "scripting",
       "notifications",
-      "windows"
+      "windows",
+      "downloads"
     ],
     "side_panel": {
       "default_path": "sidepanel.html"

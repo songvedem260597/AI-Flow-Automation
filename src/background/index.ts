@@ -448,6 +448,9 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
     case 'DOWNLOAD_FILE':
       return downloadFile(message.payload as { data: string; filename: string; mimeType: string })
 
+    case 'WORKFLOW_DOWNLOAD_OUTPUT':
+      return downloadWorkflowOutput(message.payload as { url: string; filename?: string })
+
     case 'NOTIFICATION':
       return showNotification(message.payload as { title: string; message: string; type?: string })
 
@@ -570,6 +573,15 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
 
     case 'FLOW_UPLOAD_IMAGE': {
       return await uploadImageToFlow(message.payload as UploadImagePayload)
+    }
+
+    case 'FLOW_FETCH_MEDIA_AS_DATA': {
+      // Proxy: the runner cannot fetch labs.google URLs from the side
+      // panel / service worker (cookie + same-origin context lives in
+      // the Flow tab). Forward to flow-content which performs the
+      // fetch with credentials and returns bytes (data URL or
+      // ArrayBuffer) in-memory.
+      return await fetchFlowMediaAsData(message.payload as FlowFetchMediaAsDataPayload)
     }
 
     case 'STORAGE_GET':
@@ -1501,6 +1513,63 @@ async function downloadFile(payload: { data: string; filename: string; mimeType:
   }
 }
 
+// Workflow-output direct download. Routed through the SW so:
+//   1. `chrome.downloads` only has to exist in one place.
+//   2. The browser uses the extension's profile cookies (Flow
+//      asset URLs are signed cookies that the sidepanel can fetch
+//      via the same mechanism).
+//   3. We can normalize a path-relative `/fx/...` URL against the
+//      Flow origin before passing it to chrome.downloads.
+// Owner: shared (Workflow UI only — not Flow or ChatGPT runtime).
+async function downloadWorkflowOutput(
+  payload: { url: string; filename?: string }
+): Promise<{ success: boolean; downloadId?: number; error?: string; url?: string }> {
+  const raw = String(payload?.url || '').trim()
+  if (!raw) {
+    return { success: false, error: 'OUTPUT_DOWNLOAD_URL_MISSING' }
+  }
+  let normalized = raw
+  try {
+    // Repair relative paths against the Flow origin so the SW hands
+    // chrome.downloads an absolute https URL.
+    if (/^\/(fx|tools)\//.test(normalized)) {
+      normalized = 'https://labs.google' + normalized
+    } else if (/^\/\//.test(normalized)) {
+      normalized = 'https:' + normalized
+    }
+  } catch (_) {
+    // ignore — chrome.downloads.download will surface the error.
+  }
+  if (!/^https?:\/\//i.test(normalized)) {
+    return { success: false, error: 'OUTPUT_DOWNLOAD_URL_INVALID', url: normalized }
+  }
+
+  const suggestedFilename = String(payload?.filename || 'flow-output.png').replace(/[\\/:*?"<>|]/g, '_')
+  try {
+    const downloadId = await new Promise<number>((resolve, reject) => {
+      chrome.downloads.download(
+        {
+          url: normalized,
+          filename: suggestedFilename,
+          saveAs: false,
+          conflictAction: 'uniquify',
+        },
+        (id) => {
+          const err = chrome.runtime.lastError
+          if (err || !id) {
+            reject(new Error(err?.message || 'chrome.downloads.download returned no id'))
+          } else {
+            resolve(id)
+          }
+        }
+      )
+    })
+    return { success: true, downloadId, url: normalized }
+  } catch (err) {
+    return { success: false, error: (err as Error).message, url: normalized }
+  }
+}
+
 async function showNotification(payload: { title: string; message: string; type?: string }): Promise<{ success: boolean }> {
   await chrome.notifications.create({
     type: 'basic',
@@ -1542,6 +1611,12 @@ interface UploadImagePayload {
   name: string
   type: string
   base64: string
+}
+
+interface FlowFetchMediaAsDataPayload {
+  url: string
+  maxBytes?: number
+  asArrayBuffer?: boolean
 }
 
 const FLOW_URL = 'https://labs.google/fx/tools/flow'
@@ -1732,6 +1807,108 @@ async function uploadImageToFlow(
     const err = 'chrome.tabs.sendMessage failed: ' + ((e as Error).message || String(e))
     console.error('[Background][FLOW_UPLOAD_IMAGE_RESULT]', JSON.stringify({ key: payload.key, success: false, error: err }))
     return { success: false, key: payload.key, error: err }
+  }
+}
+
+// FLOW_FETCH_MEDIA_AS_DATA — proxy.
+//
+// Why this exists:
+//   The runner (workflow pipeline) needs to forward Flow's output
+//   media bytes to downstream Generate/Media nodes for re-upload.
+//   Flow's CDN URLs (`https://labs.google/fx/api/trpc/...`) require
+//   Flow's auth cookie + same-origin context, which only the Flow
+//   tab has. From the side panel / service worker, fetch() reports
+//   ERR_FILE_NOT_FOUND on a path-relative URL and is missing
+//   credentials on a fully qualified URL.
+//
+//   This proxy asks the Flow tab's flow-content script to perform
+//   the fetch on our behalf. The result is returned in-memory as a
+//   data URL (default) or ArrayBuffer (`asArrayBuffer: true`). We
+//   never persist the bytes to chrome.storage — the caller's intent
+//   is to forward them to an uploader / next-node, not to retain
+//   them across SW wake-ups.
+//
+// Inputs:
+//   payload.url           — absolute https://labs.google/... URL.
+//                           Relative URLs are rejected (the runner
+//                           is expected to ship absolute URLs).
+//   payload.maxBytes      — cap. Default 25 MB. 0 = no cap.
+//   payload.asArrayBuffer — if true, return ArrayBuffer instead of
+//                            data URL.
+//
+// Output:
+//   { success, dataUrl?, arrayBuffer?, mimeType, byteLength, url, error? }
+async function fetchFlowMediaAsData(payload: FlowFetchMediaAsDataPayload): Promise<Record<string, unknown>> {
+  if (!payload || typeof payload.url !== 'string' || !payload.url) {
+    return { success: false, error: 'FLOW_FETCH_MEDIA_AS_DATA: url is required' }
+  }
+  console.log('[FlowTrace][BG] FLOW_FETCH_MEDIA_AS_DATA_START', JSON.stringify({
+    url: payload.url,
+    maxBytes: payload.maxBytes || (25 * 1024 * 1024),
+    asArrayBuffer: payload.asArrayBuffer === true,
+  }))
+
+  // Find the Flow tab. We do NOT auto-create one — the caller
+  // (workflow runner) has already opened it as part of the Generate
+  // node execution. If the tab is missing we surface a clear error.
+  const tabs = await chrome.tabs.query({ url: 'https://labs.google/fx/*' })
+  const flowTab = tabs.find(t => typeof t.url === 'string' && t.url.indexOf('labs.google/fx') !== -1)
+  if (!flowTab || !flowTab.id) {
+    console.error('[FlowTrace][BG] FLOW_FETCH_MEDIA_AS_DATA_NO_TAB', JSON.stringify({ url: payload.url }))
+    return { success: false, error: 'No Flow tab found for FLOW_FETCH_MEDIA_AS_DATA', url: payload.url }
+  }
+  const tabId = flowTab.id
+
+  // Defensive ping to make sure the flow-content onMessage listener is
+  // attached before we fire the request. Mirrors the FLOW_UPLOAD_IMAGE
+  // path's pre-flight ping.
+  try {
+    let contentReady = false
+    for (let attempt = 0; attempt < 5 && !contentReady; attempt++) {
+      try {
+        const ping = await chrome.tabs.sendMessage(tabId, { action: 'FLOW_CONTENT_PING' }) as { success?: boolean } | undefined
+        if (ping && ping.success) { contentReady = true; break }
+      } catch (_) {
+        // Receiving end does not exist / context invalidated — wait and retry.
+        await new Promise((r) => setTimeout(r, 250))
+      }
+    }
+    if (!contentReady) {
+      return { success: false, error: 'FLOW_FETCH_MEDIA_AS_DATA: flow content script not ready', url: payload.url }
+    }
+  } catch (e) {
+    return { success: false, error: 'FLOW_FETCH_MEDIA_AS_DATA ping failed: ' + ((e as Error).message || String(e)), url: payload.url }
+  }
+
+  try {
+    const result = await chrome.tabs.sendMessage(tabId, {
+      action: 'FLOW_FETCH_MEDIA_AS_DATA',
+      payload: {
+        url: payload.url,
+        maxBytes: typeof payload.maxBytes === 'number' ? payload.maxBytes : 25 * 1024 * 1024,
+        asArrayBuffer: payload.asArrayBuffer === true,
+      }
+    }) as Record<string, unknown> | undefined
+    if (!result || result.success !== true) {
+      const err = (result && (result.error as string)) || 'unknown error'
+      console.error('[FlowTrace][BG] FLOW_FETCH_MEDIA_AS_DATA_FAIL', JSON.stringify({ url: payload.url, error: err }))
+      return {
+        success: false,
+        error: err,
+        url: payload.url,
+        byteLength: (result && (result.byteLength as number)) || 0,
+      }
+    }
+    console.log('[FlowTrace][BG] FLOW_FETCH_MEDIA_AS_DATA_OK', JSON.stringify({
+      url: payload.url,
+      mimeType: result.mimeType,
+      byteLength: result.byteLength,
+    }))
+    return result
+  } catch (e) {
+    const err = 'FLOW_FETCH_MEDIA_AS_DATA sendMessage failed: ' + ((e as Error).message || String(e))
+    console.error('[FlowTrace][BG] FLOW_FETCH_MEDIA_AS_DATA_FAIL', JSON.stringify({ url: payload.url, error: err }))
+    return { success: false, error: err, url: payload.url }
   }
 }
 
@@ -2009,19 +2186,31 @@ async function runFlowPrompt(
   }
 
   try {
-    console.log('[FlowTrace][BG] SEND_RUN_FLOW_PROMPT tabId=' + tabId)
+    console.log('[FlowTrace][BG] SEND_RUN_FLOW_PROMPT_START ' + JSON.stringify({
+      tabId,
+      mode: payload.mode,
+      model: payload.model,
+      ratio: payload.aspectRatio,
+      quantity: payload.quantity,
+      autoDownload: payload.autoDownload,
+      fileIdsCount: (payload.fileIds || []).length,
+      promptLen: payload.prompt?.length || 0,
+    }))
     const result = await chrome.tabs.sendMessage(tabId, {
       action: 'RUN_FLOW_PROMPT',
       payload,
       tabId
     })
     console.log('[Background] runFlowPrompt result:', result)
-    console.log('[FlowTrace][BG] SEND_RUN_FLOW_PROMPT_RAW ' + JSON.stringify({
+    console.log('[FlowTrace][BG] SEND_RUN_FLOW_PROMPT_RESPONSE ' + JSON.stringify({
       tabId,
       success: result?.success,
       status: result?.status,
       error: result?.error,
       hasAutoDownload: !!(result?.autoDownload),
+      outputsCount: Array.isArray(result?.outputs) ? (result?.outputs as unknown[]).length : 0,
+      imagesCount: Array.isArray(result?.images) ? (result?.images as unknown[]).length : 0,
+      imageUrlsCount: Array.isArray(result?.imageUrls) ? (result?.imageUrls as unknown[]).length : 0,
       responseRaw: result,
     }))
     return {
@@ -2032,15 +2221,38 @@ async function runFlowPrompt(
       error: result?.error,
       autoDownload: result?.autoDownload,
       downloadDetails: result?.downloadDetails,
+      // Output assets for workflow node preview + downstream media.
+      // Forwarded as-is from flow-content.ts. The runner reads
+      // `outputs` (rich descriptor) and `images` (MediaItem shape) to
+      // populate node output + feed downstream nodes. The UI renderer
+      // reads `imageUrls` (string[]) and walks `images[]` for the
+      // preview thumbnail.
+      outputs: Array.isArray(result?.outputs) ? result?.outputs : [],
+      images: Array.isArray(result?.images) ? result?.images : [],
+      imageUrls: Array.isArray(result?.imageUrls) ? result?.imageUrls : [],
     }
   } catch (e) {
+    const message = (e as Error).message || String(e)
+    const isContextInvalidated =
+      /context invalidated/i.test(message) ||
+      /message channel closed/i.test(message) ||
+      /receiving end does not exist/i.test(message) ||
+      /could not establish connection/i.test(message)
+    const reason = isContextInvalidated ? 'FLOW_CONTENT_CONTEXT_INVALIDATED' : 'FLOW_MESSAGE_NOT_DELIVERED'
     console.error('[Background] sendMessage failed:', e)
+    console.error('[FlowTrace][BG] SEND_RUN_FLOW_PROMPT_LAST_ERROR ' + JSON.stringify({
+      tabId,
+      reason,
+      message,
+      hint: isContextInvalidated ? 'Reload the Flow tab and retry. The content script context closed before replying.' : undefined,
+    }))
     console.error('[FlowTrace][Fail] ' + JSON.stringify({
       step: 'BG.sendMessage',
-      reason: 'FLOW_MESSAGE_NOT_DELIVERED',
-      rawResult: { message: (e as Error).message },
+      reason,
+      rawResult: { message },
+      extra: isContextInvalidated ? { hint: 'Reload the Flow tab and retry.', contextInvalidated: true } : undefined,
     }))
-    return { success: false, error: (e as Error).message }
+    return { success: false, status: reason, error: message }
   }
 }
 

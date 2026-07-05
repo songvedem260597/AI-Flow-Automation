@@ -1696,18 +1696,104 @@ svg.ai-edge-completed path,
   display: block;
 }
 
-.df-node-output-badge {
+/* Top gradient + hover-revealed output control strip for
+   Generate nodes. The gradient mirrors the existing bottom
+   gradient (which sits behind the prompt overlay) so the preview
+   has symmetric top/bottom darkening. The control strip is
+   transparent — no pill background — and only fades in when the
+   user hovers the preview/node so it doesn't visually compete
+   with the image at rest.
+
+   Behavior:
+   - outputs.length > 1:
+     visible: < 1 / 2 > | download
+   - outputs.length === 1:
+     visible: 1 / 1 | download  (or just download)
+   The download button is always rendered when the node has at
+   least one successful output. */
+.df-node-output-top-gradient {
   position: absolute;
-  bottom: 4px;
-  right: 4px;
-  background: rgba(0, 0, 0, 0.72);
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 56px;
+  background: linear-gradient(to bottom, rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0));
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  z-index: 4;
+}
+.df-node-output-carousel-bar {
+  position: absolute;
+  top: 8px;
+  left: 10px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: white;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  backdrop-filter: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  pointer-events: auto;
+}
+.df-node-output-preview:hover .df-node-output-top-gradient,
+.df-node-output-preview:focus-within .df-node-output-top-gradient,
+.df-node-output-preview:hover .df-node-output-carousel-bar,
+.df-node-output-preview:focus-within .df-node-output-carousel-bar,
+.df-node:hover .df-node-output-top-gradient,
+.df-node:hover .df-node-output-carousel-bar {
+  opacity: 1;
+}
+.df-node-output-carousel-prev,
+.df-node-output-carousel-next,
+.df-node-output-carousel-download {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.92);
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+}
+.df-node-output-carousel-prev:hover,
+.df-node-output-carousel-next:hover,
+.df-node-output-carousel-download:hover {
+  background: rgba(255, 255, 255, 0.16);
   color: #fff;
-  font-size: 10px;
-  font-weight: 600;
-  padding: 2px 6px;
-  border-radius: 999px;
-  backdrop-filter: blur(4px);
-  line-height: 1.4;
+}
+.df-node-output-carousel-prev:focus-visible,
+.df-node-output-carousel-next:focus-visible,
+.df-node-output-carousel-download:focus-visible {
+  outline: 1px solid rgba(184, 168, 255, 0.7);
+  outline-offset: 1px;
+}
+.df-node-output-carousel-counter {
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  user-select: none;
+  min-width: 32px;
+  text-align: center;
+  padding: 0 2px;
+}
+.df-node-output-carousel-sep {
+  display: inline-block;
+  width: 1px;
+  height: 14px;
+  background: rgba(255, 255, 255, 0.22);
+  margin: 0 1px;
 }
 
 /* Running spinner on Generate node */

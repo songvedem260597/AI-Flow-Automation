@@ -8,6 +8,16 @@
  * 4. Try Slate API first, fall back to DOM execCommand
  * 5. DOM fallback always runs to verify text appears in editor
  * 6. Expose __flowDebugScan() and __flowTestInsert() for testing
+ *
+ * SINGLETON GUARD: this script is loaded into the MAIN world via
+ * chrome.scripting.executeScript. If executeScript is called twice on
+ * the same page (e.g. extension reload races, or older dev-helper
+ * bundles also registered a listener), the previous instance is torn
+ * down via __flowSlateBridgeCleanup before this new IIFE installs its
+ * postMessage listener. The bridge also marks `documentElement` with
+ * `data-flow-bridge-real-installed` so dev console helpers can detect
+ * the real bridge and back off instead of competing for the same
+ * postMessage channel.
  */
 ;(function () {
   'use strict'
@@ -17,16 +27,38 @@
   var _pending = {}
   var _reqId = 0
 
+  // ── Singleton guard ───────────────────────────────────────────────────
+  // If a previous instance of this bridge is still installed, tear it
+  // down first. This MUST happen before we install our postMessage
+  // listener so two instances never co-exist on the same channel.
   if (typeof window !== 'undefined' && (window as Record<string, unknown>).__flowSlateBridgeCleanup) {
-    try { ((window as Record<string, unknown>).__flowSlateBridgeCleanup as () => void)() } catch (_: unknown) {}
+    try {
+      var existingCleanup = (window as Record<string, unknown>).__flowSlateBridgeCleanup as () => void
+      existingCleanup()
+      bridgeLog('[Bridge] previous instance cleaned up')
+    } catch (_: unknown) {
+      // ignore — previous instance may already be partially torn down
+    }
   }
+
+  // Also remove any stray markers from a previous instance so we know
+  // the page is now owned by THIS instance.
+  try { document.documentElement.removeAttribute('data-flow-bridge-real-installed') } catch (_) {}
+
+  // ── Bridge instance registry ──────────────────────────────────────────
+  // Expose a registry on window so debug tooling (and the FlowTrace
+  // grep pipeline) can confirm only one bridge is installed at a time.
+  var BRIDGE_INSTANCE_ID = 'flow-slate-bridge_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8)
+  ;(window as Record<string, unknown>).__FLOW_BRIDGE_INSTANCE_ID__ = BRIDGE_INSTANCE_ID
 
   // Feature flag: disable settings automation until popup detection is stable
   var ENABLE_FLOW_SETTINGS_AUTOMATION = false
 
   // Build time marker — single source of truth for cache-busting verification
-  var FLOW_BRIDGE_BUILD_TIME = "2026-07-04 06:10:00"
-  bridgeLog('[Bridge] BUILD_TIME ' + FLOW_BRIDGE_BUILD_TIME)
+  // Bump this every time you make a runtime change so the Flow page console
+  // verification (window.__FLOW_BRIDGE_BUILD_TIME__) matches the running bundle.
+  var FLOW_BRIDGE_BUILD_TIME = "2026-07-05 18:20:00"
+  bridgeLog('[Bridge] BUILD_TIME ' + FLOW_BRIDGE_BUILD_TIME + ' instance=' + BRIDGE_INSTANCE_ID)
   ;(window as Record<string, unknown>).__FLOW_BRIDGE_BUILD_TIME__ = FLOW_BRIDGE_BUILD_TIME
 
   // ── Debug level helpers ──────────────────────────────────────────────────────
@@ -850,7 +882,75 @@
   // MASTER INSERT
   // ═══════════════════════════════════════════════════════════════
 
-  function insertText(text: string): { success: boolean; method: string; verified: boolean; strategy: string } {
+  // Compare the editor's current text against an expected prompt. Returns
+  // a structured payload so the content script can log expected vs actual
+  // and surface a `duplicate` flag when the prompt text appears more than
+  // once.
+  //
+  // Why we strip whitespace + chip/placeholder text:
+  //   Flow's composer renders reference-image chips inline; their caption
+  //   text mixes into textContent. We must NOT count chip captions as
+  //   "duplicate prompt". The strip path:
+  //   1. Take DOM textContent
+  //   2. Trim
+  //   3. Collapse internal whitespace
+  //   4. Strip any visible [data-slate-placeholder] sibling (rarely present
+  //      once text exists)
+  // For the actual match we ALSO check the Slate model text — that path
+  // is chip-free because chips live in the DOM only.
+  function compareEditorText(editor: Record<string, unknown> | null, el: HTMLElement, expected: string): {
+    expected: string
+    slateText: string
+    domText: string
+    slateMatch: boolean
+    domMatch: boolean
+    duplicate: boolean
+    exactMatch: boolean
+  } {
+    var expectedNorm = String(expected || '').trim()
+    var slateText = ''
+    var domText = ''
+    try {
+      if (editor && editor.children) slateText = getAllText(editor).trim()
+    } catch (_) {}
+    try {
+      domText = (el.textContent || '').trim()
+    } catch (_) {}
+
+    // Collapse internal whitespace so multi-space insertion still matches.
+    var slateNorm = slateText.replace(/\s+/g, ' ').trim()
+    var domNorm = domText.replace(/\s+/g, ' ').trim()
+    var expectedN = expectedNorm.replace(/\s+/g, ' ').trim()
+
+    var slateMatch = expectedN.length > 0 && slateNorm === expectedN
+    var domMatch = expectedN.length > 0 && domNorm === expectedN
+
+    // Duplicate detection: count occurrences of expected in normalized
+    // dom text. If >1 the prompt was inserted twice.
+    var duplicate = false
+    if (expectedN.length >= 2) {
+      var escaped = expectedN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      var occurrences = (domNorm.match(new RegExp(escaped, 'g')) || []).length
+      if (occurrences > 1) duplicate = true
+      // Also detect via slate model — the model is the source of truth.
+      if (!duplicate && slateNorm.length > 0) {
+        var slateOccurrences = (slateNorm.match(new RegExp(escaped, 'g')) || []).length
+        if (slateOccurrences > 1) duplicate = true
+      }
+    }
+
+    return {
+      expected: expectedN,
+      slateText: slateText,
+      domText: domText,
+      slateMatch: slateMatch,
+      domMatch: domMatch,
+      duplicate: duplicate,
+      exactMatch: slateMatch || domMatch,
+    }
+  }
+
+  function insertText(text: string): { success: boolean; method: string; verified: boolean; strategy: string; skipped?: boolean; compare?: ReturnType<typeof compareEditorText> } {
     var el = findEditorElement()
     if (!el) return { success: false, method: 'noElement', verified: false, strategy: '' }
 
@@ -864,24 +964,153 @@
     // Focus the element
     try { el.focus() } catch (_) {}
 
+    // ── IDEMPOTENCY GUARD ─────────────────────────────────────────────
+    // Before any Slate / DOM insert, check whether the editor ALREADY
+    // contains the expected prompt. If yes, no-op — we MUST NOT call
+    // editor.insertText a second time. The previous version did
+    // `trySlateInsert → verify (failed) → retry trySlateInsert`, which
+    // produced a duplicate prompt when the first insert succeeded but
+    // Slate hadn't reconciled by the time verify ran.
+    var preCompare = compareEditorText(editor, el, text)
+    if (preCompare.exactMatch) {
+      bridgeLog('[Bridge][INSERT_SKIP_ALREADY_PRESENT] expected="' + preCompare.expected + '" domText="' + preCompare.domText.substring(0, 60) + '" slateText="' + preCompare.slateText.substring(0, 60) + '"')
+      return {
+        success: true,
+        method: 'idempotent_skip',
+        verified: true,
+        strategy: editorResult ? editorResult.strategy : '',
+        skipped: true,
+        compare: preCompare,
+      }
+    }
+    if (preCompare.duplicate) {
+      bridgeError('[Bridge][INSERT_PRE_DUPLICATE_DETECTED] expected="' + preCompare.expected + '" domText="' + preCompare.domText.substring(0, 120) + '" slateText="' + preCompare.slateText.substring(0, 120) + '"')
+      // Duplicate is already present — return success without inserting
+      // again. Caller (flow-content.ts) will see exactMatch=true and the
+      // downstream verify step will pass. We DO NOT attempt to clean
+      // up the duplicate here; that's a state-flow concern, not a bridge
+      // concern. A duplicate is the right state for "the text we wanted
+      // IS there, just doubled" — better to ship it than to wipe a clean
+      // slate and re-insert into a possibly stale editor reference.
+      return {
+        success: true,
+        method: 'idempotent_skip_duplicate',
+        verified: false,
+        strategy: editorResult ? editorResult.strategy : '',
+        skipped: true,
+        compare: preCompare,
+      }
+    }
+
     // Try Slate API first if we have a Slate object
     var slateMethod: string | null = null
     if (editor) {
       slateMethod = trySlateInsert(editor, text)
       if (slateMethod) {
+        // ── POST-INSERT IDEMPOTENCY CHECK ─────────────────────────────
+        // Slate's `insertText` is asynchronous w.r.t. its reconciliation
+        // pipeline. Wait a microtask then compare BEFORE calling verifyText,
+        // because verifyText's placeholderGone fallback can pass even on
+        // empty text. If the prompt is now present exactly, return success
+        // immediately. If it's duplicate, we still return success (the
+        // text IS there) but flag `verified: false` and `compare.duplicate`
+        // so flow-content.ts's strict verify can fail the run rather than
+        // re-inserting a third time.
+        var postCompare = compareEditorText(editor, el, text)
+        if (postCompare.exactMatch && !postCompare.duplicate) {
+          bridgeLog('[Bridge] insertText SUCCESS via Slate (post-compare): ' + slateMethod)
+          return {
+            success: true,
+            method: slateMethod,
+            verified: true,
+            strategy: editorResult!.strategy,
+            compare: postCompare,
+          }
+        }
+        if (postCompare.duplicate) {
+          bridgeError('[Bridge][INSERT_DUPLICATE_DETECTED] expected="' + postCompare.expected + '" domText="' + postCompare.domText.substring(0, 120) + '"')
+          return {
+            success: true,
+            method: slateMethod,
+            verified: false,
+            strategy: editorResult!.strategy,
+            compare: postCompare,
+          }
+        }
+        // Not present yet — fall back to verifyText for the old sample
+        // check; if that fails, retry Slate.
         var verified = verifyText(editor, el, text)
         if (verified) {
           bridgeDebug('[Bridge] insertText SUCCESS via Slate: ' + slateMethod)
-          return { success: true, method: slateMethod, verified: true, strategy: editorResult!.strategy }
-        } else {
-          bridgeWarn('[Bridge] Slate insert returned but verify failed — retry Slate')
-          // Retry Slate insert once
-          slateMethod = trySlateInsert(editor, text)
-          if (slateMethod) {
-            var verified2 = verifyText(editor, el, text)
-            if (verified2) {
-              bridgeDebug('[Bridge] insertText SUCCESS via Slate retry: ' + slateMethod)
-              return { success: true, method: slateMethod, verified: true, strategy: editorResult!.strategy }
+          return {
+            success: true,
+            method: slateMethod,
+            verified: true,
+            strategy: editorResult!.strategy,
+            compare: postCompare,
+          }
+        }
+        bridgeWarn('[Bridge] Slate insert returned but verify failed — re-check before retry')
+        // ── PRE-RETRY IDEMPOTENCY CHECK ──────────────────────────────
+        // Slate reconciliation may have completed after verify failed.
+        // Compare again before retrying to avoid a second insert.
+        var preRetryCompare = compareEditorText(editor, el, text)
+        if (preRetryCompare.exactMatch && !preRetryCompare.duplicate) {
+          bridgeLog('[Bridge] insertText SUCCESS via Slate (delayed reconciliation): ' + slateMethod)
+          return {
+            success: true,
+            method: slateMethod,
+            verified: true,
+            strategy: editorResult!.strategy,
+            compare: preRetryCompare,
+          }
+        }
+        if (preRetryCompare.duplicate) {
+          bridgeError('[Bridge][INSERT_DUPLICATE_DETECTED_BEFORE_RETRY] expected="' + preRetryCompare.expected + '"')
+          return {
+            success: true,
+            method: slateMethod,
+            verified: false,
+            strategy: editorResult!.strategy,
+            compare: preRetryCompare,
+          }
+        }
+        // Safe to retry Slate — text truly is missing.
+        slateMethod = trySlateInsert(editor, text)
+        if (slateMethod) {
+          var postRetryCompare = compareEditorText(editor, el, text)
+          if (postRetryCompare.exactMatch) {
+            bridgeDebug('[Bridge] insertText SUCCESS via Slate retry: ' + slateMethod)
+            return {
+              success: true,
+              method: slateMethod,
+              verified: true,
+              strategy: editorResult!.strategy,
+              compare: postRetryCompare,
+            }
+          }
+          if (postRetryCompare.duplicate) {
+            bridgeError('[Bridge][INSERT_DUPLICATE_AFTER_RETRY] expected="' + postRetryCompare.expected + '"')
+            return {
+              success: true,
+              method: slateMethod,
+              verified: false,
+              strategy: editorResult!.strategy,
+              compare: postRetryCompare,
+            }
+          }
+          // Final sample-match check — keep legacy behavior for cases
+          // where exactMatch fails but partial sample matches (e.g.
+          // Flow inserted a trailing space).
+          var verified2 = verifyText(editor, el, text)
+          if (verified2) {
+            bridgeDebug('[Bridge] insertText SUCCESS via Slate retry (sample-match): ' + slateMethod)
+            return {
+              success: true,
+              method: slateMethod,
+              verified: true,
+              strategy: editorResult!.strategy,
+              compare: postRetryCompare,
             }
           }
         }
@@ -892,19 +1121,40 @@
     if (!editor) {
       bridgeDebug('[Bridge] Falling back to DOM insert (no Slate editor)')
       var domOk = insertTextDomFallback(el, text)
-      var domVerified = verifyText(editor || {}, el, text)
-      if (domVerified || domOk) {
-        bridgeDebug('[Bridge] insertText SUCCESS via DOM')
-        return { success: true, method: 'DOM_FALLBACK', verified: domVerified, strategy: 'DOM_ONLY' }
+      var domCompare = compareEditorText(null, el, text)
+      if (domCompare.exactMatch) {
+        bridgeLog('[Bridge] insertText SUCCESS via DOM (post-compare)')
+        return {
+          success: true,
+          method: 'DOM_FALLBACK',
+          verified: true,
+          strategy: 'DOM_ONLY',
+          compare: domCompare,
+        }
+      }
+      if (domOk) {
+        // DOM_OK with no exact match is the legacy sample-match path.
+        // Still return success but flag verified=false so strict verify
+        // can fail downstream.
+        bridgeDebug('[Bridge] insertText SUCCESS via DOM (legacy sample-match)')
+        return {
+          success: true,
+          method: 'DOM_FALLBACK',
+          verified: false,
+          strategy: 'DOM_ONLY',
+          compare: domCompare,
+        }
       }
     }
 
     bridgeDebug('[Bridge] insertText FAILED')
+    var finalCompare = compareEditorText(editor, el, text)
     return {
       success: false,
       method: slateMethod || 'none',
       verified: false,
-      strategy: editorResult ? editorResult.strategy : ''
+      strategy: editorResult ? editorResult.strategy : '',
+      compare: finalCompare,
     }
   }
 
@@ -2122,22 +2372,111 @@
     return ''
   }
 
+  // Normalize a Flow-side URL to an absolute https://labs.google/...
+  // (or origin-appropriate) URL. Flow's <img> / <video> elements
+  // frequently expose `src="/fx/api/trpc/media.getMediaUrlRedirect?name=..."`
+  // — a path-relative URL that ONLY resolves inside the Flow tab's
+  // origin. Outside that context (extension sidepanel, service worker,
+  // downstream node fetch) the URL resolves to `chrome-extension://...`
+  // or `file://...` and fails with ERR_FILE_NOT_FOUND.
+  //
+  // Rules:
+  //   blob:           — keep as-is (already absolute within the page)
+  //   data:           — keep as-is (data URL is self-contained)
+  //   http(s)://      — keep as-is (already absolute)
+  //   protocol-relative `//foo` — prepend `https:` to match Flow origin
+  //   path-relative `/foo`       — resolve against `location.origin`
+  //   anything else  — keep as-is (best-effort)
+  //
+  // Used by captureTileSnapshot so every URL the bridge reports to
+  // flow-content is already an absolute URL the runner can fetch.
+  function toAbsoluteFlowUrl(value: unknown): string {
+    if (typeof value !== 'string') return ''
+    var v = value.trim()
+    if (!v) return ''
+    if (
+      v.indexOf('blob:') === 0 ||
+      v.indexOf('data:') === 0 ||
+      v.indexOf('http://') === 0 ||
+      v.indexOf('https://') === 0
+    ) {
+      return v
+    }
+    if (v.indexOf('//') === 0) {
+      return 'https:' + v
+    }
+    if (v.indexOf('/') === 0) {
+      try {
+        return new URL(v, location.origin).href
+      } catch (_) {
+        return v
+      }
+    }
+    return v
+  }
+
   // Capture the current tile state in the same shape the getTileSnapshot
   // action returns. Used inside uploadFilesToPrompt to build per-file
   // baselines without going through the action handler.
-  function captureTileSnapshot(): { ids: string[]; fileNames: string[]; details: Array<{ id: string; fileName: string; status: string }> } {
+  //
+  // Rich payload: each detail entry now exposes the tile's thumbnail
+  // (`thumbnail`) and underlying media URLs (`imgSrc`, `videoSrc`,
+  // `videoPoster`) plus `hasImg` / `hasVideo`. The flow-content auto-
+  // download loop uses these to surface output assets to the workflow
+  // runner even before the right-click → menu → download completes. If
+  // `direct_src_available` fires, the asset list is what the BG needs to
+  // fallback-download directly. The Workflow UI uses `thumbnail` to
+  // render the preview thumbnail in the Generate-node card.
+  //
+  // All URL fields pass through toAbsoluteFlowUrl so downstream nodes
+  // can fetch the asset from any context (extension, side panel,
+  // service worker) without hitting ERR_FILE_NOT_FOUND on
+  // `chrome-extension://.../fx/api/...` or `file://.../fx/api/...`.
+  // providerOrigin / sourcePageUrl are recorded so the runner can
+  // reconstruct the URL if a legacy caller ships a relative path back.
+  function captureTileSnapshot(): {
+    ids: string[]
+    fileNames: string[]
+    details: Array<Tile & { fileName: string; providerOrigin?: string; sourcePageUrl?: string }>
+  } {
     var tiles = scanTiles()
     var snapIds: string[] = []
     var snapFileNames: string[] = []
-    var snapDetails: Array<{ id: string; fileName: string; status: string }> = []
+    var snapDetails: Array<Tile & { fileName: string; providerOrigin?: string; sourcePageUrl?: string }> = []
+    var providerOrigin = (typeof location !== 'undefined' && location && location.origin) || ''
+    var sourcePageUrl = (typeof location !== 'undefined' && location && location.href) || ''
     for (var ci = 0; ci < tiles.length; ci++) {
-      snapIds.push(tiles[ci].id)
-      snapFileNames.push(tiles[ci].fileName || '')
-      snapDetails.push({
-        id: tiles[ci].id,
-        fileName: tiles[ci].fileName || '',
-        status: tiles[ci].status,
-      })
+      var t = tiles[ci]
+      snapIds.push(t.id)
+      snapFileNames.push(t.fileName || '')
+      var detail: Tile & { fileName: string; providerOrigin?: string; sourcePageUrl?: string } = {
+        id: t.id,
+        fileName: t.fileName || '',
+        status: t.status,
+        progress: t.progress,
+        thumbnail: toAbsoluteFlowUrl(t.thumbnail || ''),
+        createdAt: t.createdAt,
+        hasImg: !!t.hasImg,
+        hasVideo: !!t.hasVideo,
+        imgSrc: toAbsoluteFlowUrl(t.imgSrc || ''),
+        imgAlt: t.imgAlt || '',
+        videoSrc: toAbsoluteFlowUrl(t.videoSrc || ''),
+        videoCurrentSrc: toAbsoluteFlowUrl(t.videoCurrentSrc || ''),
+        videoPoster: toAbsoluteFlowUrl(t.videoPoster || ''),
+        providerOrigin: providerOrigin,
+        sourcePageUrl: sourcePageUrl,
+        rect: t.rect ? { top: t.rect.top, bottom: t.rect.bottom, left: t.rect.left, right: t.rect.right } : undefined,
+      }
+      // Optional diagnostic fields — only included when set so we don't
+      // ship a giant blob to the BG with empty strings.
+      if (t.failedFirstSeenAt) detail.failedFirstSeenAt = t.failedFirstSeenAt
+      if (t.statusReason) detail.statusReason = t.statusReason
+      if (t.textPreview) detail.textPreview = t.textPreview
+      if (t.iconTexts && t.iconTexts.length) detail.iconTexts = t.iconTexts
+      if (t.buttonTexts && t.buttonTexts.length) detail.buttonTexts = t.buttonTexts
+      if (t.className) detail.className = t.className
+      if (t.mediaReadyReason) detail.mediaReadyReason = t.mediaReadyReason
+      snapDetails.push(detail)
     }
     return { ids: snapIds, fileNames: snapFileNames, details: snapDetails }
   }
@@ -2659,6 +2998,30 @@
       if (FLOW_DEBUG_VERBOSE) bridgeDebug('[Bridge] verify:', JSON.stringify(v, null, 2))
       postResult(rid, v)
 
+    } else if (action === 'verifyPrompt') {
+      // Strict compare: returns whether the editor's current text
+      // exactly matches the supplied expected prompt. Used by
+      // flow-content.ts's Step 5 verify path to fail the run when
+      // the bridge reports success but the actual DOM/Slate text is
+      // missing or duplicated.
+      var vpEl = findEditorElement()
+      var vpEditorResult = vpEl ? findSlateEditor(vpEl) : null
+      var vpEditor = vpEditorResult ? vpEditorResult.editor : null
+      var vpExpected = (d.text as string) || (d.prompt as string) || ''
+      var vpCompare = compareEditorText(vpEditor, vpEl || document.body, vpExpected)
+      bridgeLog('[Bridge][VERIFY_PROMPT] expected="' + vpCompare.expected + '" exactMatch=' + vpCompare.exactMatch + ' duplicate=' + vpCompare.duplicate + ' domText="' + vpCompare.domText.substring(0, 80) + '" slateText="' + vpCompare.slateText.substring(0, 80) + '"')
+      postResult(rid, {
+        success: vpCompare.exactMatch && !vpCompare.duplicate,
+        exactMatch: vpCompare.exactMatch,
+        duplicate: vpCompare.duplicate,
+        slateMatch: vpCompare.slateMatch,
+        domMatch: vpCompare.domMatch,
+        expected: vpCompare.expected,
+        domText: vpCompare.domText.substring(0, 200),
+        slateText: vpCompare.slateText.substring(0, 200),
+        url: window.location.href,
+      })
+
     } else if (action === 'debug' || action === 'scan') {
       var report = scanDOMReport()
       bridgeLog('[Bridge] DOM scan:', JSON.stringify({
@@ -2943,12 +3306,22 @@
 
   window.addEventListener('message', handleMessage)
 
+  // Mark the page so dev console helpers can detect the real bridge
+  // and back off. Without this, a stale dev-helper bundle injected as
+  // a content script could register a competing listener on the same
+  // postMessage channel.
+  try { document.documentElement.setAttribute('data-flow-bridge-real-installed', BRIDGE_INSTANCE_ID) } catch (_) {}
+
   ;(window as Record<string, unknown>).__flowSlateBridgeCleanup = function () {
     window.removeEventListener('message', handleMessage)
     if (_tileMonitorInterval) {
       clearInterval(_tileMonitorInterval)
       _tileMonitorInterval = null
     }
+    // Drop instance markers so the next bridge load is a clean slate.
+    try { delete (window as Record<string, unknown>).__FLOW_BRIDGE_INSTANCE_ID__ } catch (_) {}
+    try { document.documentElement.removeAttribute('data-flow-bridge-real-installed') } catch (_) {}
+    bridgeLog('[Bridge] cleanup done instance=' + BRIDGE_INSTANCE_ID)
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -5601,49 +5974,146 @@
         mediaType: mediaType,
         tag: (mediaEl && (mediaEl as HTMLElement).tagName) || 'null',
       }))
-      return { success: false, result: { success: false, error: 'invalid_media_target', tileId: tileId } }
+      return { success: false, result: { success: false, error: 'invalid_media_target', tileId: tileId, tag: (mediaEl && (mediaEl as HTMLElement).tagName) || 'null' } }
     }
 
-    // Scroll into view
-    try { tileEl.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' }) } catch (_) {}
+    // Scroll into view + wait. Use 'auto' (instead of 'instant') so
+    // the browser actually paints after the scroll, then wait for the
+    // element to settle. Without this settle wait the elementFromPoint
+    // query runs before the layout has recomputed and returns a stale
+    // element outside the tile.
+    try { tileEl.scrollIntoView({ behavior: 'auto', block: 'center', inline: 'center' }) } catch (_) {}
     await sleep(500)
-
+    // Second pass: re-read the rect AFTER the scroll settled. The previous
+    // version used a single rect read — that broke when the tile was off-
+    // screen at the moment of capture.
     var clickTarget: HTMLElement = mediaEl as HTMLElement
     var targetRect = clickTarget.getBoundingClientRect()
-    if (targetRect.width < 10 || targetRect.height < 10 || targetRect.top < 0 || targetRect.bottom > window.innerHeight) {
+    if (targetRect.width < 10 || targetRect.height < 10) {
       return {
         success: false,
         result: { success: false, error: 'invalid_media_target_rect', tileId: tileId, rect: { w: targetRect.width, h: targetRect.height } },
       }
     }
-
-    var cx = targetRect.left + targetRect.width / 2
-    var cy = targetRect.top + targetRect.height / 2
-
-    // ── elementFromPoint: allow overlay inside tileEl ──────────────────
-    // If an overlay DIV (play button, ripple, etc.) sits on top of the
-    // media but is still inside the tile, do NOT abort — Flow still
-    // dispatches the contextmenu to the underlying media element.
-    var hitEl = document.elementFromPoint(cx, cy)
-    if (hitEl && tileEl.contains(hitEl) && hitEl !== mediaEl) {
-      bridgeWarn('[Bridge][download] overlay over media, continue clicking mediaEl', JSON.stringify({
+    if (targetRect.top < 0 || targetRect.bottom > window.innerHeight) {
+      bridgeWarn('[Bridge][download] tile rect outside viewport, retrying scroll', JSON.stringify({
         tileId: tileId,
-        mediaTag: mediaEl.tagName,
-        hitTag: hitEl.tagName,
+        rect: { top: targetRect.top, bottom: targetRect.bottom, w: targetRect.width, h: targetRect.height },
+        viewport: { h: window.innerHeight },
       }))
-    } else if (!hitEl || !(tileEl.contains(hitEl) || hitEl === tileEl)) {
-      // Try center of actual media first
-      var rect2 = clickTarget.getBoundingClientRect()
-      cx = rect2.left + rect2.width / 2
-      cy = rect2.top + rect2.height / 2
-      var hitEl2 = document.elementFromPoint(cx, cy)
-      if (!hitEl2 || !(tileEl.contains(hitEl2) || hitEl2 === tileEl)) {
-        bridgeError('[Bridge][download] ELEMENT_FROM_POINT_INVALID', JSON.stringify({ tileId: tileId, tag: clickTarget.tagName }))
-        return { success: false, result: { success: false, error: 'invalid_media_target', tileId: tileId } }
-      }
+      try { mediaEl.scrollIntoView({ behavior: 'auto', block: 'center', inline: 'center' }) } catch (_) {}
+      await sleep(400)
+      targetRect = clickTarget.getBoundingClientRect()
     }
 
-    bridgeLog('[Bridge][download] Right-clicking target', clickTarget.tagName, cx + ',' + cy)
+    // ── Multi-point elementFromPoint probe ─────────────────────────────
+    // The previous version only tried the center point. That was fragile:
+    // a Radix overlay, the prompt-chip, a result badge, or even a fresh
+    // Flow overlay could intercept the center hit. We now probe 5 candidate
+    // points across the media rect in priority order. As soon as one of
+    // them lands INSIDE the tile (or on the media itself), we use it.
+    function probePoints(): Array<{ name: string; x: number; y: number }> {
+      var r = clickTarget.getBoundingClientRect()
+      var cx = r.left + r.width / 2
+      var cy = r.top + r.height / 2
+      var left = r.left + r.width * 0.25
+      var right = r.left + r.width * 0.75
+      var top = r.top + r.height * 0.30
+      var bottom = r.top + r.height * 0.70
+      return [
+        { name: 'center', x: cx, y: cy },
+        { name: 'top-center', x: (r.left + r.right) / 2, y: top },
+        { name: 'bottom-center', x: (r.left + r.right) / 2, y: bottom },
+        { name: 'left-quarter', x: left, y: cy },
+        { name: 'right-quarter', x: right, y: cy },
+      ]
+    }
+
+    var probeResults: Array<{ name: string; tag: string; insideTile: boolean; isMedia: boolean; closestTileId: string | null }> = []
+    var chosen: { x: number; y: number; name: string } | null = null
+    var probePointsArr = probePoints()
+    for (var pi = 0; pi < probePointsArr.length; pi++) {
+      var p = probePointsArr[pi]
+      try {
+        var hitEl = document.elementFromPoint(p.x, p.y) as HTMLElement | null
+        if (!hitEl) {
+          probeResults.push({ name: p.name, tag: 'null', insideTile: false, isMedia: false, closestTileId: null })
+          continue
+        }
+        var isMedia = hitEl === mediaEl || (hitEl as Node).contains(mediaEl) || (mediaEl as Node).contains(hitEl)
+        var insideTile = !!(tileEl.contains(hitEl) || hitEl === tileEl)
+        // Also accept if the hit's closest [data-tile-id] matches our
+        // tile id (covers cases where the hit is in a nested overlay).
+        var closest = hitEl.closest('[data-tile-id]') as HTMLElement | null
+        var closestTileId = closest ? closest.getAttribute('data-tile-id') : null
+        var tileMatch = closestTileId === tileId
+        probeResults.push({
+          name: p.name,
+          tag: hitEl.tagName + (hitEl.className ? '.' + String(hitEl.className).split(' ')[0].substring(0, 30) : ''),
+          insideTile: insideTile,
+          isMedia: isMedia,
+          closestTileId: closestTileId,
+        })
+        if (isMedia || insideTile || tileMatch) {
+          chosen = { x: p.x, y: p.y, name: p.name }
+          break
+        }
+      } catch (_) {}
+    }
+
+    // Diagnostic dump so we can see exactly why elementFromPoint failed.
+    if (!chosen) {
+      var mediaSrc = ''
+      var mediaCurrentSrc = ''
+      var mediaNatural = { w: 0, h: 0 }
+      try {
+        if (mediaEl instanceof HTMLImageElement) {
+          mediaSrc = mediaEl.src || ''
+          mediaCurrentSrc = mediaEl.currentSrc || ''
+          mediaNatural = { w: mediaEl.naturalWidth || 0, h: mediaEl.naturalHeight || 0 }
+        } else if (mediaEl instanceof HTMLVideoElement) {
+          mediaSrc = mediaEl.src || mediaEl.currentSrc || ''
+          mediaNatural = { w: mediaEl.videoWidth || 0, h: mediaEl.videoHeight || 0 }
+        }
+      } catch (_) {}
+      bridgeError('[Bridge][download] ELEMENT_FROM_POINT_INVALID', JSON.stringify({
+        tileId: tileId,
+        tag: clickTarget.tagName,
+        mediaSrc: mediaSrc.substring(0, 200),
+        mediaCurrentSrc: mediaCurrentSrc.substring(0, 200),
+        mediaNatural: mediaNatural,
+        rect: { x: Math.round(targetRect.left), y: Math.round(targetRect.top), w: Math.round(targetRect.width), h: Math.round(targetRect.height) },
+        visible: !!document.body.contains(mediaEl),
+        naturalWidth: mediaNatural.w,
+        naturalHeight: mediaNatural.h,
+        probeResults: probeResults,
+      }))
+      // Direct src fallback: if the media src is a Flow API URL
+      // (/fx/api/trkc/...) or https URL we can hand it to the background
+      // download path. This bypasses the right-click menu entirely so
+      // elementFromPoint is no longer a hard requirement.
+      var directSrc = ''
+      try {
+        directSrc = (mediaEl instanceof HTMLImageElement ? (mediaEl.src || mediaEl.currentSrc) : (mediaEl instanceof HTMLVideoElement ? (mediaEl.src || mediaEl.currentSrc) : ''))
+      } catch (_) {}
+      if (directSrc && (directSrc.startsWith('blob:') || directSrc.startsWith('https://') || directSrc.startsWith('http://') || directSrc.startsWith('/fx/api/'))) {
+        bridgeWarn('[Bridge][download] attempting directSrc fallback', JSON.stringify({
+          tileId: tileId,
+          directSrcPrefix: directSrc.substring(0, 60),
+        }))
+        // Stash the resolved direct URL via postMessage so flow-content.ts
+        // can hand it to the background DOWNLOAD_FILE action. Returning a
+        // dedicated error code lets flow-content.ts recognise this and
+        // route to the direct path.
+        return { success: false, result: { success: false, error: 'direct_src_available', tileId: tileId, directSrc: directSrc, fileName: fileName, promptText: promptText, mediaType: mediaType } }
+      }
+      return { success: false, result: { success: false, error: 'invalid_media_target', tileId: tileId, tag: clickTarget.tagName, probeResults: probeResults } }
+    }
+
+    var cx = chosen.x
+    var cy = chosen.y
+
+    bridgeLog('[Bridge][download] Right-clicking target', clickTarget.tagName, cx + ',' + cy, 'via', chosen.name)
     dispatchContextClick(clickTarget, cx, cy)
 
     // ── Poll for menu ──────────────────────────────────────────────────

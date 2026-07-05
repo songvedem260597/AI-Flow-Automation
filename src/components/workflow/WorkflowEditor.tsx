@@ -1028,6 +1028,7 @@ const DF_ICONS = {
   wait: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/></svg>',
   trash: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>',
   zoom: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M11 8v6"/><path d="M8 11h6"/></svg>',
+  download: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
   brandFlow: '<svg width="16" height="16" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M20.616 10.835a14.147 14.147 0 0 1-4.45-3.001 14.111 14.111 0 0 1-3.678-6.452.503.503 0 0 0-.975 0 14.134 14.134 0 0 1-3.679 6.452 14.155 14.155 0 0 1-4.45 3.001c-.65.28-1.318.505-2.002.678a.502.502 0 0 0 0 .975c.684.172 1.35.397 2.002.677a14.147 14.147 0 0 1 4.45 3.001 14.112 14.112 0 0 1 3.679 6.453.502.502 0 0 0 .975 0c.172-.685.397-1.351.677-2.003a14.145 14.145 0 0 1 3.001-4.45 14.113 14.113 0 0 1 6.453-3.678.503.503 0 0 0 0-.975 13.245 13.245 0 0 1-2.003-.678z" fill="#3186FF"/></svg>',
   brandOpenAI: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M22.282 9.821a5.985 5.985 0 0 0-.516-4.91 6.046 6.046 0 0 0-6.51-2.9A6.065 6.065 0 0 0 4.981 4.18a5.985 5.985 0 0 0-3.998 2.9 6.046 6.046 0 0 0 .743 7.097 5.98 5.98 0 0 0 .51 4.911 6.051 6.051 0 0 0 6.515 2.9A5.985 5.985 0 0 0 13.26 24a6.056 6.056 0 0 0 5.772-4.206 5.99 5.99 0 0 0 3.997-2.9 6.056 6.056 0 0 0-.747-7.073zM13.26 22.43a4.476 4.476 0 0 1-2.876-1.04l.141-.081 4.779-2.758a.795.795 0 0 0 .392-.681v-6.737l2.02 1.168a.071.071 0 0 1 .038.052v5.583a4.504 4.504 0 0 1-4.494 4.494zM3.6 18.304a4.47 4.47 0 0 1-.535-3.014l.142.085 4.783 2.759a.771.771 0 0 0 .78 0l5.843-3.369v2.332a.08.08 0 0 1-.033.062L9.74 19.95a4.5 4.5 0 0 1-6.14-1.646zM2.34 7.896a4.485 4.485 0 0 1 2.366-1.973V11.6a.766.766 0 0 0 .388.676l5.815 3.355-2.02 1.168a.076.076 0 0 1-.071 0l-4.83-2.786A4.504 4.504 0 0 1 2.34 7.872zm16.597 3.855-5.833-3.387L15.119 7.2a.076.076 0 0 1 .071 0l4.83 2.791a4.494 4.494 0 0 1-.676 8.105v-5.678a.79.79 0 0 0-.407-.667zm2.01-3.023-.141-.085-4.774-2.782a.776.776 0 0 0-.785 0L9.409 9.23V6.897a.066.066 0 0 1 .028-.061l4.83-2.787a4.5 4.5 0 0 1 6.68 4.66zm-12.64 4.135-2.02-1.164a.08.08 0 0 1-.038-.057V6.075a4.5 4.5 0 0 1 7.375-3.453l-.142.08L8.704 5.46a.795.795 0 0 0-.393.681zm1.097-2.365 2.602-1.5 2.607 1.5v2.999l-2.597 1.5-2.607-1.5z"/></svg>',
   brandGrok: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M9.27 15.29l7.978-5.897c.391-.29.95-.177 1.137.272.98 2.369.542 5.215-1.41 7.169-1.951 1.954-4.667 2.382-7.149 1.406l-2.711 1.257c3.889 2.661 8.611 2.003 11.562-.953 2.341-2.344 3.066-5.539 2.388-8.42l.006.007c-.983-4.232.242-5.924 2.75-9.383.06-.082.12-.164.179-.248l-3.301 3.305v-.01L9.267 15.292M7.623 16.723c-2.792-2.67-2.31-6.801.071-9.184 1.761-1.763 4.647-2.483 7.166-1.425l2.705-1.25a7.808 7.808 0 0 0-1.829-1A8.975 8.975 0 0 0 5.984 5.83c-2.533 2.536-3.33 6.436-1.962 9.764 1.022 2.487-.653 4.246-2.34 6.022-.599.63-1.199 1.259-1.682 1.925l7.62-6.815"/></svg>'
@@ -1239,6 +1240,107 @@ function getGenerateOutputImageUrls(output: unknown): string[] {
   return Array.from(new Set(urls))
 }
 
+// Safe download helper for Generate-node outputs.
+//
+// Routing strategy (in order):
+//   1. `chrome.runtime.sendMessage` → background `WORKFLOW_DOWNLOAD_OUTPUT`
+//      → `chrome.downloads.download` in the SW. This is the canonical
+//      path; `chrome.downloads` is GUARANTEED to exist in the SW
+//      context (manifest declares `downloads` permission).
+//   2. Direct `chrome.downloads.download` if the UI context happens to
+//      have it bound. Guarded with `chrome?.downloads?.download` so we
+//      don't crash in contexts where the API isn't exposed.
+//   3. Anchor-click fallback. Only viable for same-origin URLs — for
+//      cross-origin (`https://labs.google/...`) it opens a new tab.
+//      Best-effort only, but at least the user gets the file.
+//
+// Why we don't just call chrome.downloads from the sidepanel:
+//   The previous direct call threw "Cannot read properties of
+//   undefined (reading 'download')" in some UI contexts. The SW
+//   side of `chrome.runtime.sendMessage` never throws on API
+//   presence — chrome.* APIs are always defined inside the SW.
+//
+// Owner: shared (workflow UI only — not Flow or ChatGPT runtime).
+async function downloadWorkflowOutputAsset(args: {
+  url: string
+  filename: string
+  nodeId: string
+  selectedOutputIndex: number
+}): Promise<{ ok: boolean; path?: string; reason?: string }> {
+  const { url, filename } = args
+  if (!url) return { ok: false, reason: 'OUTPUT_DOWNLOAD_URL_MISSING' }
+
+  // 1) SW route — preferred.
+  try {
+    if (typeof globalThis !== 'undefined' && globalThis.chrome?.runtime?.sendMessage) {
+      const response = await new Promise<{ success?: boolean; downloadId?: number; error?: string }>((resolve) => {
+        try {
+          globalThis.chrome.runtime.sendMessage(
+            { action: 'WORKFLOW_DOWNLOAD_OUTPUT', payload: { url, filename } },
+            (res) => resolve(res || {})
+          )
+        } catch (e) {
+          resolve({ success: false, error: (e as Error).message })
+        }
+      })
+      if (response && response.success) {
+        return { ok: true, path: `sw:downloadId=${response.downloadId ?? '?'}` }
+      }
+      // SW failed — fall through to direct call (still safe to try).
+    }
+  } catch (err) {
+    // ignore — fall through
+  }
+
+  // 2) Direct call — only if the UI context has it bound.
+  try {
+    const chromeApi = (typeof globalThis !== 'undefined' ? (globalThis as any).chrome : undefined)
+    if (chromeApi?.downloads?.download) {
+      const downloadId = await new Promise<number>((resolve, reject) => {
+        try {
+          chromeApi.downloads.download(
+            {
+              url,
+              filename,
+              saveAs: false,
+              conflictAction: 'uniquify',
+            },
+            (id: number | undefined) => {
+              const err = chromeApi.runtime?.lastError
+              if (err || !id) {
+                reject(new Error(err?.message || 'chrome.downloads.download returned no id'))
+              } else {
+                resolve(id)
+              }
+            }
+          )
+        } catch (e) {
+          reject(e)
+        }
+      })
+      return { ok: true, path: `ui:downloadId=${downloadId}` }
+    }
+  } catch (err) {
+    // ignore — fall through to anchor fallback
+  }
+
+  // 3) Anchor-click fallback. Same-origin works via download attr;
+  //    cross-origin opens in a new tab. User still gets the file.
+  try {
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    a.target = '_blank'
+    a.rel = 'noopener noreferrer'
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    return { ok: true, path: 'anchor:fallback' }
+  } catch (err) {
+    return { ok: false, reason: (err as Error).message || 'OUTPUT_DOWNLOAD_FAILED' }
+  }
+}
+
 function renderDrawflowNode(node: WorkflowNode) {
   const data = node.data as Record<string, unknown>
   const generateData = node.type === 'generate'
@@ -1305,24 +1407,48 @@ function renderDrawflowNode(node: WorkflowNode) {
     const quantityValue = String(generateData.quantity ?? 1)
     const quantityOptions = isGoogleFlow ? GENERATE_QUANTITY_OPTIONS : []
 
-    // Output preview: if node completed and has images, show first image
+    // Output preview: if node completed and has images, show the
+    // user's currently selected image in a carousel. When the user
+    // has multiple outputs (e.g. quantity=2), the carousel bar
+    // (top-left of the preview) lets them click prev/next to switch
+    // which asset downstream nodes receive. The default is index 0
+    // (the first asset).
     const output = data._output as Record<string, unknown> | undefined
     const outputImageUrls = getGenerateOutputImageUrls(output)
-    const firstImageUrl = outputImageUrls[0] || ''
+    const hasMultipleOutputs = outputImageUrls.length > 1
+    const selectedOutputIndex = Math.max(0, Math.min(
+      outputImageUrls.length - 1,
+      Number((data as Record<string, unknown>).selectedOutputIndex) || 0
+    ))
+    const firstImageUrl = outputImageUrls[selectedOutputIndex] || outputImageUrls[0] || ''
     const hasOutput = firstImageUrl.length > 0
-    const outputBadge = outputImageUrls.length > 1
-      ? `<span class="df-node-output-badge">+${outputImageUrls.length - 1}</span>`
-      : ''
 
     body = `
       <div class="df-node-preview-wrap df-node-generate-preview-wrap">
         ${hasOutput ? `
-          <div class="df-node-output-preview df-node-image-upload-target has-image" data-generated-output-preview="true">
+          <div class="df-node-output-preview df-node-image-upload-target has-image" data-generated-output-preview="true" data-selected-output-index="${selectedOutputIndex}">
             <img class="df-node-preview-media" src="${escapeHtml(firstImageUrl)}" alt="Generated output" draggable="false">
-            ${outputBadge}
+            <span class="df-node-output-top-gradient" aria-hidden="true"></span>
             <button type="button" class="df-node-image-preview-button nodrag" data-node-action="preview-image" title="Preview output" aria-label="Preview output">
               ${DF_ICONS.zoom}
             </button>
+            <div class="df-node-output-carousel-bar nodrag" role="group" aria-label="Output carousel">
+              ${hasMultipleOutputs ? `
+                <button type="button" class="df-node-output-carousel-prev nodrag" data-node-action="output-prev" title="Previous output" aria-label="Previous output">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+                </button>
+                <span class="df-node-output-carousel-counter" aria-live="polite">${selectedOutputIndex + 1} / ${outputImageUrls.length}</span>
+                <button type="button" class="df-node-output-carousel-next nodrag" data-node-action="output-next" title="Next output" aria-label="Next output">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+                </button>
+                <span class="df-node-output-carousel-sep" aria-hidden="true"></span>
+              ` : `
+                <span class="df-node-output-carousel-counter" aria-live="polite">${outputImageUrls.length === 1 ? '1 / 1' : ''}</span>
+              `}
+              <button type="button" class="df-node-output-carousel-download nodrag" data-node-action="output-download" data-output-index="${selectedOutputIndex}" title="Download current output" aria-label="Download current output">
+                ${DF_ICONS.download}
+              </button>
+            </div>
           </div>
         ` : `
           <div class="df-node-preview ${generateRatioClass}">
@@ -2016,7 +2142,19 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         setNodeOutputs((prev) => ({ ...prev, [nodeId]: output }))
         const completedNode = workflow.nodes.find((n: WorkflowNode) => n.id === nodeId)
         if (completedNode?.type === 'generate') {
-          updateNode(nodeId, { _output: output } as Partial<FlowNodeData>)
+          // Persist a default `selectedOutputIndex = 0` on the node
+          // data if the user hasn't picked one yet. The runner reads
+          // this to decide which single asset to forward to the
+          // downstream node when the upstream produced N>1 assets.
+          // Without this default, the runner falls back to 0 anyway,
+          // but storing it explicitly makes the runner's read path
+          // and the UI's read path agree on every lookup.
+          const completedData = (completedNode.data || {}) as Record<string, unknown>
+          const nextData: Record<string, unknown> = { _output: output }
+          if (typeof completedData.selectedOutputIndex !== 'number') {
+            nextData.selectedOutputIndex = 0
+          }
+          updateNode(nodeId, nextData as Partial<FlowNodeData>)
         }
         // Refresh node DOM so Generate node shows output preview.
         // We intentionally DO NOT activate outgoing edges here — the
@@ -2029,7 +2167,17 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
           if (domNode) {
             const node = workflow.nodes.find((n: WorkflowNode) => n.id === nodeId)
             if (node) {
-              const updatedNode = { ...node, data: { ...node.data, _output: output } }
+              const nodeData = (node.data || {}) as Record<string, unknown>
+              // Include selectedOutputIndex in the DOM-rendering
+              // snapshot so the carousel renders with the right
+              // initial index (the persisted value, not undefined).
+              const renderPatch: Record<string, unknown> = { _output: output }
+              if (typeof nodeData.selectedOutputIndex === 'number') {
+                renderPatch.selectedOutputIndex = nodeData.selectedOutputIndex
+              } else {
+                renderPatch.selectedOutputIndex = 0
+              }
+              const updatedNode = { ...node, data: { ...node.data, ...renderPatch } }
               const content = domNode.closest('.drawflow_content_node') || domNode.parentElement
               if (content) {
                 content.innerHTML = renderDrawflowNode(updatedNode)
@@ -3513,6 +3661,173 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         mediaType
       })
     }
+    const handleOutputCarouselClick = (event: MouseEvent) => {
+      const target = event.target instanceof Element ? event.target : null
+      const button = target?.closest<HTMLButtonElement>(
+        '.df-node-output-carousel-prev[data-node-action="output-prev"], .df-node-output-carousel-next[data-node-action="output-next"]'
+      )
+      if (!button) return
+
+      event.preventDefault()
+      event.stopPropagation()
+
+      const nodeEl = button.closest<HTMLElement>('.df-node[data-workflow-node-id]')
+      const nodeId = nodeEl?.dataset.workflowNodeId
+      if (!nodeId) return
+
+      const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
+      if (!node || node.type !== 'generate') return
+
+      const data = (node.data || {}) as Record<string, unknown>
+      const output = data._output as Record<string, unknown> | undefined
+      const outputImageUrls = getGenerateOutputImageUrls(output)
+      if (outputImageUrls.length <= 1) return
+
+      const currentIndex = Math.max(
+        0,
+        Math.min(outputImageUrls.length - 1, Number(data.selectedOutputIndex) || 0)
+      )
+      const direction = button.dataset.nodeAction === 'output-next' ? 1 : -1
+      const nextIndex = (currentIndex + direction + outputImageUrls.length) % outputImageUrls.length
+
+      setSelectedNode(nodeId)
+      updateNode(nodeId, { selectedOutputIndex: nextIndex } as Partial<FlowNodeData>)
+      // Mirror the new selection into `nodeOutputs` so the runner's
+      // live `context[edge.source]` reflects the user's choice. The
+      // runner reads `value.selectedOutputIndex` first, then falls
+      // back to `sourceNode.data.selectedOutputIndex`; mirroring into
+      // the live context covers both the next-run and any in-flight
+      // reader. We also keep the existing `_output` shape so the
+      // rest of the Generate node's contract stays intact.
+      if (output && typeof output === 'object') {
+        setNodeOutputs((prev) => ({
+          ...prev,
+          [nodeId]: { ...(prev[nodeId] as Record<string, unknown> | undefined), selectedOutputIndex: nextIndex },
+        }))
+      }
+      // Re-render this node's DOM so the carousel counter / img src
+      // reflect the new selection without waiting for a workflow
+      // re-run.
+      requestAnimationFrame(() => {
+        const domNode = document.querySelector(`[data-workflow-node-id="${CSS.escape(nodeId)}"]`)
+        if (!domNode) return
+        const refreshed = workflowRef.current.nodes.find((item) => item.id === nodeId)
+        if (!refreshed) return
+        const updatedNode = {
+          ...refreshed,
+          data: { ...refreshed.data, selectedOutputIndex: nextIndex },
+        }
+        const content = domNode.closest('.drawflow_content_node') || domNode.parentElement
+        if (content) {
+          content.innerHTML = renderDrawflowNode(updatedNode)
+          applyPortAttributesForNode(updatedNode)
+        }
+      })
+    }
+    const handleOutputDownloadClick = (event: MouseEvent) => {
+      const target = event.target instanceof Element ? event.target : null
+      const button = target?.closest<HTMLButtonElement>(
+        '.df-node-output-carousel-download[data-node-action="output-download"]'
+      )
+      if (!button) return
+
+      event.preventDefault()
+      event.stopPropagation()
+
+      const nodeEl = button.closest<HTMLElement>('.df-node[data-workflow-node-id]')
+      const nodeId = nodeEl?.dataset.workflowNodeId
+      if (!nodeId) return
+
+      const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
+      if (!node || node.type !== 'generate') return
+
+      const data = (node.data || {}) as Record<string, unknown>
+      const output = data._output as Record<string, unknown> | undefined
+      if (!output) return
+
+      // Always resolve which asset the user is currently looking at
+      // by reading `data.selectedOutputIndex` at click time. The
+      // button's `data-output-index` attribute is a render-time
+      // snapshot — we still use the live data so a click right after
+      // a carousel wrap-around still hits the correct asset.
+      const outputImageUrls = getGenerateOutputImageUrls(output)
+      if (outputImageUrls.length === 0) return
+      const selectedOutputIndex = Math.max(
+        0,
+        Math.min(outputImageUrls.length - 1, Number(data.selectedOutputIndex) || 0)
+      )
+
+      // Prefer the rich `outputs[]` asset descriptor so we keep the
+      // saved filename and mimeType that auto-download produced. Fall
+      // back to `imageUrls[]` for bundles that pre-date the
+      // `outputs[]` enrichment.
+      const outputs = Array.isArray(output.outputs)
+        ? (output.outputs as unknown[]).filter((o): o is Record<string, unknown> => !!o && typeof o === 'object')
+        : []
+      const asset = outputs[selectedOutputIndex] || {}
+      const assetUrl =
+        (typeof asset.url === 'string' && asset.url) ||
+        (typeof asset.mediaUrl === 'string' && asset.mediaUrl) ||
+        (typeof asset.imageUrl === 'string' && asset.imageUrl) ||
+        (typeof asset.thumbnailUrl === 'string' && asset.thumbnailUrl) ||
+        outputImageUrls[selectedOutputIndex] ||
+        outputImageUrls[0] ||
+        ''
+      if (!assetUrl) return
+
+      // Build a sane filename. If the asset was already saved locally
+      // (`savedFilename`) we use its basename so the user gets a
+      // familiar name; otherwise we synthesize one from the index.
+      const savedName =
+        (typeof asset.savedFilename === 'string' && asset.savedFilename) ||
+        (typeof asset.fileNameFromFlow === 'string' && asset.fileNameFromFlow) ||
+        (typeof asset.name === 'string' && asset.name) ||
+        ''
+      const baseNameRaw = savedName
+        ? savedName.split(/[\\/]/).pop() || savedName
+        : `flow-output-${selectedOutputIndex + 1}.${(typeof asset.mediaType === 'string' && asset.mediaType === 'video') || (typeof asset.type === 'string' && asset.type === 'video') ? 'mp4' : 'png'}`
+      const baseName = baseNameRaw.replace(/\.(png|jpg|jpeg|webp|mp4|mov|webm|gif)$/i, '')
+      const isVideo =
+        assetUrl.includes('.mp4') ||
+        assetUrl.includes('video') ||
+        (typeof asset.mediaType === 'string' && asset.mediaType === 'video') ||
+        (typeof asset.type === 'string' && asset.type === 'video')
+      const suggestedFilename = `${baseName}.${isVideo ? 'mp4' : 'png'}`
+
+      // Resolve a download URL — never use the local savedFilename
+      // as a URL (file:// is blocked from extension origins in MV3).
+      const downloadUrl = assetUrl
+
+      // Kick off the download through the SW so `chrome.downloads`
+      // only has to exist in one place. We never call it directly
+      // from the UI because some UI contexts (devtools, isolated
+      // sidepanel sub-frames, etc.) don't bind `chrome.downloads`,
+      // and the SW owns the canonical download path for the
+      // extension.
+      downloadWorkflowOutputAsset({
+        url: downloadUrl,
+        filename: suggestedFilename,
+        nodeId,
+        selectedOutputIndex,
+      }).then((result) => {
+        if (result.ok) {
+          console.log('[Workflow][OutputDownload] download started', {
+            nodeId,
+            selectedOutputIndex,
+            filename: suggestedFilename,
+            path: result.path,
+          })
+        } else {
+          console.warn('[Workflow][OutputDownload] failed', {
+            nodeId,
+            selectedOutputIndex,
+            reason: result.reason,
+            url: downloadUrl,
+            filename: suggestedFilename,
+          })
+        }
+      })
+    }
     const preventNativeMediaDrag = (event: DragEvent) => {
       const target = event.target instanceof Element ? event.target : null
       if (!target?.closest('.df-node-preview-media, .df-node-preview-image, .df-node-image-upload-target')) return
@@ -3552,6 +3867,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     canvasEl.addEventListener('click', handleNodePillClick)
     canvasEl.addEventListener('click', handleNodeToolbarClick)
     canvasEl.addEventListener('click', handleImagePreviewClick)
+    canvasEl.addEventListener('click', handleOutputCarouselClick)
+    canvasEl.addEventListener('click', handleOutputDownloadClick)
     canvasEl.addEventListener('dragstart', preventNativeMediaDrag, true)
     canvasEl.addEventListener('wheel', zoomOnWheel, { passive: false })
 
