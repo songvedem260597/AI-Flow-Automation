@@ -2,7 +2,7 @@ import React, { useState, useRef, useCallback, useEffect } from 'react'
 import {
   Send, Upload, Bookmark, Minus, Plus, Trash2,
   Image as ImageIcon, Video, ChevronDown, Download, RotateCcw,
-  Search, X, Star, FileText, GripVertical
+  Search, X, FileText, GripVertical
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -167,12 +167,25 @@ const Toggle: React.FC<{ checked: boolean; onChange: (v: boolean) => void }> = (
 
 // ─── Style Dropdown ──────────────────────────────────────────────────────────
 
-const StyleDropdown: React.FC<{ value: string; onChange: (v: string) => void }> = ({ value, onChange }) => {
+type CompactDropdownOption = {
+  value: string
+  label: string
+}
+
+const CompactDropdown: React.FC<{
+  value: string
+  options: CompactDropdownOption[]
+  onChange: (v: string) => void
+  icon?: React.ReactNode
+  className?: string
+  menuClassName?: string
+  searchable?: boolean
+}> = ({ value, options, onChange, icon, className, menuClassName, searchable }) => {
   const [open, setOpen] = useState(false)
-  const [search, setSearch] = useState('')
+  const [query, setQuery] = useState('')
   const ref = useRef<HTMLDivElement>(null)
 
-  const selected = STYLES.find((s) => s.id === value)
+  const selected = options.find((option) => option.value === value)
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -182,60 +195,85 @@ const StyleDropdown: React.FC<{ value: string; onChange: (v: string) => void }> 
     return () => document.removeEventListener('mousedown', handler)
   }, [])
 
-  const filtered = STYLES.filter((s) => s.name.toLowerCase().includes(search.toLowerCase()))
+  useEffect(() => {
+    if (!open) setQuery('')
+  }, [open])
+
+  const filtered = searchable && query.trim()
+    ? options.filter((option) => option.label.toLowerCase().includes(query.trim().toLowerCase()))
+    : options
 
   return (
-    <div className="relative" ref={ref}>
+    <div className={cn('relative', className)} ref={ref}>
       <button
+        type="button"
         onClick={() => setOpen(!open)}
-        className="flex items-center gap-1.5 px-2 py-1.5 bg-[#1A1A1A] rounded-lg text-[11px] text-white/60 hover:text-white hover:bg-white/5 transition-colors border border-transparent hover:border-white/10"
+        className="flex items-center gap-1.5 rounded-lg border border-transparent bg-[#1A1A1A] px-2 py-1.5 text-[11px] text-white/60 transition-colors hover:border-white/10 hover:bg-white/5 hover:text-white"
       >
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M12 3c.132 0 .263 0 .393 0a7.5 7.5 0 0 0 7.92 12.446a9 9 0 1 1 -8.313 -12.454z" />
-          <path d="M17 4a2 2 0 0 0 2 2a2 2 0 0 0 -2 2a2 2 0 0 0 -2 -2a2 2 0 0 0 2 -2" />
-        </svg>
-        <span className="whitespace-nowrap">{selected?.name || 'Style'}</span>
-        <ChevronDown className="w-3 h-3 text-white/30" />
+        {icon}
+        <span className="whitespace-nowrap">{selected?.label || options[0]?.label || 'Select'}</span>
+        <ChevronDown className="h-3 w-3 text-white/30" />
       </button>
 
       {open && (
-        <div className="absolute left-0 top-full mt-1.5 w-60 bg-[#1A1A1A] rounded-xl border border-white/10 shadow-2xl z-50 overflow-hidden">
-          <div className="p-2 border-b border-white/5">
-            <div className="flex items-center gap-2 px-2 py-1.5 bg-[#141414] rounded-lg">
-              <Search className="w-3.5 h-3.5 text-white/30" />
-              <input
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search style..."
-                className="flex-1 bg-transparent text-xs text-white/70 placeholder:text-white/25 outline-none"
-                autoFocus
-              />
+        <div className={cn('absolute left-0 top-full z-50 mt-1.5 min-w-full overflow-hidden rounded-xl border border-white/10 bg-[#1A1A1A] shadow-2xl', menuClassName)}>
+          {searchable && (
+            <div className="border-b border-white/5 p-2">
+              <div className="relative">
+                <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-white/30 pointer-events-none" />
+                <input
+                  type="text"
+                  autoFocus
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Search..."
+                  className="w-full pl-8 pr-2 py-1.5 bg-[#141414] rounded-lg text-[11px] text-white/60 placeholder:text-white/25 outline-none border border-white/5 focus:border-white/10"
+                />
+              </div>
             </div>
-          </div>
+          )}
           <div className="max-h-64 overflow-y-auto py-1">
-            {filtered.map((style) => (
-              <button
-                key={style.id}
-                onClick={() => { onChange(style.id); setOpen(false); setSearch('') }}
-                className={cn(
-                  'w-full flex items-center gap-2.5 px-3 py-2 text-xs text-left transition-colors',
-                  value === style.id
-                    ? 'bg-[#7C5CFF]/15 text-[#7C5CFF]'
-                    : 'text-white/60 hover:bg-white/5 hover:text-white'
-                )}
-              >
-                {value === style.id && (
-                  <Star className="w-3 h-3 fill-current flex-shrink-0" />
-                )}
-                <span className={cn(!value === style.id && 'pl-5')}>{style.name}</span>
-              </button>
-            ))}
+            {filtered.length === 0 ? (
+              <div className="px-3 py-2 text-[11px] text-white/30">No matches</div>
+            ) : (
+              filtered.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => { onChange(option.value); setOpen(false) }}
+                  className={cn(
+                    'w-full flex items-center gap-2.5 px-3 py-2 text-xs text-left transition-colors',
+                    value === option.value
+                      ? 'bg-[#7C5CFF]/15 text-[#7C5CFF]'
+                      : 'text-white/60 hover:bg-white/5 hover:text-white'
+                  )}
+                >
+                  <span className="whitespace-nowrap">{option.label}</span>
+                </button>
+              ))
+            )}
           </div>
         </div>
       )}
     </div>
   )
 }
+
+const StyleDropdown: React.FC<{ value: string; onChange: (v: string) => void }> = ({ value, onChange }) => (
+  <CompactDropdown
+    value={value}
+    onChange={onChange}
+    options={STYLES.map((style) => ({ value: style.id, label: style.name }))}
+    menuClassName="w-60"
+    searchable
+    icon={(
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M12 3c.132 0 .263 0 .393 0a7.5 7.5 0 0 0 7.92 12.446a9 9 0 1 1 -8.313 -12.454z" />
+        <path d="M17 4a2 2 0 0 0 2 2a2 2 0 0 0 -2 2a2 2 0 0 0 -2 -2a2 2 0 0 0 2 -2" />
+      </svg>
+    )}
+  />
+)
 
 // ─── Main Component ───────────────────────────────────────────────────────────
 
@@ -1343,50 +1381,29 @@ const handleGenerate = useCallback(async () => {
 
             {/* Model Select — Google Flow only */}
             {activeProvider === 'flow' && (
-              <div className="relative">
-                <select
-                  key={`model-${mode}`}
-                  value={activeModel}
-                  onChange={(e) => setActiveModel(e.target.value)}
-                  className="appearance-none pl-2.5 pr-6 py-1.5 bg-[#141414] rounded-lg text-[11px] text-white/60 outline-none focus:ring-1 focus:ring-white/10 border border-white/5 cursor-pointer hover:border-white/10"
-                >
-                  {activeModelOptions.map((m) => (
-                    <option key={m.value} value={m.value}>{m.label}</option>
-                  ))}
-                </select>
-                <ChevronDown className="absolute right-1.5 top-1/2 -translate-y-1/2 w-3 h-3 text-white/30 pointer-events-none" />
-              </div>
+              <CompactDropdown
+                key={`model-${mode}`}
+                value={activeModel}
+                onChange={setActiveModel}
+                options={activeModelOptions.map((m) => ({ value: m.value, label: m.label }))}
+              />
             )}
 
             {/* Duration — Video only */}
             {activeProvider === 'flow' && mode === 'video' && (
-              <div className="relative">
-                <select
-                  value={videoDuration}
-                  onChange={(e) => setVideoDuration(e.target.value as typeof videoDuration)}
-                  className="appearance-none pl-2.5 pr-6 py-1.5 bg-[#141414] rounded-lg text-[11px] text-white/60 outline-none focus:ring-1 focus:ring-white/10 border border-white/5 cursor-pointer hover:border-white/10"
-                >
-                  {activeVideoDurationOptions.map((d) => (
-                    <option key={d} value={d}>{d}</option>
-                  ))}
-                </select>
-                <ChevronDown className="absolute right-1.5 top-1/2 -translate-y-1/2 w-3 h-3 text-white/30 pointer-events-none" />
-              </div>
+              <CompactDropdown
+                value={videoDuration}
+                onChange={(value) => setVideoDuration(value as typeof videoDuration)}
+                options={activeVideoDurationOptions.map((duration) => ({ value: duration, label: duration }))}
+              />
             )}
 
             {/* Aspect Ratio */}
-            <div className="relative">
-              <select
-                value={aspectRatio}
-                onChange={(e) => setAspectRatio(e.target.value as AspectRatio)}
-                className="appearance-none pl-2.5 pr-6 py-1.5 bg-[#141414] rounded-lg text-[11px] text-white/60 outline-none focus:ring-1 focus:ring-white/10 border border-white/5 cursor-pointer hover:border-white/10"
-              >
-                {ASPECT_RATIOS.map((r) => (
-                  <option key={r.value} value={r.value}>{r.label}</option>
-                ))}
-              </select>
-              <ChevronDown className="absolute right-1.5 top-1/2 -translate-y-1/2 w-3 h-3 text-white/30 pointer-events-none" />
-            </div>
+            <CompactDropdown
+              value={aspectRatio}
+              onChange={(value) => setAspectRatio(value as AspectRatio)}
+              options={ASPECT_RATIOS}
+            />
 
             {/* Quantity — Google Flow only */}
             {activeProvider === 'flow' && (
@@ -1438,19 +1455,16 @@ const handleGenerate = useCallback(async () => {
               <Search className="w-3.5 h-3.5" />
             </button>
             {activeProvider === 'flow' && (
-              <div className="relative">
-                <select
-                  value={refMode}
-                  onChange={(e) => setRefMode(e.target.value)}
-                  className="appearance-none pl-2 pr-5 py-1 bg-[#141414] rounded-lg text-[11px] text-white/40 outline-none border border-white/5 cursor-pointer"
-                >
-                  <option value="all">All</option>
-                  <option value="mention">@Mention</option>
-                  <option value="sequential">Sequential</option>
-                  <option value="none">None</option>
-                </select>
-                <ChevronDown className="absolute right-1 top-1/2 -translate-y-1/2 w-3 h-3 text-white/30 pointer-events-none" />
-              </div>
+              <CompactDropdown
+                value={refMode}
+                onChange={setRefMode}
+                options={[
+                  { value: 'all', label: 'All' },
+                  { value: 'mention', label: '@Mention' },
+                  { value: 'sequential', label: 'Sequential' },
+                  { value: 'none', label: 'None' },
+                ]}
+              />
             )}
           </div>
 
@@ -1532,34 +1546,29 @@ const handleGenerate = useCallback(async () => {
                 </div>
 
                 {/* Resolution — image vs video based on current mode */}
-                <div className="relative">
-                  <select
-                    value={mode === 'video' ? videoDownloadRes : downloadRes}
-                    onChange={(e) => {
-                      if (mode === 'video') {
-                        setVideoDownloadRes(e.target.value)
-                      } else {
-                        setDownloadRes(e.target.value)
-                      }
-                    }}
-                    className="appearance-none pl-2 pr-6 py-1.5 bg-[#141414] rounded-lg text-[11px] text-white/60 outline-none border border-white/5 cursor-pointer"
-                  >
-                    {mode === 'video' ? (
-                      <>
-                        <option value="720p">720p (HD)</option>
-                        <option value="1080p">1080p (Full HD)</option>
-                        <option value="4k">4K (Ultra)</option>
-                      </>
-                    ) : (
-                      <>
-                        <option value="1k">1K</option>
-                        <option value="2k">2K</option>
-                        <option value="4k">4K (Ultra)</option>
-                      </>
-                    )}
-                  </select>
-                  <ChevronDown className="absolute right-1 top-1/2 -translate-y-1/2 w-3 h-3 text-white/30 pointer-events-none" />
-                </div>
+                <CompactDropdown
+                  value={mode === 'video' ? videoDownloadRes : downloadRes}
+                  onChange={(value) => {
+                    if (mode === 'video') {
+                      setVideoDownloadRes(value)
+                    } else {
+                      setDownloadRes(value)
+                    }
+                  }}
+                  options={
+                    mode === 'video'
+                      ? [
+                          { value: '720p', label: '720p (HD)' },
+                          { value: '1080p', label: '1080p (Full HD)' },
+                          { value: '4k', label: '4K (Ultra)' },
+                        ]
+                      : [
+                          { value: '1k', label: '1K' },
+                          { value: '2k', label: '2K' },
+                          { value: '4k', label: '4K (Ultra)' },
+                        ]
+                  }
+                />
               </>
             )}
           </div>

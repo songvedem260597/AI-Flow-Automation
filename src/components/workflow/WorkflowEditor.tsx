@@ -4618,6 +4618,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
               lightboxHasCarousel && imagePreview.outputItems
                 ? imagePreview.outputItems[lightboxSelectedIndex]?.name || imagePreview.name
                 : imagePreview.name
+            const lightboxCanDownload = imagePreview.mediaType === 'image' && Boolean(imagePreview.src)
             return (
               <div
                 className="absolute inset-0 z-[70] flex flex-col bg-black/85 backdrop-blur-sm"
@@ -4651,25 +4652,15 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
                         >
                           <ChevronRight className="h-3.5 w-3.5" />
                         </button>
-                        <span className="mx-1 inline-block h-3.5 w-px bg-white/[0.18]" aria-hidden="true" />
-                        <button
-                          type="button"
-                          title="Download current output"
-                          aria-label="Download current output"
-                          onClick={handleDownloadPreview}
-                          className="flex h-6 w-6 items-center justify-center rounded text-white/55 transition-colors hover:bg-white/[0.08] hover:text-white"
-                        >
-                          <Download className="h-3.5 w-3.5" />
-                        </button>
                       </div>
                     )}
                   </div>
                   <div className="flex items-center gap-1">
-                    {imagePreview.mediaType === 'image' && imagePreview.src && !lightboxHasCarousel && (
+                    {lightboxCanDownload && (
                       <button
                         type="button"
-                        title="Download"
-                        aria-label="Download"
+                        title={lightboxHasCarousel ? 'Download current output' : 'Download'}
+                        aria-label={lightboxHasCarousel ? 'Download current output' : 'Download'}
                         onClick={handleDownloadPreview}
                         className="flex h-8 w-8 items-center justify-center rounded-lg text-white/45 transition-colors hover:bg-white/[0.07] hover:text-white"
                       >
@@ -5139,8 +5130,9 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                 {filteredWorkflows.map((workflow) => (
                   <div
                     key={workflow.id}
+                    onDoubleClick={() => handleOpenWorkflow(workflow)}
                     className={cn(
-                      'flex min-h-[170px] flex-col rounded-lg border bg-[#171717] p-4 transition-colors hover:border-white/15',
+                      'flex min-h-[118px] flex-col rounded-lg border bg-[#171717] p-3 transition-colors hover:border-white/15',
                       activeWorkflowId === workflow.id ? 'border-[#7C5CFF]/45' : 'border-white/[0.06]'
                     )}
                   >
@@ -5151,7 +5143,7 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                         className="min-w-0 flex-1 text-left"
                       >
                         <h3 className="truncate text-[12px] font-medium text-white/80">{workflow.name}</h3>
-                        <p className="mt-1 line-clamp-2 min-h-[36px] text-[11px] leading-[18px] text-white/35">
+                        <p className="mt-1 line-clamp-1 text-[11px] leading-[16px] text-white/35">
                           {workflow.description || 'Local workflow'}
                         </p>
                       </button>
@@ -5159,13 +5151,14 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                         type="button"
                         title="Run"
                         onClick={() => handleRunWorkflow(workflow)}
-                        className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#7C5CFF]/15 text-[#B8A8FF] transition-colors hover:bg-[#7C5CFF]/25"
+                        onDoubleClick={(event) => event.stopPropagation()}
+                        className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#7C5CFF]/15 text-[#B8A8FF] transition-colors hover:bg-[#7C5CFF]/25"
                       >
                         <Play className="h-3.5 w-3.5" />
                       </button>
                     </div>
 
-                    <div className="mt-4 flex flex-wrap gap-1.5">
+                    <div className="mt-3 flex flex-wrap gap-1.5">
                       {(workflow.tags?.length ? workflow.tags : ['Workflow']).slice(0, 3).map((tag) => (
                         <span key={tag} className="rounded-md bg-white/[0.05] px-2 py-1 text-[10px] text-white/35">
                           {tag}
@@ -5173,7 +5166,7 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                       ))}
                     </div>
 
-                    <div className="mt-auto flex items-center justify-between pt-4">
+                    <div className="mt-auto flex items-center justify-between pt-3">
                       <div className="text-[11px] text-white/30">
                         <span>{workflow.nodes.length} nodes</span>
                         <span className="mx-2">/</span>
@@ -5184,7 +5177,8 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                           type="button"
                           title="Rename"
                           onClick={() => handleRenameWorkflow(workflow)}
-                          className="flex h-8 w-8 items-center justify-center rounded-md text-white/35 transition-colors hover:bg-white/[0.06] hover:text-white/75"
+                          onDoubleClick={(event) => event.stopPropagation()}
+                          className="flex h-7 w-7 items-center justify-center rounded-md text-white/35 transition-colors hover:bg-white/[0.06] hover:text-white/75"
                         >
                           <FileText className="h-3.5 w-3.5" />
                         </button>
@@ -5192,7 +5186,8 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                           type="button"
                           title="Duplicate"
                           onClick={() => handleDuplicateWorkflow(workflow)}
-                          className="flex h-8 w-8 items-center justify-center rounded-md text-white/35 transition-colors hover:bg-white/[0.06] hover:text-white/75"
+                          onDoubleClick={(event) => event.stopPropagation()}
+                          className="flex h-7 w-7 items-center justify-center rounded-md text-white/35 transition-colors hover:bg-white/[0.06] hover:text-white/75"
                         >
                           <Copy className="h-3.5 w-3.5" />
                         </button>
@@ -5200,7 +5195,8 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                           type="button"
                           title="Export"
                           onClick={() => downloadWorkflowJson(workflow)}
-                          className="flex h-8 w-8 items-center justify-center rounded-md text-white/35 transition-colors hover:bg-white/[0.06] hover:text-white/75"
+                          onDoubleClick={(event) => event.stopPropagation()}
+                          className="flex h-7 w-7 items-center justify-center rounded-md text-white/35 transition-colors hover:bg-white/[0.06] hover:text-white/75"
                         >
                           <FileDown className="h-3.5 w-3.5" />
                         </button>
@@ -5208,7 +5204,8 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                           type="button"
                           title="Delete"
                           onClick={() => handleDeleteWorkflow(workflow)}
-                          className="flex h-8 w-8 items-center justify-center rounded-md text-white/35 transition-colors hover:bg-red-500/10 hover:text-red-300"
+                          onDoubleClick={(event) => event.stopPropagation()}
+                          className="flex h-7 w-7 items-center justify-center rounded-md text-white/35 transition-colors hover:bg-red-500/10 hover:text-red-300"
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>

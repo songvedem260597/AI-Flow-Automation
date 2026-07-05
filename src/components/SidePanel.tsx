@@ -260,10 +260,10 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
     }
 
     loadFlowProjects().then(() => {
-      setShowProjectPicker(true)
+      setShowProjectPicker(!selectedProject)
       setSyncDone(true)
     })
-  }, [activeGenProvider, currentUrl, showFlowOverlay, initDone])
+  }, [activeGenProvider, currentUrl, showFlowOverlay, initDone, selectedProject])
 
   const handleResync = async () => {
     setSyncDone(false)
@@ -301,9 +301,45 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
     setShowProjectPicker(false)
   }
 
+  const handleOpenFlowHome = async () => {
+    const flowHomeUrl = 'https://labs.google/fx/tools/flow'
+    const result = await checkAllTabs()
+    if (result.hasFlow && result.flowTabId) {
+      await chrome.tabs.update(result.flowTabId, { url: flowHomeUrl, active: true }).catch(() => {})
+    } else {
+      await chrome.tabs.create({ url: flowHomeUrl, active: true }).catch(() => {})
+    }
+    setCurrentUrl(flowHomeUrl)
+    setHasFlowTab(true)
+    setShowFlowOverlay(false)
+    setShowProjectPicker(true)
+    setActiveGenProvider('flow')
+  }
+
   const filteredProjects = flowProjects.filter(p =>
     p.name.toLowerCase().includes(projectSearch.toLowerCase())
   )
+  const mustOpenFlowHomeForProjectSelection =
+    activeTab === 'gen' &&
+    activeGenProvider === 'flow' &&
+    !showFlowOverlay &&
+    !selectedProject &&
+    !isFlowHomeUrl(currentUrl)
+  const mustSelectFlowProject =
+    activeTab === 'gen' &&
+    activeGenProvider === 'flow' &&
+    !showFlowOverlay &&
+    !selectedProject &&
+    isFlowHomeUrl(currentUrl)
+  const shouldShowFlowOpenOverlay =
+    activeTab === 'gen' &&
+    activeGenProvider === 'flow' &&
+    (showFlowOverlay || mustOpenFlowHomeForProjectSelection)
+  const shouldShowProjectPicker =
+    activeGenProvider === 'flow' &&
+    !showFlowOverlay &&
+    !mustOpenFlowHomeForProjectSelection &&
+    (showProjectPicker || mustSelectFlowProject)
 
   if (!initDone) {
     return (
@@ -340,8 +376,8 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
       <main className="flex-1 flex flex-col h-full overflow-hidden border-l border-white/5">
         {activeTab === 'gen' && (
           <div className="relative h-full">
-            {showFlowOverlay && (
-              <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+            {shouldShowFlowOpenOverlay && (
+              <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 backdrop-blur-sm">
                 <div
                   className="bg-[#1A1A1A] rounded-2xl border border-white/10 px-8 py-6 flex flex-col items-center text-center shadow-2xl max-w-xs w-full"
                   onClick={(e) => e.stopPropagation()}
@@ -355,23 +391,10 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
                     Google Flow tab not open
                   </p>
                   <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)', marginBottom: '16px' }}>
-                    Please open a Google Flow tab to use this extension
+                    Please open Google Flow home to select a project
                   </p>
                   <button
-                    onClick={async () => {
-                      const result = await checkAllTabs()
-                      if (result.hasFlow && result.flowTabId) {
-                        await chrome.tabs.update(result.flowTabId, { active: true }).catch(() => {})
-                        setHasFlowTab(true)
-                        setShowFlowOverlay(false)
-                        setActiveGenProvider('flow')
-                      } else {
-                        await chrome.tabs.create({ url: 'https://labs.google/fx/tools/flow', active: true }).catch(() => {})
-                        setHasFlowTab(true)
-                        setShowFlowOverlay(false)
-                        setActiveGenProvider('flow')
-                      }
-                    }}
+                    onClick={handleOpenFlowHome}
                     className="flex items-center gap-2 px-4 py-2 bg-[#7C5CFF] hover:bg-[#6B4CE0] text-white text-sm font-medium rounded-xl transition-colors cursor-pointer w-full justify-center"
                   >
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -385,14 +408,14 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
               </div>
             )}
 
-            {showProjectPicker && activeGenProvider === 'flow' && !showFlowOverlay && (
-              <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+            {shouldShowProjectPicker && (
+              <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 backdrop-blur-sm">
                 <div
-                  className="bg-[#1A1A1A] rounded-2xl border border-white/10 flex flex-col shadow-2xl w-full max-w-sm mx-4 overflow-hidden"
+                  className="flex w-full max-w-sm flex-col overflow-hidden rounded-2xl border border-white/10 bg-[#1A1A1A] shadow-2xl mx-4"
                   style={{ maxHeight: '85vh' }}
                   onClick={(e) => e.stopPropagation()}
                 >
-                  <div className="project-select-header" style={{ display: 'flex', alignItems: 'flex-start', gap: '10px', padding: '16px 16px 12px' }}>
+                  <div className="project-select-header" style={{ display: 'flex', alignItems: 'flex-start', gap: '12px', padding: '18px 20px 14px', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
                     <svg className="project-select-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.5)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginTop: '2px', flexShrink: 0 }}>
                       <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
                     </svg>
@@ -403,7 +426,7 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
                           <span style={{ color: '#10b981' }}>&#10003;</span> Đã đồng bộ
                         </span>
                       </div>
-                      <div className="project-select-desc" style={{ fontSize: '11px', color: 'rgba(255,255,255,0.3)', marginTop: '2px' }}>Chọn một project để bắt đầu làm việc</div>
+                      <div className="project-select-desc" style={{ fontSize: '11px', color: 'rgba(255,255,255,0.35)', marginTop: '3px' }}>Bắt buộc chọn một project trước khi dùng tab Gen</div>
                     </div>
                     <button
                       className="project-select-resync"
@@ -420,7 +443,7 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
                     </button>
                   </div>
 
-                  <div className="project-select-search-wrap" style={{ padding: '0 16px 12px', position: 'relative', display: 'flex', alignItems: 'center' }}>
+                  <div className="project-select-search-wrap" style={{ padding: '14px 20px 12px', position: 'relative', display: 'flex', alignItems: 'center' }}>
                     <svg className="project-select-search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.3)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ position: 'absolute', left: '26px' }}>
                       <circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
                     </svg>
@@ -434,12 +457,12 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
                       spellCheck="false"
                       style={{ width: '100%', padding: '8px 40px 8px 32px', background: '#141414', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', color: 'white', fontSize: '12px', outline: 'none' }}
                     />
-                    <span className="project-select-search-count" style={{ position: 'absolute', right: '26px', fontSize: '10px', color: 'rgba(255,255,255,0.2)' }}>{filteredProjects.length}</span>
+                    <span className="project-select-search-count" style={{ position: 'absolute', right: '30px', fontSize: '10px', color: 'rgba(255,255,255,0.2)' }}>{filteredProjects.length}</span>
                   </div>
 
-                  <div className="project-select-list" style={{ overflowY: 'auto', flex: 1, padding: '0 16px', maxHeight: 'calc(85vh - 160px)' }}>
+                  <div className="project-select-list" style={{ overflowY: 'auto', flex: 1, padding: '0 20px 4px' }}>
                     {filteredProjects.length === 0 ? (
-                      <div style={{ padding: '16px 0', textAlign: 'center', fontSize: '12px', color: 'rgba(255,255,255,0.3)' }}>
+                      <div style={{ padding: '32px 0', textAlign: 'center', fontSize: '12px', color: 'rgba(255,255,255,0.35)' }}>
                         Không có project nào
                         {flowProjects.length === 0 && (
                           <div style={{ marginTop: '8px' }}>
@@ -458,9 +481,9 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
                           key={project.id}
                           className="project-select-item"
                           onClick={() => handleSelectFlowProject(project)}
-                          style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 12px', borderRadius: '8px', cursor: 'pointer', transition: 'background 0.15s', marginBottom: '4px' }}
+                          style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '12px 14px', borderRadius: '10px', cursor: 'pointer', transition: 'background 0.15s', marginBottom: '6px', border: '1px solid rgba(255,255,255,0.04)', background: 'rgba(255,255,255,0.02)' }}
                           onMouseEnter={(e) => (e.currentTarget.style.background = 'rgba(255,255,255,0.05)')}
-                          onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+                          onMouseLeave={(e) => (e.currentTarget.style.background = 'rgba(255,255,255,0.02)')}
                         >
                           <div className="project-select-item-info" style={{ flex: 1, minWidth: 0 }}>
                             <span className="project-select-name" style={{ display: 'block', fontSize: '12px', fontWeight: 500, color: 'white', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{project.name}</span>
@@ -478,10 +501,10 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
                     )}
                   </div>
 
-                  <div className="project-select-actions" style={{ padding: '12px 16px', borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+                  <div className="project-select-actions" style={{ padding: '14px 20px', borderTop: '1px solid rgba(255,255,255,0.06)' }}>
                     <button
                       className="project-select-create-btn"
-                      onClick={() => setShowProjectPicker(false)}
+                      onClick={handleOpenFlowHome}
                       style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px', padding: '8px', background: '#7C5CFF', border: 'none', borderRadius: '8px', color: 'white', fontSize: '12px', fontWeight: 500, cursor: 'pointer', transition: 'background 0.15s' }}
                       onMouseEnter={(e) => (e.currentTarget.style.background = '#6B4CE0')}
                       onMouseLeave={(e) => (e.currentTarget.style.background = '#7C5CFF')}
@@ -490,7 +513,7 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
                         <line x1="12" y1="5" x2="12" y2="19"></line>
                         <line x1="5" y1="12" x2="19" y2="12"></line>
                       </svg>
-                      Tạo dự án mới
+                      Tạo dự án mới trên Flow
                     </button>
                   </div>
                 </div>

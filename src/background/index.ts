@@ -808,12 +808,13 @@ async function openProviderTab(
   provider: string,
   shouldFocus: boolean = true
 ): Promise<{ success: boolean; tabId?: number; error?: string }> {
-  const config = (PROVIDER_TABS as Record<string, { queryUrl: string; createUrl: string } | undefined>)[provider]
+  const normalizedProvider = provider === 'flow' ? 'google-flow' : provider
+  const config = (PROVIDER_TABS as Record<string, { queryUrl: string; createUrl: string } | undefined>)[normalizedProvider]
   if (!config) {
     console.log(`[Provider][BG] openProviderTab provider=${provider} error=Unknown provider`)
     return { success: false, error: 'Unknown provider' }
   }
-  console.log(`[Provider][BG] openProviderTab provider=${provider} queryUrl=${config.queryUrl} shouldFocus=${shouldFocus}`)
+  console.log(`[Provider][BG] openProviderTab provider=${provider} normalizedProvider=${normalizedProvider} queryUrl=${config.queryUrl} shouldFocus=${shouldFocus}`)
 
   try {
     const existing = await chrome.tabs.query({ url: config.queryUrl })
