@@ -1,31 +1,149 @@
 import { create } from 'zustand'
-import { persist, createJSONStorage } from 'zustand/middleware'
+import { persist, createJSONStorage, type StateStorage } from 'zustand/middleware'
 import type { Workflow, WorkflowNode, WorkflowEdge, FlowNodeType } from '@/types'
 import { v4 as uuid } from 'uuid'
 
-const chromeStorageCache: Record<string, string | null> = {}
-const chromeStoragePending: Record<string, boolean> = {}
-
-const chromeStorage = (key: string) => {
-  if (!(key in chromeStorageCache)) {
-    chromeStorageCache[key] = null
-    chromeStoragePending[key] = true
-    chrome.storage.local.get(key, (result) => {
-      chromeStorageCache[key] = result[key] ?? null
-      chromeStoragePending[key] = false
-    })
+/**
+ * Promise-based adapter around `chrome.storage.local` implementing the
+ * Zustand `StateStorage` contract (signature: getItem/setItem/removeItem
+ * all take `name` as the FIRST argument).
+ *
+ * Historical bug: a previous wrapper used `chromeStorage(key)` factory
+ * returning `{ getItem: () => …, setItem: (value) => … }` — no `name`.
+ * Zustand's `createJSONStorage` calls `storage.setItem(name, value)`, so
+ * the wrapper bound `value = name = "ai-flow-workflows"` and overwrote
+ * the key with the literal string `"ai-flow-workflows"`. Rehydrate then
+ * tried to JSON.parse("ai-flow-workflows") and failed.
+ *
+ * Fix: a single `StateStorage` object whose setItem takes (name, value)
+ * and writes `{ [name]: value }` to chrome.storage.local.
+ *
+ * Diagnostic logs (prefix `[WorkflowPersist][storage.*]`) help confirm
+ * the signature is wired correctly. They are gated by
+ * `localStorage.AI_FLOW_DEBUG === '1'`; default OFF.
+ */
+const DEBUG_PERSIST = (): boolean => {
+  try {
+    return typeof localStorage !== 'undefined' && localStorage.getItem('AI_FLOW_DEBUG') === '1'
+  } catch {
+    return false
   }
+}
 
-  return {
-    getItem: () => chromeStorageCache[key] ?? null,
-    setItem: (value: string) => {
-      chromeStorageCache[key] = value
-      chrome.storage.local.set({ [key]: value })
-    },
-    removeItem: () => {
-      chromeStorageCache[key] = null
-      chrome.storage.local.remove(key)
+const countWorkflows = (raw: string | null): number => {
+  if (!raw) return 0
+  try {
+    const parsed = JSON.parse(raw) as { state?: { workflows?: unknown[] } }
+    return Array.isArray(parsed?.state?.workflows) ? parsed.state.workflows.length : 0
+  } catch {
+    return 0
+  }
+}
+
+const activeWorkflowIdFromRaw = (raw: string | null): string | null => {
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw) as { state?: { activeWorkflowId?: string | null } }
+    return parsed?.state?.activeWorkflowId ?? null
+  } catch {
+    return null
+  }
+}
+
+const parseValueForDiag = (value: string): {
+  parsedTopKeys: string[] | null
+  parsedStateKeys: string[] | null
+  workflowCountFromParsed: number | null
+  activeWorkflowIdFromParsed: string | null
+} => {
+  let parsedTopKeys: string[] | null = null
+  let parsedStateKeys: string[] | null = null
+  let workflowCountFromParsed: number | null = null
+  let activeWorkflowIdFromParsed: string | null = null
+  try {
+    const top = JSON.parse(value) as Record<string, unknown>
+    parsedTopKeys = Object.keys(top)
+    if (top && typeof top === 'object' && 'state' in top) {
+      const inner = (top as { state?: Record<string, unknown> }).state
+      if (inner && typeof inner === 'object') {
+        parsedStateKeys = Object.keys(inner)
+        workflowCountFromParsed = Array.isArray((inner as { workflows?: unknown[] }).workflows)
+          ? (inner as { workflows: unknown[] }).workflows.length
+          : 0
+        activeWorkflowIdFromParsed =
+          (inner as { activeWorkflowId?: string | null }).activeWorkflowId ?? null
+      }
     }
+  } catch {
+    parsedTopKeys = null
+  }
+  return { parsedTopKeys, parsedStateKeys, workflowCountFromParsed, activeWorkflowIdFromParsed }
+}
+
+const chromeStorage: StateStorage = {
+  getItem: (name: string): Promise<string | null> => {
+    if (DEBUG_PERSIST()) {
+      console.log('[WorkflowPersist][storage.getItem:start]', JSON.stringify({ name }))
+    }
+    return new Promise((resolve) => {
+      chrome.storage.local.get(name, (result) => {
+        const raw = result[name]
+        let value: string | null = null
+        if (typeof raw === 'string') {
+          value = raw
+        } else if (raw == null) {
+          value = null
+        } else {
+          value = JSON.stringify(raw)
+        }
+        if (DEBUG_PERSIST()) {
+          console.log('[WorkflowPersist][storage.getItem:resolved]', JSON.stringify({
+            name,
+            hasValue: value !== null,
+            rawLength: value?.length ?? 0,
+            workflowCount: countWorkflows(value),
+            activeWorkflowId: activeWorkflowIdFromRaw(value)
+          }))
+        }
+        resolve(value)
+      })
+    })
+  },
+  setItem: (name: string, value: string): Promise<void> => {
+    if (DEBUG_PERSIST()) {
+      const diag = parseValueForDiag(value)
+      console.log('[WorkflowPersist][storage.setItem]', JSON.stringify({
+        name,
+        valuePreview: value.slice(0, 300),
+        valueLength: value.length,
+        parsedTopKeys: diag.parsedTopKeys,
+        parsedStateKeys: diag.parsedStateKeys,
+        workflowCountFromParsed: diag.workflowCountFromParsed,
+        activeWorkflowIdFromParsed: diag.activeWorkflowIdFromParsed
+      }))
+      if (diag.workflowCountFromParsed === 0) {
+        console.trace('[WorkflowPersist][storage.setItem:zero-workflows]')
+      }
+    }
+    return new Promise((resolve, reject) => {
+      chrome.storage.local.set({ [name]: value }, () => {
+        const err = chrome.runtime.lastError
+        if (err) reject(err)
+        else resolve()
+      })
+    })
+  },
+  removeItem: (name: string): Promise<void> => {
+    if (DEBUG_PERSIST()) {
+      console.log('[WorkflowPersist][storage.removeItem]', JSON.stringify({ name }))
+    }
+    return new Promise((resolve, reject) => {
+      chrome.storage.local.remove(name, () => {
+        const err = chrome.runtime.lastError
+        if (err) reject(err)
+        else resolve()
+      })
+    })
   }
 }
 
@@ -120,24 +238,66 @@ export const useWorkflowStore = create<WorkflowState>()(
       isDirty: false,
 
       hydrateFromStorage: async () => {
+        if (DEBUG_PERSIST()) console.log('[WorkflowPersist][hydrateFromStorage:start]')
         const result = await chrome.storage.local.get('ai-flow-workflows')
         const saved = result['ai-flow-workflows']
-        if (!saved) return
-
-        try {
-          const parsed = JSON.parse(saved)
-          const state = parsed.state as Partial<WorkflowState> | undefined
-          if (!state?.workflows) return
-
-          set({
-            workflows: state.workflows,
-            activeWorkflowId: state.activeWorkflowId ?? state.workflows[0]?.id ?? null,
-            selectedNodeId: state.selectedNodeId ?? null,
-            selectedEdgeId: state.selectedEdgeId ?? null
-          })
-        } catch {
-          // Ignore corrupt persisted state.
+        if (!saved) {
+          if (DEBUG_PERSIST()) {
+            console.log('[WorkflowPersist][hydrateFromStorage:read]', JSON.stringify({
+              hasValue: false,
+              workflowCount: 0,
+              activeWorkflowId: null,
+              rawLength: 0
+            }))
+          }
+          return
         }
+
+        let parsed: { state?: Partial<WorkflowState> } | null = null
+        try {
+          parsed = JSON.parse(saved) as { state?: Partial<WorkflowState> }
+        } catch {
+          if (DEBUG_PERSIST()) {
+            console.log('[WorkflowPersist][hydrateFromStorage:read]', JSON.stringify({
+              hasValue: true,
+              workflowCount: 0,
+              activeWorkflowId: null,
+              rawLength: saved.length,
+              parseError: true
+            }))
+          }
+          return
+        }
+
+        const state = parsed?.state
+        const wc = Array.isArray(state?.workflows) ? state.workflows.length : 0
+        const aw = state?.activeWorkflowId ?? null
+        if (DEBUG_PERSIST()) {
+          console.log('[WorkflowPersist][hydrateFromStorage:read]', JSON.stringify({
+            hasValue: true,
+            workflowCount: wc,
+            activeWorkflowId: aw,
+            rawLength: saved.length
+          }))
+        }
+
+        if (!state?.workflows) return
+
+        if (DEBUG_PERSIST()) {
+          console.log('[WorkflowPersist][hydrateFromStorage:set]', JSON.stringify({
+            workflowCount: wc,
+            activeWorkflowId: aw
+          }))
+          if (wc === 0) {
+            console.trace('[WorkflowPersist][hydrateFromStorage:set:zero-workflows]')
+          }
+        }
+        set({
+          workflows: state.workflows,
+          activeWorkflowId: state.activeWorkflowId ?? state.workflows[0]?.id ?? null,
+          selectedNodeId: state.selectedNodeId ?? null,
+          selectedEdgeId: state.selectedEdgeId ?? null
+        })
       },
 
       createWorkflow: (name) => {
@@ -149,7 +309,19 @@ export const useWorkflowStore = create<WorkflowState>()(
           createdAt: Date.now(),
           updatedAt: Date.now()
         }
+        if (DEBUG_PERSIST()) {
+          console.log('[WorkflowPersist][createWorkflow:before]', JSON.stringify({
+            currentCount: get().workflows.length
+          }))
+        }
         set((state) => ({ workflows: [...state.workflows, workflow], activeWorkflowId: workflow.id, isDirty: true }))
+        if (DEBUG_PERSIST()) {
+          console.log('[WorkflowPersist][createWorkflow:after]', JSON.stringify({
+            nextCount: get().workflows.length,
+            createdId: workflow.id,
+            activeWorkflowId: get().activeWorkflowId
+          }))
+        }
         return workflow
       },
 
@@ -188,7 +360,19 @@ export const useWorkflowStore = create<WorkflowState>()(
       },
 
       setActiveWorkflow: (id) => {
+        if (DEBUG_PERSIST()) {
+          console.log('[WorkflowPersist][setActiveWorkflow:before]', JSON.stringify({
+            currentCount: get().workflows.length,
+            nextActiveWorkflowId: id
+          }))
+        }
         set({ activeWorkflowId: id, selectedNodeId: null, selectedEdgeId: null })
+        if (DEBUG_PERSIST()) {
+          console.log('[WorkflowPersist][setActiveWorkflow:after]', JSON.stringify({
+            nextCount: get().workflows.length,
+            activeWorkflowId: get().activeWorkflowId
+          }))
+        }
       },
 
       getActiveWorkflow: () => {
@@ -350,23 +534,30 @@ export const useWorkflowStore = create<WorkflowState>()(
     }),
     {
       name: 'ai-flow-workflows',
-      storage: createJSONStorage(() => chromeStorage('ai-flow-workflows')),
-      onRehydrateStorage: () => (state) => {
-        if (state) {
-          chrome.storage.local.get('ai-flow-workflows', (result) => {
-            const saved = result['ai-flow-workflows']
-            if (saved) {
-              try {
-                const parsed = JSON.parse(saved)
-                if (parsed.state?.workflows?.length > 0) {
-                  state.workflows = parsed.state.workflows
-                  state.activeWorkflowId = parsed.state.activeWorkflowId ?? null
-                  state.selectedNodeId = parsed.state.selectedNodeId ?? null
-                  state.selectedEdgeId = parsed.state.selectedEdgeId ?? null
-                }
-              } catch {}
-            }
-          })
+      storage: createJSONStorage(() => chromeStorage),
+      partialize: (state) => {
+        const partialized: Partial<WorkflowState> = {
+          workflows: state.workflows,
+          activeWorkflowId: state.activeWorkflowId
+        }
+        if (DEBUG_PERSIST()) {
+          console.log('[WorkflowPersist][partialize]', JSON.stringify({
+            workflowCount: state.workflows?.length,
+            activeWorkflowId: state.activeWorkflowId,
+            keys: Object.keys(partialized)
+          }))
+        }
+        return partialized
+      },
+      onRehydrateStorage: () => (state, error) => {
+        const wc = Array.isArray(state?.workflows) ? state.workflows.length : 0
+        const aw = state?.activeWorkflowId ?? null
+        if (DEBUG_PERSIST()) {
+          console.log('[WorkflowPersist][rehydrate:finish]', JSON.stringify({
+            workflowCount: wc,
+            activeWorkflowId: aw,
+            error: error ? String(error) : null
+          }))
         }
       }
     }

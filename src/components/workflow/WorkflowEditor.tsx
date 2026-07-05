@@ -45,6 +45,14 @@ import type { PipelineCallbacks } from '@/pipeline'
 import { usePipelineStore } from '@/stores/pipelineStore'
 import { debugLog, debugWarn } from '@/lib/debug'
 
+const WORKFLOW_PERSIST_DEBUG = (): boolean => {
+  try {
+    return typeof localStorage !== 'undefined' && localStorage.getItem('AI_FLOW_DEBUG') === '1'
+  } catch {
+    return false
+  }
+}
+
 const SUPPORTED_NODE_TYPES: FlowNodeType[] = [
   'prompt',
   'image',
@@ -4831,6 +4839,35 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
     hydrateFromStorage().catch(() => {})
     const handleStorageChange = (changes: Record<string, chrome.storage.StorageChange>, areaName: string) => {
       if (areaName === 'local' && changes['ai-flow-workflows']) {
+        const oldVal = changes['ai-flow-workflows'].oldValue
+        const newVal = changes['ai-flow-workflows'].newValue
+        const countFrom = (raw: unknown): number => {
+          if (typeof raw !== 'string' || !raw) return 0
+          try {
+            const p = JSON.parse(raw) as { state?: { workflows?: unknown[]; activeWorkflowId?: string | null } }
+            return Array.isArray(p?.state?.workflows) ? p.state.workflows.length : 0
+          } catch { return 0 }
+        }
+        const activeFrom = (raw: unknown): string | null => {
+          if (typeof raw !== 'string' || !raw) return null
+          try {
+            const p = JSON.parse(raw) as { state?: { activeWorkflowId?: string | null } }
+            return p?.state?.activeWorkflowId ?? null
+          } catch { return null }
+        }
+        const newWc = countFrom(newVal)
+        if (WORKFLOW_PERSIST_DEBUG()) {
+          console.log('[WorkflowPersist][storage.onChanged]', JSON.stringify({
+            key: 'ai-flow-workflows',
+            oldWorkflowCount: countFrom(oldVal),
+            newWorkflowCount: newWc,
+            oldActiveWorkflowId: activeFrom(oldVal),
+            newActiveWorkflowId: activeFrom(newVal)
+          }))
+          if (newWc === 0) {
+            console.trace('[WorkflowPersist][storage.onChanged:zero-workflows]')
+          }
+        }
         hydrateFromStorage().catch(() => {})
       }
     }
@@ -4843,6 +4880,46 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
       setActiveWorkflow(workflows[0].id)
     }
   }, [activeWorkflowId, workflows, setActiveWorkflow])
+
+  // [WorkflowPersist] editorMount — capture initial render state.
+  // Persist's internal hydrate may still be in flight here (Promise wrapper
+  // resolves async), so hasHydrated() may report false even when storage
+  // already has data. The follow-up logs (storage.getItem:resolved,
+  // rehydrate:finish) confirm the eventual truth.
+  useEffect(() => {
+    const persistedView = typeof localStorage !== 'undefined'
+      ? localStorage.getItem('workflow.view')
+      : null
+    const hasHydrated = (useWorkflowStore as unknown as { persist?: { hasHydrated?: () => boolean } })
+      .persist?.hasHydrated?.()
+    if (WORKFLOW_PERSIST_DEBUG()) {
+      console.log('[WorkflowPersist][editorMount]', JSON.stringify({
+        workflowCount: workflows.length,
+        activeWorkflowId,
+        view,
+        persistedView,
+        hasHydrated: typeof hasHydrated === 'boolean' ? hasHydrated : null
+      }))
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // [WorkflowPersist] viewMismatch — workflows exist but UI stuck on templates.
+  useEffect(() => {
+    if (view === 'templates' && workflows.length > 0) {
+      const persistedView = typeof localStorage !== 'undefined'
+        ? localStorage.getItem('workflow.view')
+        : null
+      if (WORKFLOW_PERSIST_DEBUG()) {
+        console.log('[WorkflowPersist][viewMismatch]', JSON.stringify({
+          view,
+          workflowCount: workflows.length,
+          activeWorkflowId,
+          persistedView
+        }))
+      }
+    }
+  }, [view, workflows.length, activeWorkflowId])
 
   const activeWorkflow = workflows.find((workflow) => workflow.id === activeWorkflowId) || workflows[0] || null
   const templateCategories = useMemo(
