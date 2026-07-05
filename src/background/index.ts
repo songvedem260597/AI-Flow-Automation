@@ -25,7 +25,7 @@ console.log('[Background] index.ts loaded')
 // Enable with: localStorage.setItem('AI_FLOW_DEBUG', '1') in the extension page/tab
 // Guard: localStorage does not exist in service worker contexts.
 function readBgDebugFlag(): boolean {
-  try {
+    try {
     if (typeof localStorage !== 'undefined' && localStorage.getItem('AI_FLOW_DEBUG') === '1') {
       return true
     }
@@ -374,6 +374,10 @@ chrome.runtime.onStartup?.addListener(() => {
 
 chrome.windows.onRemoved.addListener((windowId) => {
   if (workflowEditorWindowId === windowId) {
+    console.log('[Workflow][EditorFocus] cleared', JSON.stringify({
+      reason: 'workflow-editor-window-closed',
+      windowId,
+    }))
     clearStoredWorkflowEditorIds().catch(() => {})
   }
 })
@@ -403,6 +407,46 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
       // so their tab (Workflow Editor / Side Panel) stays on screen.
       const shouldFocus = payload?.focus !== false
       return openProviderTab(provider, shouldFocus)
+    }
+
+    case 'ENSURE_PROVIDER_TAB_FOR_WORKFLOW': {
+      // Workflow-only entry point. Activates the provider tab +
+      // window BEFORE the workflow runner submits the prompt so the
+      // user does not have to manually switch tabs as the workflow
+      // advances between providers. Unlike `OPEN_PROVIDER_TAB` (used
+      // by GenPanel direct generation), this helper:
+      //   - always activates the tab + window (focus: true is the
+      //     workflow contract; GenPanel callers go through
+      //     RUN_FLOW_PROMPT / RUN_CHATGPT_PROMPT directly);
+      //   - emits [Workflow][ProviderRoute] trace logs at every
+      //     state transition (start / existingTab / createdTab /
+      //     focusedTab / ready / send);
+      //   - optionally waits for content-script readiness via the
+      //     already-existing chatgpt / flow readiness probes
+      //     (CHATGPT_PING for chatgpt, FLOW_INJECT_BRIDGE for flow).
+      //
+      // Owner: shared (provider routing helper used by runner only —
+      // GenPanel keeps its original focus:false contract for direct
+      // submits unless the caller explicitly opts in).
+      const payload = (message.payload || {}) as {
+        provider?: string
+        nodeId?: string
+        waitReady?: boolean
+        activate?: boolean
+        focusWindow?: boolean
+        preserveEditor?: boolean
+      }
+      const provider = String(payload.provider || '')
+      const nodeId = String(payload.nodeId || '')
+      if (!provider) {
+        return { success: false, error: 'provider is required' }
+      }
+      return ensureProviderTabForWorkflow(provider, nodeId, {
+        waitReady: payload.waitReady !== false,
+        activate: payload.activate === true,
+        focusWindow: payload.focusWindow === true,
+        preserveEditor: payload.preserveEditor !== false,
+      })
     }
 
     case 'INJECT_SCRIPT':
@@ -463,7 +507,93 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
         return { success: false, error: 'Workflow editor tab sender is missing' }
       }
       await rememberWorkflowEditorWindow(tab.windowId, tab.id)
+      // [Workflow][EditorFocus] captured — every workflow run
+      // should preserve this origin so provider-tab focus operations
+      // never navigate / close / minimize the editor popup.
+      console.log('[Workflow][EditorFocus] captured', JSON.stringify({
+        tabId: tab.id,
+        windowId: tab.windowId,
+        url: tab.url || tab.pendingUrl || '',
+        type: tab.windowType || '',
+      }))
       return { success: true }
+    }
+
+    case 'RESTORE_EDITOR_FOCUS': {
+      // Restore the workflow-editor tab/window to foreground after
+      // a provider-tab submit fires. Called by the runner on the
+      // opt-in `restore-editor-after-submit` policy; default
+      // `provider-during-node` never reaches this code path. We
+      // never close / navigate / minimize — only `tabs.update(active)`
+      // + `windows.update(focused)` on the editor origin. Defensive
+      // checks ensure we never restore a tab that has been closed
+      // since capture.
+      const payload = (message.payload || {}) as {
+        nodeId?: string
+        provider?: string
+      }
+      const nodeId = String(payload.nodeId || '')
+      const provider = String(payload.provider || '')
+      const editorRef = await readStoredWorkflowEditorIds()
+      const editorTabId = Array.from(editorRef.tabIds)[0]
+      const editorWindowId = Array.from(editorRef.windowIds)[0]
+      console.log('[Workflow][EditorFocus] restoreStart', JSON.stringify({
+        nodeId,
+        provider,
+        tabId: editorTabId ?? null,
+        windowId: editorWindowId ?? null,
+      }))
+      if (editorTabId === undefined || editorWindowId === undefined) {
+        console.log('[Workflow][EditorFocus] restoreSkipped', JSON.stringify({
+          reason: 'no-stored-editor-origin',
+          nodeId,
+          provider,
+        }))
+        return { success: false, error: 'No stored workflow editor origin' }
+      }
+      // Confirm the tab + window still exist before restoring. The
+      // user might have closed the editor while a workflow was
+      // running; that's their right, but we MUST NOT attempt to
+      // chrome.tabs.update a dead tabId (it throws).
+      let liveTab: chrome.tabs.Tab | null = null
+      try {
+        liveTab = await chrome.tabs.get(editorTabId)
+      } catch {
+        liveTab = null
+      }
+      if (!liveTab) {
+        console.log('[Workflow][EditorFocus] restoreSkipped', JSON.stringify({
+          reason: 'editor-tab-no-longer-exists',
+          nodeId,
+          provider,
+          tabId: editorTabId,
+        }))
+        // Stale storage — clear it so subsequent restores are quick.
+        clearStoredWorkflowEditorIds().catch(() => {})
+        return { success: false, error: 'Editor tab no longer exists' }
+      }
+      try {
+        await chrome.tabs.update(editorTabId, { active: true })
+        await chrome.windows.update(editorWindowId, { focused: true })
+        console.log('[Workflow][EditorFocus] restored', JSON.stringify({
+          nodeId,
+          provider,
+          tabId: editorTabId,
+          windowId: editorWindowId,
+          url: liveTab.url || '',
+        }))
+        return { success: true, tabId: editorTabId, windowId: editorWindowId }
+      } catch (err) {
+        console.log('[Workflow][EditorFocus] restoreSkipped', JSON.stringify({
+          reason: 'tab-or-window-update-failed',
+          nodeId,
+          provider,
+          tabId: editorTabId,
+          windowId: editorWindowId,
+          error: (err as Error).message,
+        }))
+        return { success: false, error: (err as Error).message }
+      }
     }
 
     case 'RUN_FLOW_PROMPT':
@@ -714,6 +844,441 @@ async function openProviderTab(
   }
 }
 
+async function getStoredWorkflowEditorState(): Promise<{
+  tabId: number | null
+  windowId: number | null
+  tab: chrome.tabs.Tab | null
+  window: chrome.windows.Window | null
+  url: string
+  isPopupWindow: boolean
+}> {
+  const editorRef = await readStoredWorkflowEditorIds()
+  const editorTabId = Array.from(editorRef.tabIds)[0] ?? null
+  const editorWindowId = Array.from(editorRef.windowIds)[0] ?? null
+
+  let editorTab: chrome.tabs.Tab | null = null
+  let editorWindow: chrome.windows.Window | null = null
+
+  if (editorTabId !== null) {
+    try {
+      editorTab = await chrome.tabs.get(editorTabId)
+    } catch {
+      editorTab = null
+    }
+  }
+
+  if (editorWindowId !== null) {
+    try {
+      editorWindow = await chrome.windows.get(editorWindowId, { populate: true })
+    } catch {
+      editorWindow = null
+    }
+  }
+
+  if (!editorTab && editorWindow?.tabs?.length) {
+    const editorUrl = chrome.runtime.getURL('tabs/workflow-editor.html')
+    editorTab = editorWindow.tabs.find((tab) => {
+      const url = String(tab.url || tab.pendingUrl || '')
+      return url.startsWith(editorUrl)
+    }) || editorWindow.tabs[0] || null
+  }
+
+  return {
+    tabId: toPositiveNumber(editorTab?.id) ?? editorTabId,
+    windowId: toPositiveNumber(editorTab?.windowId) ?? editorWindowId,
+    tab: editorTab,
+    window: editorWindow,
+    url: String(editorTab?.url || editorTab?.pendingUrl || ''),
+    isPopupWindow: editorWindow?.type === 'popup',
+  }
+}
+
+async function logWorkflowEditorVisibility(
+  event: 'beforeProviderFocus' | 'afterProviderFocus',
+  provider: string,
+  providerTabId?: number,
+  providerWindowId?: number
+): Promise<void> {
+  const editor = await getStoredWorkflowEditorState().catch(() => null)
+  let providerTab: chrome.tabs.Tab | null = null
+  let providerWindow: chrome.windows.Window | null = null
+
+  if (providerTabId !== undefined) {
+    try {
+      providerTab = await chrome.tabs.get(providerTabId)
+    } catch {
+      providerTab = null
+    }
+  }
+
+  const resolvedProviderWindowId = toPositiveNumber(providerWindowId) ?? toPositiveNumber(providerTab?.windowId)
+  if (resolvedProviderWindowId !== null) {
+    try {
+      providerWindow = await chrome.windows.get(resolvedProviderWindowId)
+    } catch {
+      providerWindow = null
+    }
+  }
+
+  const editorWindowId = editor?.windowId ?? null
+  const payload: Record<string, unknown> = {
+    editorTabId: editor?.tabId ?? null,
+    editorWindowId,
+    editorTabActive: editor?.tab?.active ?? null,
+    editorWindowFocused: editor?.window?.focused ?? null,
+    editorWindowType: editor?.window?.type ?? null,
+    editorUrl: editor?.url ?? '',
+    provider,
+    providerTabId: providerTabId ?? null,
+    providerWindowId: resolvedProviderWindowId,
+  }
+
+  if (event === 'afterProviderFocus') {
+    payload.providerTabActive = providerTab?.active ?? null
+    payload.providerWindowFocused = providerWindow?.focused ?? null
+  }
+
+  console.log('[Workflow][EditorVisibility] ' + event, JSON.stringify(payload))
+
+  if (
+    editor?.tabId !== null &&
+    editorWindowId !== null &&
+    resolvedProviderWindowId !== null &&
+    editorWindowId === resolvedProviderWindowId
+  ) {
+    console.warn('[Workflow][EditorVisibility] same_window_conflict', JSON.stringify({
+      editorTabId: editor.tabId,
+      editorWindowId,
+      provider,
+      providerTabId: providerTabId ?? null,
+      providerWindowId: resolvedProviderWindowId,
+      message: 'Workflow Editor is a normal tab in the same window. It cannot stay visible while provider tab is active. Open editor as popup window.',
+    }))
+  }
+}
+
+async function getNormalProviderWindowId(excludedWindowIds: Set<number>): Promise<number | undefined> {
+  try {
+    const windows = await chrome.windows.getAll()
+    const normalWindows = windows.filter((win) => {
+      const winId = toPositiveNumber(win.id)
+      return win.type === 'normal' && winId !== null && !excludedWindowIds.has(winId)
+    })
+    const focused = normalWindows.find((win) => win.focused)
+    return toPositiveNumber(focused?.id) ?? toPositiveNumber(normalWindows[0]?.id) ?? undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Workflow-only provider tab router. Always activates + focuses the
+ * window; optionally waits for the per-provider readiness probe.
+ *
+ * Returns a structured payload so the runner can chain the next
+ * action without re-querying chrome.tabs:
+ *   {
+ *     success: boolean
+ *     provider: 'google-flow' | 'chatgpt'
+ *     tabId: number
+ *     windowId: number
+ *     url: string  ← tabs.get(tabId).url AFTER activation
+ *     ready: boolean  ← content script responded to provider ping,
+ *                       or `true` when `waitReady=false`
+ *     activated: boolean  ← whether this call moved the tab forward
+ *   }
+ *
+ * Logging contract: every state transition emits one
+ * `[Workflow][ProviderRoute] <event>` line so operators can confirm
+ * the routing sequence by greping the BG console only. Event names
+ * fixed: `start`, `existingTab`, `createdTab`, `focusedTab`,
+ * `ready`. Defensive against unknown providers, missing tabs, and
+ * the readiness probe failing — none of those block the rest of
+ * the chain. `ready:false` is the signal that the next step
+ * (RUN_CHATGPT_PROMPT / RUN_FLOW_PROMPT) must do its own readiness
+ * wait.
+ */
+async function ensureProviderTabForWorkflow(
+  provider: string,
+  nodeId: string,
+  options: {
+    waitReady?: boolean
+    activate?: boolean
+    focusWindow?: boolean
+    preserveEditor?: boolean
+  } = {}
+): Promise<{
+  success: boolean
+  provider?: string
+  tabId?: number
+  windowId?: number
+  url?: string
+  ready?: boolean
+  activated?: boolean
+  focused?: boolean
+  error?: string
+}> {
+  const waitReady = options.waitReady !== false
+  const activate = options.activate === true
+  const focusWindow = options.focusWindow === true
+  const preserveEditor = options.preserveEditor !== false
+  const trace = (event: string, extra: Record<string, unknown> = {}) => {
+    console.log('[Workflow][ProviderRoute]', event, JSON.stringify({
+      nodeId: nodeId || '(none)',
+      provider,
+      activate,
+      focusWindow,
+      preserveEditor,
+      tabId: extra.tabId ?? null,
+      windowId: extra.windowId ?? null,
+      url: extra.url ?? null,
+      ready: extra.ready ?? null,
+      ...extra,
+    }))
+  }
+
+  trace('ensureTab')
+
+  const config = (PROVIDER_TABS as Record<string, { queryUrl: string; createUrl: string } | undefined>)[provider]
+  if (!config) {
+    trace('error', { reason: 'unknown_provider' })
+    return { success: false, error: 'Unknown provider: ' + provider }
+  }
+
+  // Step 1: find or create the provider tab.
+  let tabId: number | undefined
+  let windowId: number | undefined
+  let url: string | undefined
+  let createdNow = false
+  try {
+    const editorRef = await readStoredWorkflowEditorIds()
+    const editorState = await getStoredWorkflowEditorState().catch(() => null)
+    const editorTabIds = editorRef.tabIds
+    const editorWindowIds = editorRef.windowIds
+    const editorPopupWindowIds = new Set<number>()
+    if (editorState?.isPopupWindow && editorState.windowId !== null) {
+      editorPopupWindowIds.add(editorState.windowId)
+    }
+    const editorExtensionPrefix = chrome.runtime.getURL('')
+    const rawMatches = await chrome.tabs.query({ url: config.queryUrl })
+    // Defense-in-depth: filter out any tab whose id / windowId
+    // matches the workflow editor origin, OR whose URL resolves to
+    // the extension's own pages. In normal flows the URL match
+    // pattern (e.g. https://labs.google/fx/*) cannot match the
+    // extension URL — Chrome's `chrome.tabs.query` respects URL
+    // patterns — but a future constant change, an open chatgpt tab
+    // that's been navigated by the user to a debug URL, or a stale
+    // popup could in theory collide. Filter rather than mutate so
+    // the editor popup is never even touched.
+    const candidates = rawMatches.filter((tab) => {
+      const tabIdNum = toPositiveNumber(tab.id)
+      const windowIdNum = toPositiveNumber(tab.windowId)
+      const tabUrl = String(tab.url || tab.pendingUrl || '')
+      if (tabIdNum !== null && editorTabIds.has(tabIdNum)) {
+        console.log('[Workflow][EditorFocus] preserved', JSON.stringify({
+          reason: 'tab-id-matches-editor',
+          provider,
+          candidateTabId: tabIdNum,
+          candidateUrl: tabUrl,
+          editorTabId: Array.from(editorTabIds)[0] ?? null,
+        }))
+        return false
+      }
+      if (windowIdNum !== null && editorPopupWindowIds.has(windowIdNum)) {
+        console.log('[Workflow][EditorFocus] preserved', JSON.stringify({
+          reason: 'window-id-matches-editor',
+          provider,
+          candidateTabId: tabIdNum,
+          candidateWindowId: windowIdNum,
+          editorWindowId: Array.from(editorWindowIds)[0] ?? null,
+        }))
+        return false
+      }
+      if (windowIdNum !== null && editorWindowIds.has(windowIdNum)) {
+        console.warn('[Workflow][EditorVisibility] same_window_conflict', JSON.stringify({
+          editorTabId: Array.from(editorTabIds)[0] ?? null,
+          editorWindowId: windowIdNum,
+          provider,
+          providerTabId: tabIdNum,
+          providerWindowId: windowIdNum,
+          message: 'Workflow Editor is a normal tab in the same window. It cannot stay visible while provider tab is active. Open editor as popup window.',
+        }))
+      }
+      if (tabUrl.startsWith(editorExtensionPrefix)) {
+        console.log('[Workflow][EditorFocus] preserved', JSON.stringify({
+          reason: 'extension-url-match',
+          provider,
+          candidateTabId: tabIdNum,
+          candidateUrl: tabUrl,
+        }))
+        return false
+      }
+      return true
+    })
+    if (candidates.length > 0 && candidates[0].id) {
+      tabId = candidates[0].id
+      windowId = (candidates[0] as { windowId?: number }).windowId
+      url = candidates[0].url || candidates[0].pendingUrl || ''
+      trace('existingTab', {
+        tabId,
+        windowId,
+        url,
+        rejectedEditorMatches: rawMatches.length - candidates.length,
+      })
+    } else {
+      const targetWindowId = await getNormalProviderWindowId(editorPopupWindowIds)
+      let created: chrome.tabs.Tab
+      if (targetWindowId !== undefined) {
+        created = await chrome.tabs.create({
+          url: config.createUrl,
+          active: false,
+          windowId: targetWindowId
+        })
+      } else {
+        const createdWindow = await chrome.windows.create({
+          url: config.createUrl,
+          type: 'normal',
+          focused: false
+        })
+        const firstTab = createdWindow.tabs?.[0]
+        if (!firstTab) throw new Error('Provider window created without a tab')
+        created = firstTab
+      }
+      tabId = created.id
+      windowId = created.windowId
+      url = created.url || created.pendingUrl || config.createUrl
+      createdNow = true
+      trace(activate ? 'createdTab' : 'createdBackgroundTab', { tabId, windowId, url })
+    }
+  } catch (err) {
+    trace('error', { reason: 'tab_query_or_create_failed', error: (err as Error).message })
+    return { success: false, error: (err as Error).message }
+  }
+
+  if (!tabId) {
+    trace('error', { reason: 'tab_id_missing_after_query' })
+    return { success: false, error: 'Failed to obtain tabId' }
+  }
+
+  // Step 2: re-fetch the tab to see the final URL and current active
+  // state. Newly-created tabs can have `pendingUrl` while still
+  // loading; this also catches the rare case the user closed the tab
+  // between query and update.
+  let finalTab: chrome.tabs.Tab | undefined
+  try {
+    finalTab = await chrome.tabs.get(tabId)
+    url = finalTab.url || url || config.createUrl
+    windowId = finalTab.windowId ?? windowId
+  } catch (err) {
+    trace('error', { reason: 'tab_get_failed', error: (err as Error).message })
+    return { success: false, error: (err as Error).message }
+  }
+
+  await logWorkflowEditorVisibility('beforeProviderFocus', provider, tabId, windowId).catch(() => {})
+
+  // Step 3: activate the tab + focus the window. Workflow contract
+  // is "always focus" — the user's window otherwise stays on the
+  // previous provider's tab (Flow tab during a Flow→ChatGPT chain,
+  // ChatGPT tab during a ChatGPT→Flow chain), which is exactly the
+  // bug this helper fixes.
+  let activated = false
+  if (activate || focusWindow) {
+    try {
+      if (activate) {
+        await chrome.tabs.update(tabId, { active: true })
+      }
+      if (focusWindow && windowId !== undefined) {
+        await chrome.windows.update(windowId, { focused: true })
+      }
+      activated = activate
+      if (activate && !focusWindow) {
+        trace('activatedTabNoWindowFocus', {
+          tabId,
+          windowId,
+          reason: provider === 'chatgpt' && preserveEditor
+            ? 'chatgpt-needs-active-tab-but-preserve-editor'
+            : 'activate-without-window-focus',
+        })
+      } else {
+        trace('focusedTab', { tabId, windowId })
+      }
+    } catch (err) {
+    // Tabs in special windows (e.g. chrome://-only) cannot be
+    // activated — log and continue. Subsequent RUN_*_PROMPT paths
+    // will still send the message to the right tabId.
+      trace('focusedTab', { tabId, windowId, warn: (err as Error).message })
+    }
+
+  } else {
+    trace('noActivate', {
+      tabId,
+      windowId,
+      reason: preserveEditor ? 'workflow-editor-preservation' : 'activate-false',
+    })
+  }
+
+  await logWorkflowEditorVisibility('afterProviderFocus', provider, tabId, windowId).catch(() => {})
+
+  // Step 4: optional readiness probe. Per-provider:
+  //   - chatgpt → CHATGPT_PING via chrome.tabs.sendMessage (the
+  //     listener comes from the generic content-script.ts).
+  //   - google-flow → MAIN-world flow bridge probe via
+  //     executeScript + BridgePingRaw probe (cheap, no extra
+  //     injection). runFlowPrompt below will do its own
+  //     waitBridgeReady anyway, so this is best-effort.
+  // When `waitReady === false`, we skip the probe entirely.
+  let ready = false
+  if (waitReady) {
+    try {
+      if (provider === 'chatgpt') {
+        // The generic content-script already exposes CHATGPT_PING
+        // on chatgpt.com (verified at runtime via sendMessage).
+        const ping = await chrome.tabs
+          .sendMessage(tabId, { action: 'CHATGPT_PING' })
+          .catch(() => null)
+        ready = !!(ping && (ping as { success?: boolean }).success !== false)
+        if (!ready && activate) {
+          await new Promise((resolve) => setTimeout(resolve, 500))
+          try {
+            await ensureChatGPTContentReady(tabId)
+            ready = true
+          } catch (readyErr) {
+            ready = false
+            trace('chatgptReadyAfterActivate', {
+              ready,
+              tabId,
+              warn: (readyErr as Error).message,
+            })
+          }
+        }
+        if (activate) {
+          trace('chatgptReadyAfterActivate', { ready, tabId })
+        }
+        // Treat absence-of-listener as "not ready" but do not fail.
+      } else if (provider === 'google-flow') {
+        const probe = await pingFlowBridgeViaMainWorld(tabId).catch(() => null)
+        ready = !!(probe && (probe as { bridgeReady?: boolean }).bridgeReady === true)
+      }
+      trace('ready', { ready, tabId })
+    } catch (err) {
+      trace('ready', { ready: false, tabId, warn: (err as Error).message })
+    }
+  } else {
+    ready = true
+  }
+
+  return {
+    success: true,
+    provider,
+    tabId,
+    windowId,
+    url,
+    ready,
+    activated,
+    focused: focusWindow,
+  }
+}
+
 // ── ChatGPT job state ───────────────────────────────────────────────────
 //
 // Job state lives in chrome.storage.session so it survives service-worker
@@ -817,8 +1382,14 @@ interface ChatGPTPromptPayload {
   outputFolder?: string
   timeoutMs?: number
   mediaUploads?: Array<{ name?: string; type?: string; base64?: string }>
+  tabId?: number
   /** When false, do not focus the ChatGPT tab — keep the caller's tab visible. */
   focus?: boolean
+  activateTab?: boolean
+  focusWindow?: boolean
+  /** Workflow runner sets this to avoid stealing focus from the editor. */
+  preserveEditor?: boolean
+  source?: string
 }
 
 async function chatgptReadJobs(): Promise<Record<string, ChatGPTJobState>> {
@@ -1341,12 +1912,33 @@ async function runChatGPTPromptLocked(
   // 1. Find or create ChatGPT tab (reuse existing helper).
   // Default behavior focuses the tab (GenPanel). Workflow-run
   // callers pass focus:false so the user's tab stays visible.
-  const opened = await openProviderTab('chatgpt', payload.focus !== false)
-  if (!opened.success || !opened.tabId) {
-    return { success: false, error: opened.error || 'Failed to open ChatGPT tab' }
+  const routedTabId = toPositiveNumber(payload.tabId)
+  const shouldUseRoutedTab = payload.preserveEditor === true && routedTabId !== null
+  const shouldFocusChatGPT = payload.preserveEditor === true ? false : payload.focus !== false
+  let tabId: number
+
+  if (shouldUseRoutedTab) {
+    tabId = routedTabId
+    if (payload.activateTab === true) {
+      await chrome.tabs.update(tabId, { active: true }).catch(() => {})
+    }
+  } else {
+    const opened = await openProviderTab('chatgpt', shouldFocusChatGPT)
+    if (!opened.success || !opened.tabId) {
+      return { success: false, error: opened.error || 'Failed to open ChatGPT tab' }
+    }
+    tabId = opened.tabId
   }
-  const tabId = opened.tabId
-  console.log('[ChatGPT][Background] tab opened/focused tabId=' + tabId)
+
+  if (payload.preserveEditor === true) {
+    console.log('[Workflow][ProviderRoute] chatgptNoFocus', JSON.stringify({
+      tabId,
+      reusedRoutedTab: shouldUseRoutedTab,
+      activateTab: payload.activateTab === true,
+      reason: 'workflow-editor-preservation',
+    }))
+  }
+  console.log('[ChatGPT][Background] tab resolved tabId=' + tabId + ' focused=' + shouldFocusChatGPT)
 
   // 2. Ensure content script is injected AND responsive. This is the
   // critical guard against "Receiving end does not exist" — the prior
@@ -1597,6 +2189,8 @@ interface RunFlowPromptPayload {
   resolution: string
   videoResolution?: string
   focusTab?: boolean
+  preserveEditor?: boolean
+  source?: string
 }
 
 interface FlowStatusPayload {
@@ -2181,7 +2775,12 @@ async function runFlowPrompt(
     }))
   }
 
-  if (payload.focusTab) {
+  if (payload.preserveEditor === true || payload.focusTab === false) {
+    console.log('[Workflow][ProviderRoute] flowNoFocus', JSON.stringify({
+      tabId,
+      reason: 'workflow-editor-preservation',
+    }))
+  } else if (payload.focusTab) {
     await chrome.tabs.update(tabId, { active: true }).catch(() => {})
   }
 

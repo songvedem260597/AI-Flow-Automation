@@ -331,6 +331,59 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms))
 }
 
+// Normalize a Flow-side URL to an absolute https://labs.google/...
+// URL when possible. Flow's <img> / <video> elements frequently expose
+// `src="/fx/api/trpc/media.getMediaUrlRedirect?name=..."` — a path-
+// relative URL that ONLY resolves inside the Flow tab's origin. When
+// the workflow runner forwards that URL to a downstream node and the
+// node tries to fetch it from the extension / side panel context, the
+// browser resolves it against `chrome-extension://...` and reports
+// `ERR_FILE_NOT_FOUND`. We always normalize the URL the moment the
+// asset crosses the bridge boundary, AND defensively normalize again
+// when shipping the asset to the runner so legacy callers that somehow
+// already saw a relative URL do not regress.
+//
+// Rules:
+//   blob:           — keep as-is (already absolute within the page)
+//   data:           — keep as-is (data URL is self-contained)
+//   http(s)://      — keep as-is
+//   protocol-relative `//foo` — prepend `https:`
+//   path-relative `/foo`       — resolve against `location.origin`
+//   anything else  — keep as-is
+function toAbsoluteFlowUrl(value: unknown, origin?: string): string {
+  if (typeof value !== 'string') return ''
+  var v = value.trim()
+  if (!v) return ''
+  if (
+    v.indexOf('blob:') === 0 ||
+    v.indexOf('data:') === 0 ||
+    v.indexOf('http://') === 0 ||
+    v.indexOf('https://') === 0
+  ) {
+    return v
+  }
+  if (v.indexOf('//') === 0) {
+    return 'https:' + v
+  }
+  if (v.indexOf('/') === 0) {
+    try {
+      var base = origin || (typeof location !== 'undefined' && location && location.origin) || ''
+      if (!base) return v
+      return new URL(v, base).href
+    } catch (_) {
+      return v
+    }
+  }
+  return v
+}
+
+// Page origin (e.g. https://labs.google). Captured once at file load
+// so every output asset can be tagged with the origin it came from.
+// The runner can use this to repair relative URLs that somehow slip
+// through the bridge normalization.
+var FLOW_PROVIDER_ORIGIN: string = (typeof location !== 'undefined' && location && location.origin) || ''
+var FLOW_SOURCE_PAGE_URL: string = (typeof location !== 'undefined' && location && location.href) || ''
+
 /**
  * Build a sanitized download filename from prompt text.
  * Converts Vietnamese diacritics to ASCII, strips special chars.
@@ -693,6 +746,9 @@ async function runFlowPrompt(payload: {
   }
   flowTrace('Content', 'STEP_3_CLEAR_DONE', { method: (clearResult as Record<string, unknown>).method })
   await new Promise(r => setTimeout(r, 300))
+  // Snapshot editor text right after clear so we can prove addRef/insert
+  // never introduced extra text from a duplicate bridge or stale state.
+  await snapshotEditorText('after_clear')
 
   // Step 4: Add reference images BEFORE text
   const isFrames = !!(payload.frameFileIds && (payload.frameFileIds.frame1 || payload.frameFileIds.frame2))
@@ -744,11 +800,18 @@ async function runFlowPrompt(payload: {
     }
     flowTrace('Content', 'STEP_4_ADD_REF_DONE', { count: payload.fileIds.length })
     await new Promise(r => setTimeout(r, 300))
+    // Snapshot editor text after addRef to catch any prompt leakage from
+    // the "Add to prompt" right-click menu (Flow sometimes appends the
+    // prompt text as part of the chip caption).
+    await snapshotEditorText('after_addRef')
   }
 
   // Step 5: Insert text
   console.log('[FlowContent] Step 5: insertText, len=', payload.prompt.length)
   flowTrace('Content', 'STEP_5_INSERT_START', { promptLen: payload.prompt.length })
+  // Snapshot editor text BEFORE insert so the strict verify below can
+  // diff cleanly against a known-clean baseline.
+  await snapshotEditorText('before_insert')
   let insertResult = await bridgeCall('insert', { text: payload.prompt })
   flowTrace('Content', 'STEP_5_INSERT_RAW', insertResult)
   if (!insertResult.success) {
@@ -788,6 +851,87 @@ async function runFlowPrompt(payload: {
   })
   notifyStatus('FLOW_INSERT_SUCCESS')
   await new Promise(r => setTimeout(r, 500))
+
+  // ── Step 5 verify: STRICT expected-vs-actual prompt check ─────────────
+  // The Slate `insert` action's verifyText used to be satisfied by
+  // "placeholderGone=true" alone, which let a duplicated prompt like
+  // "ảnh 16:9ảnh 16:9" pass. After Step 5 we now ALWAYS call the new
+  // bridge `verifyPrompt` action — which compares expected vs actual
+  // character-for-character — and we surface the result with one
+  // canonical log key for grep:
+  //   [FlowContent][STEP_5_INSERT_VERIFY]
+  //     expected="ảnh 16:9" actual="ảnh 16:9" duplicate=false
+  // If `duplicate` is true the run is HARD-FAILED with
+  // status='FLOW_INSERT_TEXT_DUPLICATED' — never submitted with a
+  // doubled prompt. If `actual` is empty or doesn't match expected
+  // the run HARD-FAILS with status='FLOW_INSERT_TEXT_MISMATCH'.
+  let strictVerify: Record<string, unknown> = {}
+  for (let vpAttempt = 0; vpAttempt < 3; vpAttempt++) {
+    try {
+      strictVerify = (await bridgeCall('verifyPrompt', { text: payload.prompt }, 5000)) as Record<string, unknown>
+      break
+    } catch (e) {
+      console.warn('[FlowContent] verifyPrompt attempt ' + (vpAttempt + 1) + ' failed: ' + (e as Error)?.message)
+      await new Promise(r => setTimeout(r, 300))
+    }
+  }
+  const expectedText = String(strictVerify.expected || payload.prompt || '').trim()
+  const actualText = String(strictVerify.domText || '').trim()
+  const isDuplicate = !!(strictVerify.duplicate)
+  const isExactMatch = !!(strictVerify.exactMatch)
+  console.log('[FlowContent][STEP_5_INSERT_VERIFY] ' + JSON.stringify({
+    expected: expectedText,
+    actual: actualText,
+    duplicate: isDuplicate,
+    exactMatch: isExactMatch,
+    slateMatch: !!(strictVerify.slateMatch),
+    domMatch: !!(strictVerify.domMatch),
+    slateText: String(strictVerify.slateText || '').substring(0, 60),
+    attemptMethod: String((insertResult as Record<string, unknown>).method || ''),
+    attemptStrategy: String((insertResult as Record<string, unknown>).strategy || ''),
+  }))
+  flowTrace('Content', 'STEP_5_INSERT_VERIFY', {
+    expected: expectedText,
+    actual: actualText,
+    duplicate: isDuplicate,
+    exactMatch: isExactMatch,
+  })
+
+  if (isDuplicate) {
+    flowTraceFail('insertText', 'FLOW_INSERT_TEXT_DUPLICATED', {
+      rawResult: strictVerify,
+      payloadSummary: payloadSummary,
+      extra: { expected: expectedText, actual: actualText, attemptMethod: String((insertResult as Record<string, unknown>).method || '') },
+    })
+    return {
+      success: false,
+      status: 'FLOW_INSERT_TEXT_DUPLICATED',
+      error: 'Prompt appears more than once in editor. expected="' + expectedText + '" actual="' + actualText + '". The bridge or content script has a duplicate listener — verify only one bridge instance is installed.',
+      expected: expectedText,
+      actual: actualText,
+      duplicate: true,
+      insertMethod: String((insertResult as Record<string, unknown>).method || ''),
+    }
+  }
+  if (!isExactMatch) {
+    flowTraceFail('insertText', 'FLOW_INSERT_TEXT_MISMATCH', {
+      rawResult: strictVerify,
+      payloadSummary: payloadSummary,
+      extra: { expected: expectedText, actual: actualText, attemptMethod: String((insertResult as Record<string, unknown>).method || '') },
+    })
+    return {
+      success: false,
+      status: 'FLOW_INSERT_TEXT_MISMATCH',
+      error: 'Prompt not present verbatim after insert. expected="' + expectedText + '" actual="' + actualText + '"',
+      expected: expectedText,
+      actual: actualText,
+      exactMatch: false,
+      insertMethod: String((insertResult as Record<string, unknown>).method || ''),
+    }
+  }
+  // Snapshot editor text after the strict verify passes so we have a
+  // clean post-insert baseline.
+  await snapshotEditorText('after_insert')
 
   // Step 6: Verify
   flowTrace('Content', 'STEP_6_VERIFY_START', {})
@@ -952,21 +1096,68 @@ async function runFlowPrompt(payload: {
     downloadResolution: normDownloadResolution,
     videoDownloadResolution: normVideoResolution,
     outputFolder: normOutputFolder,
+    source: (payload as Record<string, unknown>).source || 'gen-tab',
+    suppressAutoDownload: !!(payload as Record<string, unknown>).suppressAutoDownload,
+    collectOutputs: (payload as Record<string, unknown>).collectOutputs !== false,
     rawPayloadKeys: Object.keys(payload),
   }))
 
-  var autoDownloadResult: Record<string, unknown> = { skipped: true }
-  if (!normAutoDownload) {
-    console.log('[FlowContent][AUTO_DOWNLOAD_SKIP] reason=autoDownload_disabled')
-  } else {
-    console.log('[FlowContent][AUTO_DOWNLOAD_START]', JSON.stringify({
-      expectedCount: payload.quantity,
-      baselineIds: preSubmitIds.length,
-      baselineNonEmptyFileNames: preSubmitFileNames.filter(function (f) { return f.length > 0 }).length,
-      downloadResolution: normDownloadResolution,
-      videoDownloadResolution: normVideoResolution,
-      outputFolder: normOutputFolder,
+  // ── Two-flag gate ─────────────────────────────────────────────
+  // shouldCollectOutputs: should we wait for new result tiles and
+  //   build outputAssets for the workflow preview / downstream
+  //   media? Defaults to true. Workflow callers set this true so
+  //   the node still shows its generated thumbnails even when no
+  //   file is downloaded.
+  // shouldAutoDownload: should we call bridge.downloadTileMedia and
+  //   write files to the user's disk? Defense-in-depth gate: any
+  //   caller (gen-tab, workflow, future sources) must satisfy all
+  //   three — autoDownload===true, suppressAutoDownload!==true,
+  //   source!=='workflow' — before a download fires.
+  //   Gen tab: shouldAutoDownload = autoDownload toggle
+  //   Workflow: shouldAutoDownload = false
+  var payloadSource = String((payload as Record<string, unknown>).source || 'gen-tab')
+  var payloadSuppress = !!(payload as Record<string, unknown>).suppressAutoDownload
+  var shouldCollectOutputs = (payload as Record<string, unknown>).collectOutputs !== false
+  var shouldAutoDownload =
+    normAutoDownload === true &&
+    payloadSuppress !== true &&
+    payloadSource !== 'workflow'
+
+  var autoDownloadResult: Record<string, unknown> = {
+    attempted: shouldAutoDownload,
+    skipped: !shouldAutoDownload,
+  }
+  if (!shouldCollectOutputs) {
+    console.log('[FlowContent][RESULT_COLLECTION_SKIP] reason=collectOutputs_disabled', JSON.stringify({
+      source: payloadSource,
+      suppressAutoDownload: payloadSuppress,
     }))
+  } else {
+    if (shouldAutoDownload) {
+      console.log('[FlowContent][RESULT_COLLECTION_START]', JSON.stringify({
+        expectedCount: payload.quantity,
+        baselineIds: preSubmitIds.length,
+        baselineNonEmptyFileNames: preSubmitFileNames.filter(function (f) { return f.length > 0 }).length,
+        downloadResolution: normDownloadResolution,
+        videoDownloadResolution: normVideoResolution,
+        outputFolder: normOutputFolder,
+        source: payloadSource,
+        downloadEnabled: true,
+      }))
+    } else {
+      console.log('[FlowContent][RESULT_COLLECTION_START]', JSON.stringify({
+        expectedCount: payload.quantity,
+        baselineIds: preSubmitIds.length,
+        baselineNonEmptyFileNames: preSubmitFileNames.filter(function (f) { return f.length > 0 }).length,
+        downloadResolution: normDownloadResolution,
+        videoDownloadResolution: normVideoResolution,
+        outputFolder: normOutputFolder,
+        source: payloadSource,
+        downloadEnabled: false,
+        reason: 'download_suppressed_collecting_outputs_only',
+        autoDownloadRequested: normAutoDownload,
+      }))
+    }
 
     // ── Wait for new result tiles with DUAL filter (id + fileName) ──
     // This prevents lazy-loaded old tiles or mis-identified ref tiles from appearing
@@ -1439,7 +1630,7 @@ async function runFlowPrompt(payload: {
         if (provisionalMediaSeenAt === 0) provisionalMediaSeenAt = nowMs
         var provisionalElapsed = nowMs - provisionalMediaSeenAt
         if (provisionalElapsed >= PROVISIONAL_GRACE_MS) {
-          console.warn('[FlowContent][AUTO_DOWNLOAD_PARTIAL_EARLY_EXIT]', JSON.stringify({
+          console.warn('[FlowContent][RESULT_COLLECTION_PARTIAL_EARLY_EXIT]', JSON.stringify({
             reason: 'provisional_grace_expired',
             expected: payload.quantity,
             confirmed: 0,
@@ -1462,22 +1653,56 @@ async function runFlowPrompt(payload: {
       // ── Partial branch: confirmed > 0 AND stable-failed > 0 ────────────
       // Flow already signaled partial: at least one tile is fully done
       // and at least one tile has been failing for >= MIN_FAIL_DETECT_MS.
-      // There is no point waiting further for the failed tiles — download
-      // the confirmed tiles now. This replaces the old "wait 30s no
-      // progress" rule for the common partial case.
-      if (uniqueConfirmed.length > 0 && failed.length > 0) {
-        console.warn('[FlowContent][AUTO_DOWNLOAD_PARTIAL_EARLY_EXIT]', JSON.stringify({
+      //
+      // BUT we must NOT exit early if the pending set still has room
+      // for more confirmed tiles to reach the partial-success target.
+      // Target semantics:
+      //   targetSuccessful = expectedQuantity - failed.length
+      //   e.g. expected=3 failed=1 → target=2 → we need 2 confirmed.
+      //   e.g. expected=3 failed=2 → target=1 → we need 1 confirmed.
+      //   e.g. expected=3 failed=3 → target=0 → nothing to download.
+      //
+      // Pre-fix behavior: exited at `confirmed>0 AND failed>0`
+      // regardless of pending, which dropped outputs when a confirmed
+      // tile would have arrived shortly after the failed tile. With
+      // expected=3, confirmed=1, failed=1, pending=1 the legacy code
+      // reported outputsCount=1 even though Flow was still painting
+      // the second confirmed tile. The fix:
+      //   exit when confirmed >= target OR pending.length === 0.
+      // Pending=0 means "Flow is done emitting tiles" so any
+      // confirmed we have IS the partial answer.
+      var targetSuccessful = Math.max(0, payload.quantity - failed.length)
+      if (uniqueConfirmed.length >= targetSuccessful && failed.length > 0) {
+        console.warn('[FlowContent][RESULT_COLLECTION_PARTIAL_EARLY_EXIT]', JSON.stringify({
           reason: 'confirmed_and_stable_failed_coexist',
           expected: payload.quantity,
           confirmed: uniqueConfirmed.length,
           failed: failed.length,
           freshFailed: freshFailedIds.size,
           pending: uniquePending.length,
+          targetSuccessful: targetSuccessful,
           waitedMs: waitedMs,
         }))
         cleanupObserver()
         // Mark newTilesFullData as the confirmed set so the post-loop branch
         // picks the partial path.
+        newTilesFullData = uniqueConfirmed
+        break
+      }
+      // Stable-failed with no remaining pending: nothing more to wait
+      // for. Take the confirmed partial set as the final answer even
+      // if confirmed < target (Flow has painted all its tiles).
+      if (uniqueConfirmed.length > 0 && failed.length > 0 && uniquePending.length === 0) {
+        console.warn('[FlowContent][RESULT_COLLECTION_PARTIAL_EARLY_EXIT]', JSON.stringify({
+          reason: 'confirmed_failed_pending_zero',
+          expected: payload.quantity,
+          confirmed: uniqueConfirmed.length,
+          failed: failed.length,
+          pending: 0,
+          targetSuccessful: targetSuccessful,
+          waitedMs: waitedMs,
+        }))
+        cleanupObserver()
         newTilesFullData = uniqueConfirmed
         break
       }
@@ -1671,18 +1896,82 @@ async function runFlowPrompt(payload: {
         pending: afterLoopPending.length,
         failed: uniqueFailed.length,
       }))
+      // Populate generation / downloadDetails even on hard failure so
+      // downstream consumers (runner, GenPanel, workflow preview)
+      // can render the same counters regardless of whether the run
+      // succeeded or failed. Keeping these blocks identical in shape
+      // to the success path means callers only need to read one set
+      // of fields.
       autoDownloadResult = {
         successCount: 0,
         failCount: 0,
+        skippedCount: 0,
+        attempted: shouldAutoDownload,
+        skipped: !shouldAutoDownload,
+        source: payloadSource,
         error: 'AUTO_DOWNLOAD_NO_SUCCESSFUL_RESULTS',
       }
-      console.log('[FlowContent][AUTO_DOWNLOAD_DONE]', JSON.stringify(autoDownloadResult))
+      // RESULT_COLLECTION_DONE always fires — independent of
+      // download gate. Even on hard failure, log the counters so
+      // operators can grep for the exact reason.
+      console.log('[FlowContent][RESULT_COLLECTION_DONE]', JSON.stringify({
+        generationExpected: payload.quantity,
+        generationGenerated: 0,
+        generationFailed: uniqueFailed.length,
+        generationPending: afterLoopPending.length,
+        generationPartial: true,
+        // status mirrors the response.status string so log and
+        // payload stay in lockstep — operators greping one field
+        // can find the other. The new normalizedStatus field
+        // exposes the canonical FLOW_SUBMIT_PARTIAL_FAILURE class
+        // for callers that want a single semantic status across
+        // success / partial / failure paths.
+        status: 'AUTO_DOWNLOAD_NO_SUCCESSFUL_RESULTS',
+        normalizedStatus: 'FLOW_SUBMIT_PARTIAL_FAILURE',
+        success: false,
+        outputsCount: 0,
+        outputsAvailableCount: 0,
+        outputsDownloadedCount: 0,
+        outputsSkippedCount: 0,
+        downloadAttempted: shouldAutoDownload,
+        downloadSuccessCount: 0,
+        downloadFailCount: 0,
+        downloadSkippedCount: 0,
+        totalFailedCount: uniqueFailed.length,
+        source: payloadSource,
+      }))
       return {
         success: false,
         status: 'AUTO_DOWNLOAD_NO_SUCCESSFUL_RESULTS',
         error: 'No successful result tiles. expected=' + payload.quantity,
         bridgeReady: true,
         autoDownload: autoDownloadResult,
+        generation: {
+          expected: payload.quantity,
+          generated: 0,
+          failed: uniqueFailed.length,
+          pending: afterLoopPending.length,
+          partial: true,
+        },
+        downloadDetails: {
+          expected: payload.quantity,
+          generated: 0,
+          generationFailedCount: uniqueFailed.length,
+          generationPendingCount: afterLoopPending.length,
+          generationPartial: true,
+          downloadAttempted: shouldAutoDownload,
+          downloaded: 0,
+          skipped: 0,
+          generationFailedCount_legacy: uniqueFailed.length,
+          generationPendingCount_legacy: afterLoopPending.length,
+        },
+        outputsCount: 0,
+        outputsAvailableCount: 0,
+        outputsDownloadedCount: 0,
+        outputsSkippedCount: 0,
+        outputs: [],
+        images: [],
+        imageUrls: [],
       }
     }
 
@@ -1692,7 +1981,7 @@ async function runFlowPrompt(payload: {
     var finalTargets: Array<{ id: string; status: string; fileName: string }> = []
     if (afterLoopConfirmed.length === 0 && provisionalDone.length > 0) {
       // Use provisional tiles as download targets (no fileName → prompt/index/resolution filename).
-      console.warn('[FlowContent][AUTO_DOWNLOAD_PARTIAL_EARLY_EXIT]', JSON.stringify({
+      console.warn('[FlowContent][RESULT_COLLECTION_PARTIAL_EARLY_EXIT]', JSON.stringify({
         reason: 'provisional_done_used',
         expected: payload.quantity,
         confirmed: afterLoopConfirmed.length,
@@ -1710,7 +1999,7 @@ async function runFlowPrompt(payload: {
       }
       finalTargets = dedupeTilesByIdentity(provOrdered)
     } else if (isPartialResult) {
-      console.warn('[FlowContent][AUTO_DOWNLOAD_PARTIAL_RESULTS]', JSON.stringify({
+      console.warn('[FlowContent][RESULT_COLLECTION_PARTIAL_RESULTS]', JSON.stringify({
         expected: payload.quantity,
         confirmed: afterLoopConfirmed.length,
         pending: afterLoopPending.length,
@@ -1857,18 +2146,78 @@ async function runFlowPrompt(payload: {
         failed: failedTargets.length,
         pending: pendingTargets.length,
       }))
+      // Hard failure after classification: 0 valid download targets.
+      // generation{} / downloadDetails{} still populated so callers
+      // see the same counter shape regardless of success / failure.
       autoDownloadResult = {
         successCount: 0,
         failCount: 0,
+        skippedCount: 0,
+        attempted: shouldAutoDownload,
+        skipped: !shouldAutoDownload,
+        source: payloadSource,
         error: 'AUTO_DOWNLOAD_NO_SUCCESSFUL_RESULTS',
       }
-      console.log('[FlowContent][AUTO_DOWNLOAD_DONE]', JSON.stringify(autoDownloadResult))
+      // RESULT_COLLECTION_DONE always fires — single source of
+      // truth for the operator-facing counter dump. `status`
+      // mirrors response.status so log and payload stay aligned;
+      // `normalizedStatus` exposes the canonical generation-level
+      // status class for callers that want one semantic across
+      // success / partial / failure paths. Legacy
+      // AUTO_DOWNLOAD_NO_SUCCESSFUL_RESULTS callers keep matching
+      // via response.status.
+      console.log('[FlowContent][RESULT_COLLECTION_DONE]', JSON.stringify({
+        generationExpected: payload.quantity,
+        generationGenerated: 0,
+        generationFailed: failedTargets.length,
+        generationPending: pendingTargets.length,
+        generationPartial: true,
+        status: 'AUTO_DOWNLOAD_NO_SUCCESSFUL_RESULTS',
+        normalizedStatus: 'FLOW_SUBMIT_PARTIAL_FAILURE',
+        success: false,
+        outputsCount: 0,
+        outputsAvailableCount: 0,
+        outputsDownloadedCount: 0,
+        outputsSkippedCount: 0,
+        downloadAttempted: shouldAutoDownload,
+        downloadSuccessCount: 0,
+        downloadFailCount: 0,
+        downloadSkippedCount: 0,
+        totalFailedCount: failedTargets.length,
+        source: payloadSource,
+      }))
       return {
         success: false,
         status: 'AUTO_DOWNLOAD_NO_SUCCESSFUL_RESULTS',
         error: 'No successful result tiles after classification. expected=' + payload.quantity,
         bridgeReady: true,
         autoDownload: autoDownloadResult,
+        generation: {
+          expected: payload.quantity,
+          generated: 0,
+          failed: failedTargets.length,
+          pending: pendingTargets.length,
+          partial: true,
+        },
+        downloadDetails: {
+          expected: payload.quantity,
+          generated: 0,
+          generationFailedCount: failedTargets.length,
+          generationPendingCount: pendingTargets.length,
+          generationPartial: true,
+          downloadAttempted: shouldAutoDownload,
+          downloaded: 0,
+          skipped: 0,
+          generationFailedCount_legacy: failedTargets.length,
+          generationPendingCount_legacy: pendingTargets.length,
+        },
+        outputsCount: 0,
+        outputsAvailableCount: 0,
+        outputsDownloadedCount: 0,
+        outputsSkippedCount: 0,
+        outputs: [],
+        images: [],
+        imageUrls: [],
       }
     }
     // Update isPartialResult to reflect the post-classification count.
@@ -1883,6 +2232,37 @@ async function runFlowPrompt(payload: {
 
     var successCount = 0
     var failCount = 0
+    // Tracks tiles whose chrome.downloads.download call was
+    // deliberately skipped (workflow / suppressed callers). Kept
+    // separate from `failCount` because a skip is not a failure.
+    var skippedCount = 0
+    var tileErrors: Array<{ tileId: string; error: string; directSrc?: string; fileName?: string }> = []
+    // Per-tile output asset descriptors. These power the workflow node
+    // output preview (UI thumbnail) AND the downstream Generate/Download
+    // node inputs (via runner.coerceMediaList). Fields mirror the runner's
+    // expected media shape so coerceMediaList will accept each entry.
+    var outputAssets: Array<Record<string, unknown>> = []
+    // Map tileId → rich snapshot (thumbnail / imgSrc / videoSrc). One
+    // snapshot at the start of the loop is enough — by the time the loop
+    // opens each tile, all `done` tiles have their media URLs stable.
+    var tileMediaMap: Record<string, { thumbnail?: string; imgSrc?: string; videoSrc?: string; videoPoster?: string; hasVideo?: boolean; hasImg?: boolean }> = {}
+    try {
+      var preSnap = (await bridgeCall('getTileSnapshot', {}, 5000)) as Record<string, unknown>
+      var preSnapTiles = (preSnap.details as Array<Record<string, unknown>>) || []
+      for (var psi = 0; psi < preSnapTiles.length; psi++) {
+        var st = preSnapTiles[psi]
+        if (st && typeof st.id === 'string' && st.id) {
+          tileMediaMap[st.id] = {
+            thumbnail: typeof st.thumbnail === 'string' ? st.thumbnail : '',
+            imgSrc: typeof st.imgSrc === 'string' ? st.imgSrc : '',
+            videoSrc: typeof st.videoSrc === 'string' ? st.videoSrc : '',
+            videoPoster: typeof st.videoPoster === 'string' ? st.videoPoster : '',
+            hasVideo: !!st.hasVideo,
+            hasImg: !!st.hasImg,
+          }
+        }
+      }
+    } catch (_) { /* non-fatal: tile-media map is best-effort */ }
     for (var di = 0; di < finalTargets.length; di++) {
       var tileEntry = finalTargets[di]
       var tileId = tileEntry.id
@@ -1907,9 +2287,9 @@ async function runFlowPrompt(payload: {
     // marked as failed. The batch MUST NOT halt on this — increment
     // failCount and continue to the next target.
     var tileReady = false
-    var finalTileData: { id: string; fileName: string; status: string } | null = null
+    var finalTileData: { id: string; fileName: string; status: string; thumbnail?: string; imgSrc?: string; videoSrc?: string; videoPoster?: string; hasVideo?: boolean; hasImg?: boolean } | null = null
     var firstStatus = await bridgeCall('getTileSnapshot', {}, 5000)
-    var firstSnapTiles = ((firstStatus as Record<string, unknown>).details as Array<{ id: string; fileName: string; status: string }>) || []
+    var firstSnapTiles = ((firstStatus as Record<string, unknown>).details as Array<{ id: string; fileName: string; status: string; thumbnail?: string; imgSrc?: string; videoSrc?: string; videoPoster?: string; hasVideo?: boolean; hasImg?: boolean }>) || []
     var firstTarget = firstSnapTiles.find(function (t) { return t.id === tileId })
     if (firstTarget && firstTarget.status === 'failed') {
       console.warn('[FlowContent][AUTO_DOWNLOAD] tile status=failed, skipping', JSON.stringify({
@@ -1922,7 +2302,7 @@ async function runFlowPrompt(payload: {
     for (var pi = 0; pi < 30; pi++) {
       await new Promise(r => setTimeout(r, 2000))
       var statusResult = await bridgeCall('getTileSnapshot', {}, 5000)
-      var snapTiles = ((statusResult as Record<string, unknown>).details as Array<{ id: string; fileName: string; status: string }>) || []
+      var snapTiles = ((statusResult as Record<string, unknown>).details as Array<{ id: string; fileName: string; status: string; thumbnail?: string; imgSrc?: string; videoSrc?: string; videoPoster?: string; hasVideo?: boolean; hasImg?: boolean }>) || []
       var targetTile = snapTiles.find(function (t) { return t.id === tileId })
       if (targetTile) {
         finalTileData = targetTile
@@ -1967,50 +2347,313 @@ async function runFlowPrompt(payload: {
       var filenameResolution = normMode === 'video' ? normVideoResolution : normDownloadResolution
       var fileName = buildDownloadFilename(promptText, tileIndex, normOutputFolder, filenameResolution)
 
-      // Prepare rename in background
-      try {
-        await safeSendAwait({
-          action: 'PREPARE_DOWNLOAD_RENAME',
-          payload: {
-            folder: normOutputFolder || 'tobyflow-01',
-            filename: fileName,
-            identifier: tileId,
-            resolution: filenameResolution,
-            mediaKind: normMode,
-          }
-        })
-        console.log('[Background][DOWNLOAD_RENAME_PREPARED]', JSON.stringify({ folder: normOutputFolder || 'tobyflow-01', filename: fileName, identifier: tileId, resolution: filenameResolution, mode: normMode, mediaKind: normMode }))
-      } catch (_) {}
+      // Per-tile download — gated by `shouldAutoDownload`. Workflow
+      // callers and any future caller with `suppressAutoDownload: true`
+      // skip the bridge.downloadTileMedia + chrome.downloads chain
+      // entirely, but still get a per-tile outputAsset descriptor so
+      // the node preview / downstream consumers work.
+      var dlResult: Record<string, unknown>
+      if (shouldAutoDownload) {
+        // Prepare rename in background (only meaningful when we
+        // actually trigger the chrome.downloads.download below)
+        try {
+          await safeSendAwait({
+            action: 'PREPARE_DOWNLOAD_RENAME',
+            payload: {
+              folder: normOutputFolder || 'tobyflow-01',
+              filename: fileName,
+              identifier: tileId,
+              resolution: filenameResolution,
+              mediaKind: normMode,
+            }
+          })
+          console.log('[Background][DOWNLOAD_RENAME_PREPARED]', JSON.stringify({ folder: normOutputFolder || 'tobyflow-01', filename: fileName, identifier: tileId, resolution: filenameResolution, mode: normMode, mediaKind: normMode }))
+        } catch (_) {}
 
-      // Call bridge to download via native menu
-      var dlResult = await bridgeCall('downloadTileMedia', {
-        tileId: tileId,
-        mode: normMode,
-        resolution: normDownloadResolution,
-        videoResolution: normVideoResolution,
-        fileName: fileName,
-        outputFolder: normOutputFolder,
-        index: tileIndex,
-        promptText: promptText,
-      }, 60000)
+        // Call bridge to download via native menu
+        dlResult = await bridgeCall('downloadTileMedia', {
+          tileId: tileId,
+          mode: normMode,
+          resolution: normDownloadResolution,
+          videoResolution: normVideoResolution,
+          fileName: fileName,
+          outputFolder: normOutputFolder,
+          index: tileIndex,
+          promptText: promptText,
+        }, 60000)
+      } else {
+        // Download suppressed — synthesize a no-op result so the
+        // existing success / fail branches build the right
+        // outputAsset descriptor (downloadSuccess:false,
+        // downloadSkipped:true).
+        console.log('[FlowContent][AUTO_DOWNLOAD] tile SKIPPED (suppressed)', JSON.stringify({
+          tileId: tileId,
+          source: payloadSource,
+          suppressAutoDownload: payloadSuppress,
+        }))
+        dlResult = { success: false, error: 'download_suppressed', skipped: true }
+      }
 
       if ((dlResult as Record<string, unknown>).success) {
         successCount++
         console.log('[FlowContent][AUTO_DOWNLOAD] tile SUCCESS', tileId)
-      } else {
-        failCount++
-        console.warn('[FlowContent][AUTO_DOWNLOAD] tile FAILED, continue next', JSON.stringify({
+        // Per-tile output asset descriptor (workflow node preview +
+        // downstream media). The runner's coerceMediaList will pick up
+        // either `images` (if renamed to MediaItem shape) or
+        // `imageUrls` (string[]) when this asset is reached by a
+        // downstream node. We populate BOTH shapes so the UI thumbnail
+        // works even when downstream nodes are Media/Download with
+        // a strict shape contract.
+        //
+        // `outputAvailable` is the load-bearing flag for downstream
+        // consumers — true when Flow produced a tile we have a usable
+        // URL for, regardless of whether the local file was saved.
+        // `downloadSuccess` is the narrower question "did the file
+        // land on disk" — separate from `outputAvailable` so callers
+        // can distinguish "Flow produced N images" from "we saved N
+        // files" without conflating suppressed-download (workflow
+        // path) with hard download failures.
+        //
+        // URL fields are normalized via toAbsoluteFlowUrl so the runner
+        // and downstream node see `https://labs.google/...` (or blob:)
+        // instead of path-relative `/fx/api/trpc/...` which only
+        // resolves inside the Flow tab and ERR_FILE_NOT_FOUNDs
+        // everywhere else.
+        var tileMedia = tileMediaMap[tileId] || {}
+        var assetUrl = normMode === 'video'
+          ? toAbsoluteFlowUrl(tileMedia.videoSrc || tileMedia.videoPoster || tileMedia.thumbnail || '', FLOW_PROVIDER_ORIGIN)
+          : toAbsoluteFlowUrl(tileMedia.imgSrc || tileMedia.thumbnail || '', FLOW_PROVIDER_ORIGIN)
+        var assetRecord: Record<string, unknown> = {
+          provider: 'google-flow',
+          type: normMode === 'video' ? 'video' : 'image',
+          mediaType: normMode === 'video' ? 'video' : 'image',
+          index: tileIndex,
           tileId: tileId,
-          error: (dlResult as Record<string, unknown>).error || 'unknown',
-        }))
+          fileNameFromFlow: tileFileName,
+          // savedFilename is the LOCAL on-disk path Flow's native
+          // download wrote to. We keep it for inspection / debug
+          // log lines, but the runner MUST NOT use it as a media
+          // source for the preview or downstream — Chrome's
+          // chrome-extension://... UI cannot read arbitrary local
+          // file paths. UI / downstream always use the absolute URL.
+          savedFilename: fileName,
+          outputFolder: normOutputFolder || 'tobyflow-01',
+          resolution: filenameResolution,
+          mode: normMode,
+          mediaKind: normMode,
+          providerOrigin: FLOW_PROVIDER_ORIGIN,
+          sourcePageUrl: FLOW_SOURCE_PAGE_URL,
+          // Successful tile: file saved to disk AND URL is available.
+          outputAvailable: true,
+          downloadSuccess: true,
+          downloadSkipped: false,
+          downloadId: typeof (dlResult as Record<string, unknown>).downloadId === 'number' ? (dlResult as Record<string, unknown>).downloadId : undefined,
+        }
+        if (assetUrl) {
+          assetRecord.url = assetUrl
+          assetRecord.mediaUrl = assetUrl
+          assetRecord.imageUrl = assetUrl
+        }
+        if (tileMedia.thumbnail) {
+          var thumbAbs = toAbsoluteFlowUrl(tileMedia.thumbnail, FLOW_PROVIDER_ORIGIN)
+          assetRecord.thumbnailUrl = thumbAbs
+          assetRecord.thumbnail = thumbAbs
+        }
+        if (normMode === 'video') {
+          if (tileMedia.videoSrc) assetRecord.videoUrl = toAbsoluteFlowUrl(tileMedia.videoSrc, FLOW_PROVIDER_ORIGIN)
+          if (tileMedia.videoPoster) assetRecord.poster = toAbsoluteFlowUrl(tileMedia.videoPoster, FLOW_PROVIDER_ORIGIN)
+        }
+        // mimeType: best-effort from fileName / mode
+        if (normMode === 'video') {
+          assetRecord.mimeType = 'video/mp4'
+        } else {
+          assetRecord.mimeType = 'image/png'
+        }
+        assetRecord.aspectRatio = payload.aspectRatio || '1:1'
+        outputAssets.push(assetRecord)
+      } else {
+        var tileErr = String((dlResult as Record<string, unknown>).error || 'unknown')
+        // When the per-tile download was suppressed (workflow path
+        // or any future caller with `suppressAutoDownload: true`),
+        // we still want the asset descriptor in outputAssets so the
+        // node preview and downstream consumers see the generated
+        // URL — but we do NOT increment `failCount`. A suppressed
+        // tile is neither a success nor a failure; it's a
+        // deliberate skip. Track these separately so the response
+        // payload can distinguish "tried and failed" from "didn't
+        // try".
+        var isSkipped = (dlResult as Record<string, unknown>).skipped === true
+        if (isSkipped) {
+          skippedCount++
+        } else {
+          failCount++
+        }
+        // If the bridge surfaced a direct_src_available fallback, stash
+        // the URL so flow-content.ts can return it for the background
+        // to attempt a direct download. Note: a suppressed tile is
+        // not a fallback target — only real download failures with a
+        // direct URL fallback qualify here.
+        if (!isSkipped && tileErr === 'direct_src_available') {
+          tileErrors.push({
+            tileId: tileId,
+            error: tileErr,
+            directSrc: String((dlResult as Record<string, unknown>).directSrc || ''),
+            fileName: tileFileName,
+          })
+        } else if (!isSkipped) {
+          // Suppressed tiles are not errors — don't pollute
+          // tileErrors. They flow through downloadSkippedCount.
+          tileErrors.push({ tileId: tileId, error: tileErr })
+        }
+        var failedMedia = tileMediaMap[tileId] || {}
+        var failedAssetUrl = normMode === 'video'
+          ? toAbsoluteFlowUrl(failedMedia.videoSrc || failedMedia.videoPoster || failedMedia.thumbnail || '', FLOW_PROVIDER_ORIGIN)
+          : toAbsoluteFlowUrl(failedMedia.imgSrc || failedMedia.thumbnail || '', FLOW_PROVIDER_ORIGIN)
+        var hasUsableUrl = !!failedAssetUrl
+        var failedAsset: Record<string, unknown> = {
+          provider: 'google-flow',
+          type: normMode === 'video' ? 'video' : 'image',
+          mediaType: normMode === 'video' ? 'video' : 'image',
+          index: tileIndex,
+          tileId: tileId,
+          fileNameFromFlow: tileFileName,
+          outputFolder: normOutputFolder || 'tobyflow-01',
+          resolution: filenameResolution,
+          mode: normMode,
+          mediaKind: normMode,
+          providerOrigin: FLOW_PROVIDER_ORIGIN,
+          sourcePageUrl: FLOW_SOURCE_PAGE_URL,
+          // Three independent flags so downstream callers can tell
+          // the three failure modes apart:
+          //   outputAvailable — Flow produced a tile with a usable
+          //     URL. Workflow preview + downstream media can render
+          //     this even if the file is not on disk.
+          //   downloadSuccess — did the file land on disk via
+          //     chrome.downloads.download? Always false in the else
+          //     branch.
+          //   downloadSkipped — was the download deliberately
+          //     suppressed (workflow / collect-only) vs a real
+          //     failure (403, menu timeout, ...).
+          outputAvailable: hasUsableUrl,
+          downloadSuccess: false,
+          downloadSkipped: isSkipped,
+          downloadError: isSkipped ? 'download_suppressed' : tileErr,
+        }
+        if (failedMedia.thumbnail) {
+          var failedThumbAbs = toAbsoluteFlowUrl(failedMedia.thumbnail, FLOW_PROVIDER_ORIGIN)
+          failedAsset.thumbnailUrl = failedThumbAbs
+          failedAsset.thumbnail = failedThumbAbs
+        }
+        if (failedAssetUrl) {
+          failedAsset.url = failedAssetUrl
+          failedAsset.mediaUrl = failedAssetUrl
+        }
+        outputAssets.push(failedAsset)
+        // Log routing — three distinct prefixes so operator-facing
+        // log greps are clean. Suppressed tiles are NOT failures.
+        if (isSkipped) {
+          console.log('[FlowContent][DOWNLOAD_SKIPPED]', JSON.stringify({
+            tileId: tileId,
+            reason: 'download_suppressed',
+            outputAvailable: hasUsableUrl,
+            source: payloadSource,
+          }))
+        } else {
+          console.warn('[FlowContent][AUTO_DOWNLOAD] tile FAILED, continue next', JSON.stringify({
+            tileId: tileId,
+            error: tileErr,
+          }))
+        }
       }
 
       // Small delay between downloads
       await new Promise(r => setTimeout(r, 500))
     }
 
-    console.log('[FlowContent][AUTO_DOWNLOAD_DONE]', JSON.stringify({ successCount: successCount, failCount: failCount }))
-    autoDownloadResult = { successCount: successCount, failCount: failCount }
+    // Aggregate failure reasons. The previous version only returned
+    // { successCount, failCount } — callers could not tell WHY each
+    // tile failed. We now expose `downloadFailReason` (lastError from
+    // bridge) plus the full `tileErrors` list, plus an aggregated
+    // `lastError` for the worst failure (most likely to explain a
+    // total failure). Distinguishing generation-time failure
+    // (AUTO_DOWNLOAD_PARTIAL_FAILURE) from submit-time failure
+    // (FLOW_SUBMIT_FAILED) keeps downstream callers from conflating
+    // the two.
+    var aggregatedReason = ''
+    if (failCount > 0) {
+      // First non-empty tile error
+      for (var ei = 0; ei < tileErrors.length; ei++) {
+        if (tileErrors[ei] && tileErrors[ei].error) {
+          aggregatedReason = tileErrors[ei].error
+          break
+        }
+      }
+      if (!aggregatedReason) aggregatedReason = 'unknown'
+    }
+    var directSrcFallbacks = tileErrors.filter(function (te) { return te.error === 'direct_src_available' })
+    var aggregatedDirectSrcList: string[] = []
+    for (var dsi = 0; dsi < directSrcFallbacks.length; dsi++) {
+      var dItem = directSrcFallbacks[dsi]
+      if (dItem && dItem.directSrc) aggregatedDirectSrcList.push(dItem.directSrc)
+    }
+
+    // Two parallel DONE logs:
+//   - AUTO_DOWNLOAD_DONE: only when downloads were actually
+//     attempted. Operators greping for download-path events get
+//     one line per real download attempt.
+//   - RESULT_COLLECTION_DONE: always. Reflects the result
+//     collection outcome regardless of download gating.
+    if (shouldAutoDownload) {
+      console.log('[FlowContent][AUTO_DOWNLOAD_DONE]', JSON.stringify({
+        downloadAttempted: true,
+        downloadSuccessCount: successCount,
+        downloadFailCount: failCount,
+        downloadSkippedCount: skippedCount,
+        downloadFailReason: aggregatedReason,
+        lastError: aggregatedReason,
+        tileErrorCount: tileErrors.length,
+        firstDirectSrcAvailable: aggregatedDirectSrcList[0] || '',
+        source: payloadSource,
+      }))
+    }
+    // RESULT_COLLECTION_DONE always fires — independent of the
+    // download gate. Operators greping for partial / fail events
+    // can rely on this single line. Field names explicitly
+    // distinguish generation counters (top of the log) from
+    // download counters (bottom) so a single line answers both
+    // questions without confusion.
+    console.log('[FlowContent][RESULT_COLLECTION_DONE]', JSON.stringify({
+      generationExpected: generationExpected,
+      generationGenerated: generationGenerated,
+      generationFailed: generationFailed,
+      generationPending: generationPending,
+      generationPartial: generationPartial,
+      status: finalStatus,
+      success: runSucceeded,
+      outputsCount: outputAssets.length,
+      outputsAvailableCount: outputsAvailableCount,
+      outputsDownloadedCount: outputsDownloadedCount,
+      outputsSkippedCount: outputsSkippedCount,
+      downloadAttempted: shouldAutoDownload,
+      downloadSuccessCount: outputsDownloadedCount,
+      downloadFailCount: shouldAutoDownload ? failCount : 0,
+      downloadSkippedCount: outputsSkippedCount,
+      totalFailedCount: generationFailed + (shouldAutoDownload ? failCount : 0),
+      source: payloadSource,
+    }))
+    autoDownloadResult = {
+      successCount: successCount,
+      failCount: failCount,
+      skippedCount: skippedCount,
+      downloadFailReason: aggregatedReason,
+      lastError: aggregatedReason,
+      tileErrors: tileErrors,
+      firstDirectSrcAvailable: aggregatedDirectSrcList[0] || '',
+      allDownloadFailures: tileErrors.map(function (te) { return te.error }),
+      attempted: shouldAutoDownload,
+      skipped: !shouldAutoDownload,
+      source: payloadSource,
+    }
   }
 
   flowTrace('Content', 'STEP_8_AUTO_DOWNLOAD_RESULT', {
@@ -2022,27 +2665,74 @@ async function runFlowPrompt(payload: {
     outputFolder: normOutputFolder,
   })
 
-// When autoDownload is OFF, default to success. When ON, three cases:
-    // - all expected succeeded with no partial: FLOW_SUBMIT_SUCCESS
-    // - partial (confirmed < expected): AUTO_DOWNLOAD_PARTIAL_SUCCESS
-    // - everything else (should not reach here for partial/no-success paths
-    //   which already returned early): AUTO_DOWNLOAD_PARTIAL_FAILURE
+// Generation / download counters. These are the source of truth
+    // for `generation{}` and `downloadDetails{}` below — kept
+    // independent of the AUTO_DOWNLOAD result so callers can
+    // distinguish "Flow produced N tiles" from "we saved N files".
+    var generationGenerated = afterLoopConfirmed.length
+    var generationPending = afterLoopPending.length
+    var generationFailed = uniqueFailed.length
+    var generationExpected = payload.quantity
+    // generationPartial is true whenever the final tile accounting
+    // does not match the requested quantity. Three independent
+    // conditions can trigger it (any one is enough):
+    //   1. generated < expected  → fewer confirmed tiles than asked
+    //   2. failed > 0            → at least one tile failed generation
+    //   3. pending > 0           → at least one tile is still in-flight
+    // We OR them so a user-visible "partial" badge fires even when
+    // generation succeeded but Flow didn't finish painting the last
+    // tile (we got `generated = expected` but pending > 0 indicates
+    // Flow emitted extra tiles that didn't settle).
+    var generationPartial =
+      generationGenerated < generationExpected ||
+      generationFailed > 0 ||
+      generationPending > 0
+    // Sum of (downloadSuccess === true) on outputAssets. Counts
+    // only tiles where chrome.downloads.download actually fired
+    // AND succeeded. Skipped tiles are NOT failures.
+    var outputsAvailableCount = outputAssets.filter(function (a) { return a.outputAvailable === true }).length
+    var outputsDownloadedCount = outputAssets.filter(function (a) { return a.downloadSuccess === true }).length
+    var outputsSkippedCount = outputAssets.filter(function (a) { return a.downloadSkipped === true }).length
+
+    // Status decision tree. We separate generation-success from
+    // download-success because Flow can produce a partial set of
+    // tiles that are still perfectly usable (workflow path with
+    // downloads suppressed, or hard-fail with at least one
+    // usable asset):
+    //   - generated == expected → full success (FLOW_SUBMIT_SUCCESS)
+    //   - generated > 0 && generated < expected → partial success;
+    //     workflow + downstream still get useful assets, so
+    //     success:true. Distinguish from a download-only partial
+    //     (legacy AUTO_DOWNLOAD_PARTIAL_SUCCESS) by using a
+    //     status string that callers can grep for generation-level
+    //     partials.
+    //   - generated == 0 && pending == 0 → no usable outputs;
+    //     hard failure.
+    //   - generated == 0 && pending > 0 → loop already handled
+    //     this earlier (it would have either fallen through to
+    //     provisionalDone or kept waiting).
     var runSucceeded = true
     var finalStatus = 'FLOW_SUBMIT_SUCCESS'
-    if (normAutoDownload) {
-      var expectedQty = payload.quantity
-      var allSucceeded = (autoDownloadResult.successCount === expectedQty) && (autoDownloadResult.failCount === 0)
-      if (allSucceeded) {
-        runSucceeded = true
-        finalStatus = 'FLOW_SUBMIT_SUCCESS'
+    if (generationGenerated === 0 && generationPending === 0) {
+      runSucceeded = false
+      finalStatus = 'FLOW_SUBMIT_PARTIAL_FAILURE'
+    } else if (generationPartial) {
+      runSucceeded = true
+      finalStatus = 'FLOW_SUBMIT_PARTIAL_SUCCESS'
+    }
+    // When autoDownload is enabled and downloads themselves failed
+    // (so the user got tiles they cannot preview locally) but
+    // generation succeeded, downgrade success to false so the GenPanel
+    // "Partial" UI shows. This mirrors the legacy behavior — but
+    // only when downloads were ATTEMPTED. Suppressed downloads do
+    // not affect runSucceeded.
+    if (shouldAutoDownload && outputsDownloadedCount < generationGenerated) {
+      // The user wanted files on disk but did not get all of them.
+      runSucceeded = false
+      if (outputsDownloadedCount > 0) {
+        finalStatus = 'AUTO_DOWNLOAD_PARTIAL_SUCCESS'
       } else {
-        // Distinguish partial (downloaded something) from total failure (downloaded nothing)
-        finalStatus = autoDownloadResult.successCount > 0
-          ? 'AUTO_DOWNLOAD_PARTIAL_SUCCESS'
-          : 'AUTO_DOWNLOAD_PARTIAL_FAILURE'
-        // Partial: let GenPanel decide whether to alert or surface soft message
-        // based on download counts. Return success:false so GenPanel's else fires.
-        runSucceeded = false
+        finalStatus = 'AUTO_DOWNLOAD_PARTIAL_FAILURE'
       }
     }
 
@@ -2052,6 +2742,24 @@ async function runFlowPrompt(payload: {
       autoDownload: autoDownloadResult,
       submitMethod: (submitResult as Record<string, unknown>).method || '',
       insertStrategy: (insertResult as Record<string, unknown>).strategy || '',
+      // Generation outcome (independent of download).
+      generationExpected: generationExpected,
+      generationGenerated: generationGenerated,
+      generationFailed: generationFailed,
+      generationPending: generationPending,
+      generationPartial: generationPartial,
+      // Output assets.
+      outputsCount: outputAssets.length,
+      outputsAvailableCount: outputsAvailableCount,
+      outputsDownloadedCount: outputsDownloadedCount,
+      outputsSkippedCount: outputsSkippedCount,
+      // Download outcome (only meaningful when attempted).
+      downloadAttempted: shouldAutoDownload,
+      downloadSuccessCount: outputsDownloadedCount,
+      downloadFailCount: shouldAutoDownload ? failCount : 0,
+      downloadSkippedCount: outputsSkippedCount,
+      // Aggregated.
+      totalFailedCount: generationFailed + (shouldAutoDownload ? failCount : 0),
     })
 
     return {
@@ -2062,13 +2770,134 @@ async function runFlowPrompt(payload: {
       insertStrategy: (insertResult as Record<string, unknown>).strategy as string || '',
       clearMethod: (clearResult as Record<string, unknown>).method as string || '',
       autoDownload: autoDownloadResult,
-      // Structured metadata for UI / caller
-      downloadDetails: normAutoDownload ? {
-        expected: payload.quantity,
-        downloaded: autoDownloadResult.successCount,
-        generationPartial: isPartialResult,
-        generationFailedCount: isPartialResult ? (payload.quantity - (afterLoopConfirmed ? afterLoopConfirmed.length : 0)) : 0,
-      } : undefined,
+      // Generation outcome — independent of download outcome.
+      // `generated` = tiles that Flow produced and the result
+      // collection loop accepted. `failed` = tiles with stable
+      // failed status from Flow. `pending` = tiles Flow still
+      // emitted but that did not yet settle by the time we
+      // exited the loop. The sum `generated + failed + pending`
+      // is `expected` in normal cases; partial mismatches are
+      // possible when Flow emits extra tiles (capped by the
+      // result dedupe).
+      generation: {
+        expected: generationExpected,
+        generated: generationGenerated,
+        failed: generationFailed,
+        pending: generationPending,
+        partial: generationPartial,
+      },
+      // Structured metadata for UI / caller. The downloadFailReason +
+      // lastError fields distinguish generation-time failure (Flow did
+      // not produce tiles) from download-time failure (tiles exist but
+      // the menu-driven download failed). GenPanel can render them
+      // directly without conflating FLOW_SUBMIT_FAILED and
+      // AUTO_DOWNLOAD_PARTIAL_FAILURE.
+      downloadFailReason: (autoDownloadResult as Record<string, unknown>).downloadFailReason || '',
+      lastError: (autoDownloadResult as Record<string, unknown>).lastError || '',
+      tileErrors: (autoDownloadResult as Record<string, unknown>).tileErrors || [],
+      firstDirectSrcAvailable: (autoDownloadResult as Record<string, unknown>).firstDirectSrcAvailable || '',
+      // New structured downloadDetails — generation outcome + download
+      // outcome in one payload. `generated` is the source of truth
+      // for "did Flow produce something"; `downloaded` is the source
+      // of truth for "did the file land on disk"; `skipped` is the
+      // count of deliberately-not-attempted tiles (workflow / collect-
+      // only path). `downloadAttempted` makes the suppression
+      // observable so callers don't have to guess from a 0 value.
+      downloadDetails: {
+        expected: generationExpected,
+        generated: generationGenerated,
+        generationFailedCount: generationFailed,
+        generationPendingCount: generationPending,
+        generationPartial: generationPartial,
+        downloadAttempted: shouldAutoDownload,
+        downloaded: outputsDownloadedCount,
+        skipped: outputsSkippedCount,
+        // Legacy fields kept for backward-compat with callers that
+        // already read them. Semantically identical to the new
+        // explicit fields above.
+        generationFailedCount_legacy: generationFailed,
+        generationPendingCount_legacy: generationPending,
+      },
+      // Top-level count aliases — convenience fields so existing
+      // operators reading RUN_FLOW_PROMPT_RETURN don't have to walk
+      // through `generation`. (Legacy `outputsSuccessful` field is
+      // intentionally renamed to `outputsAvailableCount` to remove
+      // the semantic conflation with `downloadSuccess`.)
+      outputsCount: outputAssets.length,
+      outputsAvailableCount: outputsAvailableCount,
+      outputsDownloadedCount: outputsDownloadedCount,
+      outputsSkippedCount: outputsSkippedCount,
+      // Output assets — power the workflow node preview AND downstream
+      // media inputs. Three shapes are exposed to match the three
+      // consumers in the codebase:
+      //   `outputs`    — rich per-tile descriptor (provider, tileId,
+      //                  savedFilename, outputFolder, resolution, mode,
+      //                  thumbnailUrl, mediaUrl, etc.). Used by the
+      //                  Workflow UI to render previews + counts.
+      //   `images`     — MediaItem-shaped array filtered by
+      //                  `outputAvailable === true` so workflow callers
+      //                  see usable tiles even when downloads were
+      //                  suppressed. The runner.coerceMediaList walks
+      //                  this for downstream Media / Download / Generate
+      //                  nodes.
+      //   `imageUrls`  — flat string[] of asset URLs. The Workflow UI
+      //                  renderer (`getGenerateOutputImageUrls`) walks
+      //                  this when the rich shape is missing.
+      // Output of the workflow Generate node MUST include `outputs` so
+      // the node card shows the produced assets instead of staying
+      // empty after a successful Flow run.
+      //
+      // Final defensive URL normalization pass: even if a `tileMediaMap`
+      // entry somehow slipped through with a relative URL (older bridge
+      // build, third-party tile paint), the runner still sees an
+      // absolute `https://labs.google/...` (or blob:). This also re-
+      // applies providerOrigin / sourcePageUrl so a single asset
+      // descriptor carries everything the runner needs to repair
+      // itself.
+      outputs: outputAssets.map(function (a) {
+        return {
+          ...a,
+          url: toAbsoluteFlowUrl(a.url, FLOW_PROVIDER_ORIGIN),
+          mediaUrl: toAbsoluteFlowUrl(a.mediaUrl, FLOW_PROVIDER_ORIGIN),
+          imageUrl: toAbsoluteFlowUrl(a.imageUrl, FLOW_PROVIDER_ORIGIN),
+          thumbnailUrl: toAbsoluteFlowUrl(a.thumbnailUrl, FLOW_PROVIDER_ORIGIN),
+          thumbnail: toAbsoluteFlowUrl(a.thumbnail, FLOW_PROVIDER_ORIGIN),
+          videoUrl: toAbsoluteFlowUrl(a.videoUrl, FLOW_PROVIDER_ORIGIN),
+          poster: toAbsoluteFlowUrl(a.poster, FLOW_PROVIDER_ORIGIN),
+          providerOrigin: a.providerOrigin || FLOW_PROVIDER_ORIGIN,
+          sourcePageUrl: a.sourcePageUrl || FLOW_SOURCE_PAGE_URL,
+        }
+      }),
+      images: outputAssets
+        // Filter on `outputAvailable` so workflow callers with
+        // suppressed downloads still see usable tiles here.
+        // Previously this filter used `downloadSuccess === true`,
+        // which collapsed every workflow-path response into an
+        // empty `images[]` even when tiles were produced and the
+        // downstream Media/Download/Generate nodes could consume
+        // them via the URL.
+        .filter(function (a) { return a.outputAvailable === true })
+        .map(function (a) {
+          return {
+            mediaType: a.type,
+            data: '',
+            // Defensive: re-normalize at the very last mile so the
+            // MediaItem shape the runner consumes is always absolute.
+            url: toAbsoluteFlowUrl(a.url || a.thumbnailUrl || '', FLOW_PROVIDER_ORIGIN),
+            mediaUrl: toAbsoluteFlowUrl(a.mediaUrl || a.url || a.thumbnailUrl || '', FLOW_PROVIDER_ORIGIN),
+            imageUrl: toAbsoluteFlowUrl(a.imageUrl || a.url || a.thumbnailUrl || '', FLOW_PROVIDER_ORIGIN),
+            name: (a.savedFilename as string) || (a.fileNameFromFlow as string) || ('flow-output-' + a.index + '.' + ((a.type === 'video') ? 'mp4' : 'png')),
+            mimeType: a.mimeType,
+            aspectRatio: a.aspectRatio,
+            source: 'google-flow',
+            providerOrigin: a.providerOrigin || FLOW_PROVIDER_ORIGIN,
+            sourcePageUrl: a.sourcePageUrl || FLOW_SOURCE_PAGE_URL,
+          }
+        }),
+      imageUrls: outputAssets
+        .map(function (a) { return a.url || a.thumbnailUrl || '' })
+        .map(function (u) { return toAbsoluteFlowUrl(u, FLOW_PROVIDER_ORIGIN) })
+        .filter(function (u) { return !!u }),
     }
   }
 
@@ -2077,6 +2906,30 @@ function notifyStatus(status: string, data: Record<string, unknown> = {}) {
     action: 'FLOW_STATUS',
     payload: { status, timestamp: Date.now(), ...data }
   })
+}
+
+// ── Editor text snapshot helper ─────────────────────────────────────────────
+// Reads the current editor text via bridge `verify` action and produces
+// a single structured log line so the pipeline can grep the lifecycle of
+// the editor text. Used after clear / addRef / insert / submit so a
+// "prompt is duplicate" regression is immediately visible.
+async function snapshotEditorText(stage: string): Promise<{ stage: string; domText: string; slateText: string; url: string }> {
+  let res: Record<string, unknown> = {}
+  try {
+    res = await bridgeCall('verify', {}, 3000) as Record<string, unknown>
+  } catch (_) { res = {} }
+  var domText = String((res as Record<string, unknown>).editableText || '')
+  var slateText = String((res as Record<string, unknown>).slateEditorFound ? domText : '')
+  var url = String((res as Record<string, unknown>).url || window.location.href)
+  console.log('[FlowContent][EDITOR_TEXT_SNAPSHOT] ' + JSON.stringify({
+    stage: stage,
+    domText: domText.substring(0, 120),
+    slateText: slateText.substring(0, 120),
+    hasContent: !!(res as Record<string, unknown>).hasContent,
+    placeholderGone: !!(res as Record<string, unknown>).placeholderGone,
+    url: url,
+  }))
+  return { stage: stage, domText: domText, slateText: slateText, url: url }
 }
 
 // ── Message Handler ──────────────────────────────────────────────────────────
@@ -2124,8 +2977,184 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true
   }
 
+  // In-page fetch of a Flow media URL → data URL.
+  //
+  // The workflow runner cannot fetch `https://labs.google/fx/api/trpc/
+  // media.getMediaUrlRedirect?...` from the side panel / service
+  // worker because the request needs Flow's auth cookie and same-origin
+  // context. We expose this action so the runner can ask the Flow
+  // tab's content script to perform the fetch on its behalf and
+  // return the bytes as a data URL (or ArrayBuffer).
+  //
+  // Inputs:
+  //   payload.url         — absolute https://labs.google/... URL
+  //                         (relative URLs are normalized here too).
+  //   payload.maxBytes    — optional cap (default 25 MB). 0 = no cap.
+  //   payload.asArrayBuffer — if true, return ArrayBuffer instead of
+  //                            data URL. Used by the runner when
+  //                            forwarding the bytes through
+  //                            `mediaUploads` (which already carries
+  //                            base64).
+  //
+  // Output:
+  //   { success, dataUrl?, arrayBuffer?, mimeType, byteLength, error? }
+  //
+  // We never persist the bytes (chrome.storage is not involved). The
+  // caller consumes the data URL / ArrayBuffer in-memory and lets it
+  // be GC'd. This is safe because the caller's intent is to ship the
+  // bytes onward (uploader / next-node), not to retain them.
+  if (action === 'FLOW_FETCH_MEDIA_AS_DATA') {
+    const fetchPayload = (message.payload || {}) as Record<string, unknown>
+    const rawUrl = String(fetchPayload.url || '')
+    const maxBytes = typeof fetchPayload.maxBytes === 'number' && fetchPayload.maxBytes > 0
+      ? fetchPayload.maxBytes
+      : 25 * 1024 * 1024
+    const asArrayBuffer = fetchPayload.asArrayBuffer === true
+
+    if (!rawUrl) {
+      sendResponse({ success: false, error: 'url is required' })
+      return true
+    }
+
+    const absoluteUrl = toAbsoluteFlowUrl(rawUrl, FLOW_PROVIDER_ORIGIN)
+
+    // Reject obviously bad URLs (still relative after normalization, or
+    // pointing at the extension origin). Defensive — the runner should
+    // already have shipped absolute URLs.
+    if (
+      !absoluteUrl ||
+      absoluteUrl.indexOf('http://') !== 0 &&
+      absoluteUrl.indexOf('https://') !== 0 &&
+      absoluteUrl.indexOf('blob:') !== 0 &&
+      absoluteUrl.indexOf('data:') !== 0
+    ) {
+      sendResponse({
+        success: false,
+        error: 'url is not absolute: ' + absoluteUrl,
+        url: absoluteUrl,
+      })
+      return true
+    }
+
+    ;(async () => {
+      try {
+        const res = await fetch(absoluteUrl, {
+          method: 'GET',
+          credentials: 'include',
+          cache: 'no-store',
+          redirect: 'follow',
+          referrerPolicy: 'no-referrer',
+        })
+        if (!res.ok) {
+          sendResponse({
+            success: false,
+            error: 'fetch failed: HTTP ' + res.status,
+            url: absoluteUrl,
+            status: res.status,
+          })
+          return
+        }
+        const mimeType = (res.headers && res.headers.get && res.headers.get('content-type')) || 'application/octet-stream'
+        const buf = await res.arrayBuffer()
+        if (maxBytes > 0 && buf.byteLength > maxBytes) {
+          sendResponse({
+            success: false,
+            error: 'response too large: ' + buf.byteLength + ' bytes (max=' + maxBytes + ')',
+            url: absoluteUrl,
+            byteLength: buf.byteLength,
+          })
+          return
+        }
+        if (asArrayBuffer) {
+          // For ArrayBuffer mode we transfer ownership. Chrome's
+          // structured-clone path can carry an ArrayBuffer across
+          // chrome.runtime.sendMessage in a single hop.
+          sendResponse({
+            success: true,
+            arrayBuffer: buf,
+            mimeType: mimeType,
+            byteLength: buf.byteLength,
+            url: absoluteUrl,
+          })
+        } else {
+          // Default: data URL. We assemble bytes → base64 in a
+          // background-free loop so very large blobs do not freeze the
+          // main thread for long.
+          const bytes = new Uint8Array(buf)
+          let binary = ''
+          const chunkSize = 0x8000
+          for (let i = 0; i < bytes.length; i += chunkSize) {
+            binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunkSize)) as number[])
+          }
+          const dataUrl = 'data:' + mimeType + ';base64,' + btoa(binary)
+          sendResponse({
+            success: true,
+            dataUrl: dataUrl,
+            mimeType: mimeType,
+            byteLength: buf.byteLength,
+            url: absoluteUrl,
+          })
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        sendResponse({
+          success: false,
+          error: 'fetch threw: ' + msg,
+          url: absoluteUrl,
+        })
+      }
+    })()
+    return true
+  }
+
   if (action === 'RUN_FLOW_PROMPT') {
-    const rawPayload = (message as Record<string, unknown>).payload as Record<string, unknown>
+    console.log('[FlowTrace][Content] RUN_FLOW_PROMPT_ENTERED', JSON.stringify({
+      url: window.location.href,
+      senderTabId: sender?.tab?.id,
+      senderFrameId: sender?.frameId,
+    }))
+
+    let responded = false
+    let timeoutId: ReturnType<typeof setTimeout> | null = null
+    const responseTimeoutMs = 270000
+    const safeRespondOnce = (payload: Record<string, unknown>) => {
+      if (responded) return
+      responded = true
+      if (timeoutId) {
+        clearTimeout(timeoutId)
+        timeoutId = null
+      }
+      try {
+        console.log('[FlowTrace][Content] RUN_FLOW_PROMPT_SEND_RESPONSE', JSON.stringify({
+          success: payload.success,
+          status: payload.status,
+          error: payload.error,
+          hasAutoDownload: !!payload.autoDownload,
+          responseTimeoutMs,
+        }))
+      } catch (_) {}
+      try {
+        sendResponse(payload)
+      } catch (err) {
+        console.error('[FlowTrace][Content] RUN_FLOW_PROMPT_SEND_RESPONSE_FAILED', err)
+      }
+    }
+
+    timeoutId = setTimeout(() => {
+      console.error('[FlowTrace][Content] RUN_FLOW_PROMPT_TIMEOUT', JSON.stringify({
+        timeoutMs: responseTimeoutMs,
+        url: window.location.href,
+      }))
+      safeRespondOnce({
+        success: false,
+        status: 'RUN_FLOW_PROMPT_TIMEOUT',
+        error: 'RUN_FLOW_PROMPT did not respond within ' + Math.round(responseTimeoutMs / 1000) + 's',
+        bridgeReady: isBridgeLoaded(),
+      })
+    }, responseTimeoutMs)
+
+    try {
+    const rawPayload = ((message as Record<string, unknown>).payload || {}) as Record<string, unknown>
     settingsDebug('[FlowContent][RUN_FLOW_PROMPT_PAYLOAD]', JSON.stringify(rawPayload, null, 2))
 
     const debugGenState = rawPayload.debugGenState as Record<string, unknown> | undefined
@@ -2214,8 +3243,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       focusTab: (rawPayload.focusTab as boolean) || false,
     }
     runFlowPrompt(fullPayload)
-      .then((result) => sendResponse(result))
-      .catch((err) => sendResponse({ success: false, error: (err as Error).message }))
+      .then((result) => {
+        safeRespondOnce(result)
+      })
+      .catch((err) => {
+        console.error('[FlowTrace][Content] RUN_FLOW_PROMPT_CAUGHT', err)
+        safeRespondOnce({
+          success: false,
+          status: 'RUN_FLOW_PROMPT_EXCEPTION',
+          error: (err as Error)?.message || String(err),
+        })
+      })
+    } catch (err) {
+      console.error('[FlowTrace][Content] RUN_FLOW_PROMPT_SYNC_THROW', err)
+      safeRespondOnce({
+        success: false,
+        status: 'RUN_FLOW_PROMPT_SYNC_THROW',
+        error: (err as Error)?.message || String(err),
+      })
+    }
     return true
   }
 

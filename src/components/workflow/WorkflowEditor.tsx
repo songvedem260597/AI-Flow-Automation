@@ -122,6 +122,12 @@ const GENERATE_QUANTITY_OPTIONS: Array<{ value: string; label: string }> = [
   { value: '3', label: 'x3' },
   { value: '4', label: 'x4' }
 ]
+const GENERATE_RESOLUTION_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: '1k', label: '1K' },
+  { value: '2k', label: '2K' },
+  { value: '4k', label: '4K' }
+]
+const GENERATE_DEFAULT_RESOLUTION = '1k'
 const GOOGLE_FLOW_IMAGE_MODEL_OPTIONS = ['Nano Banana Pro', 'Nano Banana 2', 'Nano Banana 2 Lite']
 const GOOGLE_FLOW_VIDEO_MODEL_OPTIONS = [
   'Omni Flash',
@@ -145,7 +151,7 @@ const IMAGE_ASPECT_RATIO_VALUES = {
 type GenerateMediaType = 'image' | 'video'
 type MediaNodeType = 'image' | 'video'
 type ImageAspectRatioOption = keyof typeof IMAGE_ASPECT_RATIO_VALUES
-type NodePillField = 'provider' | 'aspectRatio' | 'mediaType' | 'model' | 'videoDuration' | 'quantity'
+type NodePillField = 'provider' | 'aspectRatio' | 'mediaType' | 'model' | 'videoDuration' | 'quantity' | 'resolution'
 
 interface NodePillOption {
   value: string
@@ -267,6 +273,19 @@ function sanitizeGenerateDataPatch(currentData: Record<string, unknown>, patch: 
     sanitized.aspectRatio = ratioOptions[0]
   }
 
+  // Resolution only applies to google-flow image outputs. ChatGPT
+  // has no equivalent setting; clamp unknown / stale values to
+  // '1k' so the runner always sends a valid value (or omits it
+  // entirely for non-google providers, see runner).
+  if (provider === 'google-flow') {
+    const validResolutions = GENERATE_RESOLUTION_OPTIONS.map((opt) => opt.value)
+    sanitized.resolution = validResolutions.includes(String(next.resolution))
+      ? String(next.resolution)
+      : GENERATE_DEFAULT_RESOLUTION
+  } else {
+    sanitized.resolution = undefined
+  }
+
   return sanitized
 }
 
@@ -276,6 +295,7 @@ function getPillOptions(field: NodePillField, data: Record<string, unknown> = {}
   if (field === 'model') return normalizePillOptions(getGenerateModelOptions(data))
   if (field === 'videoDuration') return normalizePillOptions(getGenerateVideoDurationOptions(data))
   if (field === 'quantity') return normalizePillOptions(GENERATE_QUANTITY_OPTIONS)
+  if (field === 'resolution') return normalizePillOptions(GENERATE_RESOLUTION_OPTIONS)
   return normalizePillOptions(
     data && Object.keys(data).length > 0 ? getGenerateAspectRatioOptions(data) : ASPECT_RATIO_OPTIONS
   )
@@ -287,6 +307,7 @@ function pillFieldLabel(field: NodePillField) {
   if (field === 'model') return 'Model'
   if (field === 'videoDuration') return 'Duration'
   if (field === 'quantity') return 'Quantity'
+  if (field === 'resolution') return 'Resolution'
   return 'Aspect ratio'
 }
 
@@ -1542,6 +1563,11 @@ function renderDrawflowNode(node: WorkflowNode) {
     const isGoogleFlow = String(generateData.provider || 'chatgpt') === 'google-flow'
     const quantityValue = String(generateData.quantity ?? 1)
     const quantityOptions = isGoogleFlow ? GENERATE_QUANTITY_OPTIONS : []
+    const generateResolution = String(
+      isGoogleFlow && GENERATE_RESOLUTION_OPTIONS.some((opt) => opt.value === generateData.resolution)
+        ? generateData.resolution
+        : GENERATE_DEFAULT_RESOLUTION
+    )
 
     // Output preview: if node completed and has images, show the
     // user's currently selected image in a carousel. When the user
@@ -1600,6 +1626,7 @@ function renderDrawflowNode(node: WorkflowNode) {
           ${mediaType === 'video' ? renderPillTrigger('videoDuration', generateDuration, durationOptions) : ''}
           ${renderPillTrigger('aspectRatio', generateAspectRatio, ratioOptions)}
           ${isGoogleFlow ? renderPillTrigger('quantity', quantityValue, quantityOptions) : ''}
+          ${isGoogleFlow && mediaType === 'image' ? renderPillTrigger('resolution', generateResolution, GENERATE_RESOLUTION_OPTIONS) : ''}
         </div>
       </div>
     `
@@ -1920,6 +1947,28 @@ const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, nodeId, onClose
                 className={fieldSelectClass}
               >
                 {GENERATE_QUANTITY_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+              <ChevronDown className={selectIconClass} />
+            </div>
+          </label>
+        )}
+
+        {node.type === 'generate' && generateProvider === 'google-flow' && generateMediaType === 'image' && (
+          <label className="block">
+            <span className={fieldLabelClass}>Resolution</span>
+            <div className="relative">
+              <select
+                value={String(
+                  GENERATE_RESOLUTION_OPTIONS.some((opt) => opt.value === generateData.resolution)
+                    ? generateData.resolution
+                    : GENERATE_DEFAULT_RESOLUTION
+                )}
+                onChange={(event) => updateGenerate({ resolution: event.target.value as '1k' | '2k' | '4k' })}
+                className={fieldSelectClass}
+              >
+                {GENERATE_RESOLUTION_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>{option.label}</option>
                 ))}
               </select>
@@ -4305,7 +4354,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         model: { model: option.value },
         videoDuration: { videoDuration: option.value },
         aspectRatio: { aspectRatio: option.value },
-        quantity: { quantity: Number(option.value) }
+        quantity: { quantity: Number(option.value) },
+        resolution: { resolution: option.value }
       }
       updateNode(
         nodePillMenu.nodeId,

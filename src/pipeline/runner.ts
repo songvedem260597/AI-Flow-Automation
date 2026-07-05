@@ -51,6 +51,63 @@ interface MediaInput {
   mimeType?: string
   aspectRatio?: string
   targetHandle?: string
+  // Provider origin (e.g. 'https://labs.google') attached by the
+  // Flow content script. Used to repair path-relative URLs that
+  // somehow slip through the bridge normalization (e.g. a legacy
+  // asset that did not go through toAbsoluteFlowUrl).
+  providerOrigin?: string
+  // Where the asset was first seen (e.g. Flow project page URL).
+  sourcePageUrl?: string
+}
+
+// FALLBACK_LABS_ORIGIN — used when an asset lacks providerOrigin but
+// is clearly Flow-side (path begins with /fx/ or contains
+// media.getMediaUrlRedirect). We assume `https://labs.google` for the
+// host since Flow's CDN lives there. This is a last-resort repair for
+// older / legacy asset descriptors.
+const FALLBACK_LABS_ORIGIN = 'https://labs.google'
+
+// Repair a possibly-relative URL into an absolute URL. Mirrors
+// flow-slate-bridge.toAbsoluteFlowUrl and flow-content.toAbsoluteFlowUrl
+// so any path-relative URL the runner sees can be reconstructed without
+// the browser resolving it against the extension / file:// origin.
+//
+// Rules:
+//   blob:           — keep
+//   data:           — keep
+//   http(s)://      — keep
+//   //foo           — prepend `https:`
+//   /foo            — resolve against `origin` (providerOrigin) or
+//                     FALLBACK_LABS_ORIGIN when the path looks Flow-
+//                     specific
+//   anything else   — keep
+function repairFlowUrl(value: string, origin?: string): string {
+  if (!value) return value
+  if (
+    value.indexOf('blob:') === 0 ||
+    value.indexOf('data:') === 0 ||
+    value.indexOf('http://') === 0 ||
+    value.indexOf('https://') === 0
+  ) {
+    return value
+  }
+  if (value.indexOf('//') === 0) {
+    return 'https:' + value
+  }
+  if (value.indexOf('/') === 0) {
+    const base = origin || (
+      value.indexOf('/fx/') !== -1 || value.indexOf('media.getMediaUrlRedirect') !== -1
+        ? FALLBACK_LABS_ORIGIN
+        : ''
+    )
+    if (!base) return value
+    try {
+      return new URL(value, base).href
+    } catch (_) {
+      return value
+    }
+  }
+  return value
 }
 
 interface RuntimeResponse {
@@ -69,6 +126,7 @@ const DEFAULT_IMAGE_RATIO = '1:1'
 const DEFAULT_VIDEO_RATIO = '16:9'
 const DEFAULT_VIDEO_DURATION = '8s'
 const FLOW_OUTPUT_FOLDER = 'ai-flow-workflow'
+const DEFAULT_WORKFLOW_FOCUS_POLICY = 'restore-editor-after-submit'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -76,6 +134,40 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function asString(value: unknown): string {
   return typeof value === 'string' ? value : ''
+}
+
+function shouldRestoreEditorAfterProviderAction(data: Record<string, unknown>): boolean {
+  const policy = asString(data.restoreFocusPolicy) || DEFAULT_WORKFLOW_FOCUS_POLICY
+  return policy === 'restore-editor-after-submit'
+}
+
+function getForegroundRequiredReason(provider: string, error: unknown): string | null {
+  const message = error instanceof Error ? error.message : String(error || '')
+  const normalized = message.toLowerCase()
+  const sharedSignals = [
+    'not focused',
+    'background tab',
+  ]
+  const chatgptSignals = [
+    'composer_not_focused',
+    'paste_failed_background_tab',
+    'file_input_requires_active_tab',
+    'chatgpt_background_insert_failed',
+    'chatgpt_submit_failed_background',
+    'paste failed',
+    'file input',
+  ]
+  const flowSignals = [
+    'flow_background_insert_failed',
+    'flow_submit_requires_active_tab',
+  ]
+  const signals = provider === 'chatgpt'
+    ? [...sharedSignals, ...chatgptSignals]
+    : provider === 'google-flow'
+      ? [...sharedSignals, ...flowSignals]
+      : sharedSignals
+  const matched = signals.find((signal) => normalized.includes(signal))
+  return matched ? message || matched : null
 }
 
 function compactStrings(values: string[]): string[] {
@@ -815,11 +907,17 @@ export class PipelineRunner {
     }
 
     if (provider === 'chatgpt') {
-      return this.runChatGPTGenerate({ ...data, nodeId: node.id }, prompt, mediaInputs)
+      console.log('[Workflow][ProviderRoute] dispatch node=' + node.id + ' provider=chatgpt')
+      return this.runWithForegroundFallback('chatgpt', node.id, () =>
+        this.runChatGPTGenerate({ ...data, nodeId: node.id }, prompt, mediaInputs)
+      )
     }
 
     if (provider === 'google-flow') {
-      return this.runGoogleFlowGenerate(node, data, prompt, mediaType, mediaInputs)
+      console.log('[Workflow][ProviderRoute] dispatch node=' + node.id + ' provider=google-flow')
+      return this.runWithForegroundFallback('google-flow', node.id, () =>
+        this.runGoogleFlowGenerate(node, data, prompt, mediaType, mediaInputs)
+      )
     }
 
     throw new Error(`Provider "${provider}" is not supported by workflow run yet`)
@@ -839,19 +937,182 @@ export class PipelineRunner {
     return allText.join('\n\n')
   }
 
+  // Default behavior for media propagation across edges:
+  //
+  //   * Source node is `image` / `media`:
+  //       contribute exactly ONE media (the media node's own value).
+  //   * Source node is `generate`:
+  //       look at the upstream `_output.outputs[]` (the rich asset
+  //       descriptors). Forward ONE asset (the
+  //       `selectedOutputIndex`-th one) by default. Only forward
+  //       ALL outputs when the caller explicitly opts in via
+  //       `data.useAllOutputs === true` (downstream node data) OR
+  //       the edge's `sourceHandle === 'all-images' | 'batch'`.
+  //   * Source node is anything else (prompt, etc.): contribute
+  //       ZERO media (prompt is text-only, no media to forward).
+  //
+  // Why this matters:
+  //   The previous `coerceMediaList(input.value)` walked the
+  //   upstream Generate node's `_output.images[]` AND
+  //   `_output.imageUrls[]` AND recursed into `_output.result`.
+  //   With `quantity=2`, that pushed THREE refs into the downstream
+  //   addRef loop instead of the user's selected one.
+  //
+  // We intentionally do NOT use `coerceMediaList` for the Generate
+  // source path — `coerceMediaList` is a permissive fallback that
+  // does exhaustive walks, which is exactly what the policy must
+  // avoid for a controlled per-edge flow.
+  private extractEdgeMedia(input: ResolvedInput, downstreamUseAll = false): MediaInput[] {
+    const value = input.value
+    if (value === null || value === undefined) return []
+
+    // ── Generate-node source policy ───────────────────────────────────
+    // Google Flow outputs come with a rich `outputs[]` array of asset
+    // descriptors (provider, type, tileId, urls, etc.) — a carousel.
+    // The default policy is "forward only the user's currently
+    // selected asset" so downstream addRef doesn't re-upload 3
+    // images when the user only wants 1.
+    //
+    // ChatGPT outputs (CLAUDE.md "Do not regress" list) keep their
+    // existing contract: forward ALL images unconditionally. ChatGPT
+    // has no carousel, so "selected" doesn't apply — the user
+    // expects the full set.
+    if (isRecord(value) && value.provider === 'google-flow') {
+      const outputsRaw = value.outputs
+      const outputs = Array.isArray(outputsRaw) ? outputsRaw.filter((o): o is Record<string, unknown> => isRecord(o)) : []
+      const sourceNode = input.sourceNode
+      const sourceData = (sourceNode?.data || {}) as Record<string, unknown>
+      // Default: single-output. Opt-in: useAllOutputs / batch handle.
+      const useAllOutputs =
+        value.useAllOutputs === true ||
+        downstreamUseAll ||
+        input.sourceHandle === 'all-images' ||
+        input.sourceHandle === 'batch' ||
+        sourceData.useAllOutputs === true
+      const selectedIndexRaw =
+        typeof value.selectedOutputIndex === 'number' ? value.selectedOutputIndex
+        : typeof sourceData.selectedOutputIndex === 'number' ? sourceData.selectedOutputIndex
+        : 0
+      const selectedIndex = Math.max(0, Math.min(Math.max(0, outputs.length - 1), selectedIndexRaw))
+
+      if (outputs.length === 0) {
+        // Pre-existing google-flow bundles that have only
+        // `imageUrls[]` (no `outputs[]`) — fall back to the
+        // permissive list walk. This avoids regressing older
+        // workflows where the contract was "all images".
+        return this.coerceMediaList(value)
+      }
+
+      if (useAllOutputs || outputs.length === 1) {
+        return outputs.map((asset) => this.outputAssetToMediaInput(asset, input.targetHandle))
+      }
+      // Single-selected path.
+      const picked = outputs[selectedIndex] || outputs[0]
+      const mediaInput = this.outputAssetToMediaInput(picked, input.targetHandle)
+      return mediaInput ? [mediaInput] : []
+    }
+
+    // ChatGPT (no carousel) and any other non-Flow generation shape:
+    // fall through to the permissive coerceMediaList so the existing
+    // contract is preserved verbatim. Touching this branch would
+    // break the runner's "do not regress ChatGPT" invariants.
+    if (isRecord(value) && value.provider === 'chatgpt') {
+      return this.coerceMediaList(value)
+    }
+
+    // ── Non-Generate sources (Media/Image/Prompt/etc.) ───────────────
+    return this.coerceMediaList(value)
+  }
+
+  // Convert one asset descriptor from `outputAssets[]` into a
+  // `MediaInput` for the runner's downstream consumers. Honors
+  // providerOrigin so a path-relative URL is repaired.
+  private outputAssetToMediaInput(asset: Record<string, unknown>, targetHandle?: string): MediaInput {
+    const assetUrl = asString(asset.url)
+      || asString(asset.mediaUrl)
+      || asString(asset.imageUrl)
+      || asString(asset.thumbnailUrl)
+    const providerOrigin = asString(asset.providerOrigin)
+    const repairedUrl = assetUrl ? repairFlowUrl(assetUrl, providerOrigin) : ''
+    const dataUrl = asString(asset.data)
+    const mediaType = normalizeMediaType(
+      asString(asset.mediaType) || asString(asset.type) || 'image'
+    )
+    const name = asString(asset.savedFilename)
+      || asString(asset.fileNameFromFlow)
+      || asString(asset.name)
+      || `flow-output-${asset.index || 0}.${mediaType === 'video' ? 'mp4' : 'png'}`
+    return {
+      mediaType,
+      data: dataUrl || undefined,
+      url: repairedUrl || undefined,
+      name,
+      mimeType: asString(asset.mimeType) || (mediaType === 'video' ? 'video/mp4' : 'image/png'),
+      aspectRatio: asString(asset.aspectRatio) || undefined,
+      targetHandle,
+      providerOrigin: providerOrigin || undefined,
+      sourcePageUrl: asString(asset.sourcePageUrl) || undefined,
+    }
+  }
+
   private resolveGenerateMediaInputs(
     provider: AIProvider,
     mediaType: MediaKind,
     data: Record<string, unknown>,
     inputs: NodeInputs
   ): MediaInput[] {
+    // Downstream-side opt-in. If the downstream Generate node explicitly
+    // opts in to forwarding all upstream images (e.g. a batch workflow
+    // that fans-in N images to one output), each edge policy defaults to
+    // 'all' instead of 'single'. Per-edge opt-in is still preferred —
+    // see `edge.useAllOutputs` / sourceHandle — but this is a safety
+    // net for users who didn't customize the edge.
+    const downstreamUseAll = data.useAllOutputs === true
     const allMedia: MediaInput[] = []
+    const edgeContributions: Array<{ edgeId: string; sourceType: string; sourceHandle: string; count: number; mode: string; names: string[] }> = []
     for (const input of inputs.items) {
-      const mediaItems = this.coerceMediaList(input.value)
+      const mediaItems = this.extractEdgeMedia(input, downstreamUseAll)
       for (const media of mediaItems) {
         allMedia.push({ ...media, targetHandle: input.targetHandle })
       }
+      const sourceType = String(input.sourceNode?.type || 'unknown')
+      const sourceHandle = String(input.sourceHandle || 'output_1')
+      const useAll =
+        isRecord(input.value) && (
+          input.value.useAllOutputs === true ||
+          sourceHandle === 'all-images' ||
+          sourceHandle === 'batch'
+        ) ||
+        downstreamUseAll
+      const singleMode =
+        sourceType === 'generate' &&
+        !useAll &&
+        Array.isArray((input.value as Record<string, unknown>)?.outputs) &&
+        ((input.value as Record<string, unknown>).outputs as unknown[]).length > 0
+      edgeContributions.push({
+        edgeId: String(input.edge?.id || ''),
+        sourceType,
+        sourceHandle,
+        count: mediaItems.length,
+        mode: singleMode ? 'single' : (useAll ? 'all' : 'default'),
+        names: mediaItems.map((m) => m.name || m.url || '(unnamed)').slice(0, 4),
+      })
     }
+
+    // [Workflow][InputResolve] — always-on log so operators can see
+    // exactly which edges contributed what media to this Generate node.
+    // Logs edge-by-edge breakdown + the final list so it is obvious
+    // when an extra edge slipped through or the batch opt-in was
+    // missing.
+    try {
+      console.log('[Workflow][InputResolve] ' + JSON.stringify({
+        nodeId: String((data as Record<string, unknown>).nodeId || inputs.items[0]?.edge?.target || '(unknown)'),
+        provider,
+        mediaType,
+        upstreamMediaCount: allMedia.length,
+        edges: edgeContributions,
+      }))
+    } catch (_) {}
 
     // [SeqDebug][Runner] resolved generate inputs — TEMPORARY diagnostic,
     // always-on while investigating sequential multi-generate duplicate
@@ -940,6 +1201,55 @@ export class PipelineRunner {
     return uploadable.length > 0
   }
 
+  private async runWithForegroundFallback<T>(
+    provider: 'chatgpt' | 'google-flow',
+    nodeId: string,
+    action: () => Promise<T>
+  ): Promise<T> {
+    try {
+      return await action()
+    } catch (error) {
+      const reason = getForegroundRequiredReason(provider, error)
+      if (!reason) throw error
+
+      console.warn('[Workflow][ProviderRoute] focusFallbackRequired', JSON.stringify({
+        provider,
+        nodeId,
+        reason,
+      }))
+
+      const focused = await this.sendRuntimeMessage({
+        action: 'ENSURE_PROVIDER_TAB_FOR_WORKFLOW',
+        payload: {
+          provider,
+          nodeId,
+          waitReady: true,
+          activate: true,
+          focusWindow: true,
+          preserveEditor: false,
+        }
+      })
+      if (!focused.success) {
+        throw error
+      }
+
+      try {
+        return await action()
+      } finally {
+        const restored = await this.sendRuntimeMessage({
+          action: 'RESTORE_EDITOR_FOCUS',
+          payload: { nodeId, provider }
+        })
+        console.log('[Workflow][EditorFocus] restoredAfterFallback', JSON.stringify({
+          provider,
+          nodeId,
+          success: !!restored.success,
+          error: restored.error || null,
+        }))
+      }
+    }
+  }
+
   private async runChatGPTGenerate(
     data: Record<string, unknown>,
     prompt: string,
@@ -991,6 +1301,60 @@ export class PipelineRunner {
       })
     } catch (_) {}
 
+    // Workflow contract: ALWAYS focus the ChatGPT tab before the
+    // submit + upload pipeline fires. The legacy `focus: false`
+    // contract is what caused the manual-switch bug — Flow → ChatGPT
+    // chains left the user staring at the Flow tab while ChatGPT
+    // uploads were silently queuing in a backgrounded tab. The
+    // ensureProviderTabForWorkflow helper:
+    //   - finds / creates the ChatGPT tab,
+    //   - activates it + brings its window to front,
+    //   - waits for the content script (CHATGPT_PING),
+    //   - emits [Workflow][ProviderRoute] trace lines so operators
+    //     can confirm the routing sequence in BG console.
+    //
+    // We do this for both directions:
+    //   Flow → ChatGPT: user was looking at Flow tab; now ChatGPT.
+    //   ChatGPT → Flow: user was looking at ChatGPT tab; now Flow.
+    //
+    // GenPanel direct calls (not in this code path) keep the old
+    // focus contract — they call runChatGPTPrompt directly with
+    // payload.focus defaulting to true.
+    const nodeId = asString(data.nodeId)
+    const routed = await this.sendRuntimeMessage({
+      action: 'ENSURE_PROVIDER_TAB_FOR_WORKFLOW',
+      payload: {
+        provider: 'chatgpt',
+        nodeId,
+        waitReady: true,
+        activate: true,
+        focusWindow: false,
+        preserveEditor: true,
+      }
+    })
+    let chatgptTabId: number | undefined
+    if (!routed || !routed.success) {
+      console.warn('[Workflow][Runner] ensureProviderTabForWorkflow chatgpt failed (continuing — RUN_CHATGPT_PROMPT will retry)', {
+        nodeId,
+        error: routed?.error,
+      })
+    } else {
+      chatgptTabId = routed.tabId
+      // Single condensed line that the operator-facing log grep
+      // expects: `[Workflow][ProviderRoute] node=<id> provider=chatgpt
+      // tabId=<id> focused=false`. The structured JSON lives below.
+      console.log('[Workflow][ProviderRoute] node=' + nodeId + ' provider=chatgpt tabId=' + routed.tabId + ' activated=' + !!routed.activated + ' focused=' + !!routed.focused + ' ready=' + !!routed.ready)
+      console.log('[Workflow][Runner] provider tab routed', JSON.stringify({
+        provider: 'chatgpt',
+        nodeId,
+        tabId: routed.tabId,
+        windowId: routed.windowId,
+        ready: routed.ready,
+        activated: routed.activated,
+        focused: routed.focused,
+      }))
+    }
+
     const response = await this.sendRuntimeMessage({
       action: 'RUN_CHATGPT_PROMPT',
       payload: {
@@ -1000,14 +1364,49 @@ export class PipelineRunner {
         autoDownload: false,
         timeoutMs,
         mediaUploads,
-        // Workflow Editor / Side Panel callers — keep the user's tab
-        // visible while the ChatGPT tab runs in the background.
-        focus: false
+        tabId: chatgptTabId,
+        // Workflow editor preservation: keep ChatGPT targeted by tabId
+        // without stealing focus unless foreground fallback is required.
+        focus: false,
+        focusWindow: false,
+        activateTab: true,
+        preserveEditor: true,
+        source: 'workflow'
       }
     })
 
     if (!response.success || !response.jobId) {
       throw new Error(response.error || 'ChatGPT automation failed to start')
+    }
+
+    // Optional focus-restore policy. Default is
+    // 'provider-during-node' (no restore) — by design, this is the
+    // safest contract because:
+    //   - ChatGPT upload + insert + submit are still running in the
+    //     background while we waitForChatGPTJob. Putting the
+    //     ChatGPT tab in background is fine for the generation
+    //     itself (chatgpt.com's React UI doesn't lose state when
+    //     backgrounded) but the user may want to keep watching the
+    //     ChatGPT tab if they care.
+    //   - The editor popup is preserved in either case (the helper
+    //     skip above already prevents it from being closed /
+    //     navigated).
+    // Opt in by setting `data.restoreFocusPolicy ===
+    // 'restore-editor-after-submit'` on the Generate node. Once
+    // the BG has accepted the job (above), it's safe to refocus
+    // the editor — the content script pipeline runs independently
+    // of tab visibility.
+    if (shouldRestoreEditorAfterProviderAction(data)) {
+      this.sendRuntimeMessage({
+        action: 'RESTORE_EDITOR_FOCUS',
+        payload: { nodeId, provider: 'chatgpt' }
+      }).catch((err) => {
+        console.warn('[Workflow][Runner] restore editor focus failed (non-fatal)', {
+          nodeId,
+          provider: 'chatgpt',
+          error: (err as Error)?.message,
+        })
+      })
     }
 
     if (data.waitForCompletion === false) {
@@ -1082,13 +1481,45 @@ export class PipelineRunner {
       ? asString(data.videoDuration) || asString(data.duration) || DEFAULT_VIDEO_DURATION
       : undefined
     const quantity = Math.max(1, Math.min(4, Number(data.quantity || 1)))
-    const opened = await this.sendRuntimeMessage({
-      action: 'OPEN_PROVIDER_TAB',
-      payload: { provider: 'google-flow', focus: false }
+    // Workflow contract: ALWAYS focus the provider tab so the user
+    // does not have to click the Flow tab manually as the workflow
+    // transitions between providers (Flow → ChatGPT and back). This
+    // replaces the legacy OPEN_PROVIDER_TAB path which routed with
+    // focus:false to "keep the user's tab visible" — that policy
+    // was the source of the manual-switch bug. The user's own tab
+    // (Workflow Editor / Side Panel) is preserved by the sidepanel
+    // UX itself; the browser tab order is not a contract the
+    // workflow runner must honor.
+    const routed = await this.sendRuntimeMessage({
+      action: 'ENSURE_PROVIDER_TAB_FOR_WORKFLOW',
+      payload: {
+        provider: 'google-flow',
+        nodeId: node.id,
+        waitReady: true,
+        activate: false,
+        focusWindow: false,
+        preserveEditor: true,
+      }
     })
-
-    if (!opened.success) {
-      throw new Error(opened.error || 'Could not open Google Flow tab')
+    let flowTabId: number | undefined
+    if (routed && routed.success && routed.tabId) {
+      flowTabId = routed.tabId
+      console.log('[Workflow][ProviderRoute] node=' + node.id + ' provider=google-flow tabId=' + flowTabId + ' focused=' + !!routed.activated + ' ready=' + !!routed.ready)
+    } else {
+      // Soft fallback: legacy OPEN_PROVIDER_TAB. We still pass
+      // focus:true here — the workflow contract is "always focus".
+      console.warn('[Workflow][Runner] ensureProviderTabForWorkflow google-flow failed, falling back to OPEN_PROVIDER_TAB', {
+        nodeId: node.id,
+        error: routed?.error,
+      })
+      const opened = await this.sendRuntimeMessage({
+        action: 'OPEN_PROVIDER_TAB',
+        payload: { provider: 'google-flow', focus: false }
+      })
+      if (!opened.success || !opened.tabId) {
+        throw new Error(opened.error || 'Could not open Google Flow tab')
+      }
+      flowTabId = opened.tabId
     }
 
     const fileIds: string[] = []
@@ -1112,9 +1543,28 @@ export class PipelineRunner {
       fileNameMap[tileId] = String(upload.fileName || payload.name)
     }
 
-    const shouldAutoDownload = data.waitForCompletion !== false || this.hasDirectDownstreamType(node.id, 'download')
+    // Workflow Editor never auto-downloads. Generation still runs to
+    // completion so the node has output assets for the preview
+    // thumbnail and for downstream Media / Download / Generate
+    // nodes. Auto-download is the user's choice only when they
+    // click Generate in the Gen tab — never when this code path
+    // runs from a workflow run.
+    //
+    // `shouldAutoDownload` is intentionally fixed to false here.
+    // The legacy `waitForCompletion !== false || hasDirectDownstreamType`
+    // logic was the source of the bug: downstream Download nodes
+    // would silently trigger file writes to the user's disk even
+    // when they never asked for an automatic save. Workflow nodes
+    // must be deterministic — explicit manual actions only.
+    const shouldAutoDownload = false
+    // Download resolution. Google Flow workflow nodes now expose
+    // a per-node resolution pill (`1k` | `2k` | `4k`); default
+    // `1k` for legacy / chatgpt-irrelevant nodes. Sanitized in
+    // sanitizeGenerateDataPatch, so this should always be one of
+    // the three valid values when the provider is `google-flow`.
+    const resolution = String(asString(data.resolution) || '1k').toLowerCase()
     const payload = {
-      tabId: opened.tabId,
+      tabId: flowTabId,
       prompt,
       provider: 'google_flow',
       mode: mediaType,
@@ -1128,12 +1578,22 @@ export class PipelineRunner {
       fileNameMap,
       autoDownload: shouldAutoDownload,
       outputFolder: FLOW_OUTPUT_FOLDER,
-      resolution: '1k',
+      resolution,
       videoResolution: '720p',
       videoDownloadResolution: '720p',
-      // Workflow Editor / Side Panel callers — keep the user's tab
-      // visible while the Flow tab runs in the background.
+      // Source-of-call: 'workflow' lets flow-content distinguish
+      // this payload from Gen-tab traffic and refuse auto-download
+      // even if upstream callers forget to set suppressAutoDownload.
+      source: 'workflow',
+      collectOutputs: true,
+      suppressAutoDownload: true,
+      // Workflow contract — the Flow tab is already focused by
+      // ensureProviderTabForWorkflow above; this flag is logged by
+      // flow-content.ts as the tab's intent, mirrored to true so
+      // operators can verify the workflow path matches the
+      // focusedTab trace line.
       focusTab: false,
+      preserveEditor: true,
       debugGenState: {
         mode: mediaType,
         isVideoMode: mediaType === 'video',
@@ -1158,6 +1618,62 @@ export class PipelineRunner {
       throw new Error(response.error || response.status || 'Google Flow automation failed')
     }
 
+    // Output assets — pulled off the BG response (which forwards them
+    // from flow-content.ts) and exposed at the top level so:
+    //   (a) WorkflowEditor.renderDrawflowNode can show the Generate
+    //       node's preview thumbnail via data._output → runner's
+    //       onNodeComplete → updateNode({_output}) →
+    //       getGenerateOutputImageUrls(_output) walks images[] /
+    //       imageUrls[] / result.images[] / result.imageUrls[].
+    //   (b) Downstream Media/Download/Generate nodes can consume the
+    //       outputs via runner.coerceMediaList, which reads
+    //       value.images[] (MediaItem shape) and value.imageUrls[].
+    // We expose three shapes on purpose:
+    //   - `outputs`   : rich per-tile descriptor (Flow-specific
+    //                  metadata: tileId, savedFilename, outputFolder,
+    //                  resolution, mode, ...).
+    //   - `images`    : MediaItem shape compatible with ChatGPT's
+    //                  `images` array (data/url, mimeType, aspectRatio,
+    //                  source) so downstream nodes see one contract
+    //                  across both providers.
+    //   - `imageUrls` : flat string[] of asset URLs for the UI
+    //                  renderer, which prefers this for thumbnails.
+    //   - `result`    : full BG response (already includes
+    //                  outputs/images/imageUrls — kept for callers
+    //                  that recurse into the raw response).
+    const responseOutputs = Array.isArray(response.outputs) ? response.outputs : []
+    const responseImages = Array.isArray(response.images) ? response.images : []
+    const responseImageUrls = Array.isArray(response.imageUrls) ? response.imageUrls : []
+
+    // [Workflow][NodeOutput] google-flow outputs=N — emitted exactly once
+    // per Generate node so operators can confirm the node received the
+    // produced assets. Logged at default verbosity (no debug flag).
+    // `outputsAvailableCount` counts tiles that Flow produced with a
+    // usable URL (independent of whether they were saved to disk);
+    // `outputsDownloadedCount` counts only the ones where the file
+    // actually landed on disk via chrome.downloads.download.
+    console.log(`[Workflow][NodeOutput] google-flow outputs=${responseOutputs.length} (${responseOutputs.filter(function (o) { return (o as Record<string, unknown>).outputAvailable === true }).length} available / ${responseOutputs.filter(function (o) { return (o as Record<string, unknown>).downloadSuccess === true }).length} downloaded)`)
+
+    // Optional focus-restore policy (mirror of the ChatGPT branch).
+    // The flow generation has already completed by this point, so
+    // the Flow tab is no longer driving any pipeline. Restoring
+    // the editor here is purely cosmetic — but it gives the user
+    // the visual cue "the workflow advanced". Default is
+    // 'provider-during-node' (no restore) for safety; opt in via
+    // `data.restoreFocusPolicy === 'restore-editor-after-submit'`.
+    if (shouldRestoreEditorAfterProviderAction(data)) {
+      this.sendRuntimeMessage({
+        action: 'RESTORE_EDITOR_FOCUS',
+        payload: { nodeId: node.id, provider: 'google-flow' }
+      }).catch((err) => {
+        console.warn('[Workflow][Runner] restore editor focus failed (non-fatal)', {
+          nodeId: node.id,
+          provider: 'google-flow',
+          error: (err as Error)?.message,
+        })
+      })
+    }
+
     return {
       type: 'generation',
       provider: 'google-flow',
@@ -1170,6 +1686,32 @@ export class PipelineRunner {
       fileNameMap,
       autoDownload: response.autoDownload,
       status: response.status,
+      // Top-level output assets — these are what the Workflow UI walks
+      // for the Generate-node preview and what downstream
+      // Media/Download/Generate nodes see via coerceMediaList.
+      outputs: responseOutputs,
+      images: responseImages,
+      imageUrls: responseImageUrls,
+      // Convenience: pre-filtered list of usable outputs (outputAvailable).
+      // Use this instead of `outputs` filtering downstream — it
+      // matches the semantic of "what can I render / forward".
+      // `downloadSuccess === true` is narrower (only file-on-disk),
+      // so we deliberately DO NOT use it here.
+      successfulOutputs: responseOutputs.filter(function (o) { return (o as Record<string, unknown>).outputAvailable === true }),
+      // Default selectedOutputIndex = 0 on first run. The editor's
+      // onNodeComplete persists it back into node data; this default
+      // ensures downstream nodes reading the in-memory output before
+      // the persistence flush still get index 0 instead of undefined.
+      selectedOutputIndex: 0,
+      outputsCount: responseOutputs.length,
+      downloadFailReason: response.downloadFailReason,
+      lastError: response.lastError,
+      tileErrors: response.tileErrors,
+      firstDirectSrcAvailable: response.firstDirectSrcAvailable,
+      // `result` retained for backward-compat with callers that read
+      // response.status, response.autoDownload, etc. It also embeds
+      // outputs/images/imageUrls for the recursive
+      // getGenerateOutputImageUrls path.
       result: response
     }
   }
@@ -1217,7 +1759,7 @@ export class PipelineRunner {
       || ''
   }
 
-  private coerceMedia(value: unknown): MediaInput | null {
+  private coerceMedia(value: unknown, inheritedOrigin?: string): MediaInput | null {
     if (!isRecord(value)) return null
 
     const mediaType = normalizeMediaType(value.mediaType || (value.videoData || value.videoUrl ? 'video' : 'image'))
@@ -1225,10 +1767,17 @@ export class PipelineRunner {
       || asString(value.mediaData)
       || asString(value.imageData)
       || asString(value.videoData)
-    const url = asString(value.url)
+    // URL repair — see repairFlowUrl above. Asset descriptors that
+    // originated from flow-content.ts already carry absolute URLs,
+    // but legacy / 3rd-party descriptors might still have a path-
+    // relative URL. Repair against providerOrigin first, then
+    // FALLBACK_LABS_ORIGIN when the path looks Flow-specific.
+    const providerOrigin = asString(value.providerOrigin) || inheritedOrigin
+    const rawUrl = asString(value.url)
       || asString(value.mediaUrl)
       || asString(value.imageUrl)
       || asString(value.videoUrl)
+    const url = repairFlowUrl(rawUrl, providerOrigin)
 
     if (!data && !url) return null
 
@@ -1238,18 +1787,23 @@ export class PipelineRunner {
       url,
       name: asString(value.name) || asString(value.mediaName) || asString(value.imageName) || asString(value.videoName),
       mimeType: asString(value.mimeType) || asString(value.mediaMimeType),
-      aspectRatio: asString(value.aspectRatio)
+      aspectRatio: asString(value.aspectRatio),
+      providerOrigin: providerOrigin || undefined,
+      sourcePageUrl: asString(value.sourcePageUrl) || undefined,
     }
   }
 
-  private coerceMediaList(value: unknown): MediaInput[] {
+  private coerceMediaList(value: unknown, inheritedOrigin?: string): MediaInput[] {
     if (Array.isArray(value)) {
-      return value.flatMap((item) => this.coerceMediaList(item))
+      return value.flatMap((item) => this.coerceMediaList(item, inheritedOrigin))
     }
     if (!isRecord(value)) return []
 
     const media: MediaInput[] = []
-    const direct = this.coerceMedia(value)
+    // Inherit providerOrigin from the parent record so a relative URL
+    // at any depth can be repaired against the Flow origin.
+    const nextInheritedOrigin = asString(value.providerOrigin) || inheritedOrigin
+    const direct = this.coerceMedia(value, nextInheritedOrigin)
     if (direct) media.push(direct)
 
     const inheritedAspectRatio = asString(value.aspectRatio)
@@ -1262,7 +1816,9 @@ export class PipelineRunner {
         name: asString(item.name) || asString(item.mediaName) || asString(item.imageName) || `generated-image-${index + 1}`,
         mimeType: asString(item.mimeType) || asString(item.mediaMimeType) || 'image/png',
         aspectRatio: asString(item.aspectRatio) || inheritedAspectRatio,
-      })
+        providerOrigin: asString(item.providerOrigin) || nextInheritedOrigin,
+        sourcePageUrl: asString(item.sourcePageUrl),
+      }, nextInheritedOrigin)
       if (generated) media.push(generated)
     }
 
@@ -1275,14 +1831,16 @@ export class PipelineRunner {
     if (Array.isArray(imageUrls)) {
       imageUrls.forEach((url, index) => {
         if (typeof url !== 'string' || !url) return
-        const alreadyIncluded = media.some((item) => item.url === url)
+        const repaired = repairFlowUrl(url, nextInheritedOrigin)
+        const alreadyIncluded = media.some((item) => item.url === repaired)
         if (!alreadyIncluded) {
           media.push({
             mediaType: 'image',
-            url,
+            url: repaired,
             name: `generated-image-${index + 1}.png`,
             mimeType: 'image/png',
             aspectRatio: inheritedAspectRatio,
+            providerOrigin: nextInheritedOrigin,
           })
         }
       })
@@ -1290,7 +1848,7 @@ export class PipelineRunner {
 
     const result = value.result
     if (isRecord(result)) {
-      for (const item of this.coerceMediaList(result)) {
+      for (const item of this.coerceMediaList(result, nextInheritedOrigin)) {
         const alreadyIncluded = media.some((existing) => {
           return (item.data && existing.data === item.data) || (item.url && existing.url === item.url)
         })
@@ -1323,37 +1881,108 @@ export class PipelineRunner {
   }
 
   private async resolveMediaUrlToData(media: MediaInput): Promise<MediaInput | null> {
-    const url = media.url || ''
-    if (!url) return null
+    const rawUrl = media.url || ''
+    if (!rawUrl) return null
+
+    // Repair any path-relative URL against the asset's providerOrigin
+    // (or fallback to labs.google for Flow-style paths) BEFORE the
+    // fetch attempt. The browser would otherwise resolve a relative
+    // URL against the extension / file:// origin and report
+    // ERR_FILE_NOT_FOUND.
+    const url = repairFlowUrl(rawUrl, media.providerOrigin)
 
     if (url.startsWith('data:')) {
       return { ...media, data: url }
     }
 
+    // 1) Direct fetch — works for non-Flow URLs and for any asset the
+    //    runner can reach on its own (e.g. an externally hosted image
+    //    that the user dragged into a Media Node).
     try {
       const response = await fetch(url)
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      const blob = await response.blob()
-      const data = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader()
-        reader.onload = () => resolve(String(reader.result || ''))
-        reader.onerror = () => reject(reader.error || new Error('FileReader failed'))
-        reader.readAsDataURL(blob)
-      })
-      const mimeType = media.mimeType || blob.type || (media.mediaType === 'video' ? 'video/mp4' : 'image/png')
-
-      return {
-        ...media,
-        data,
-        mimeType,
-        name: media.name || this.mediaNameFromMime(media.mediaType, mimeType),
+      if (response.ok) {
+        const blob = await response.blob()
+        const data = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader()
+          reader.onload = () => resolve(String(reader.result || ''))
+          reader.onerror = () => reject(reader.error || new Error('FileReader failed'))
+          reader.readAsDataURL(blob)
+        })
+        const mimeType = media.mimeType || blob.type || (media.mediaType === 'video' ? 'video/mp4' : 'image/png')
+        return {
+          ...media,
+          data,
+          mimeType,
+          name: media.name || this.mediaNameFromMime(media.mediaType, mimeType),
+        }
       }
-    } catch (error) {
-      console.warn('[Runner] Failed to fetch upstream media URL for upload', {
-        name: media.name,
-        mediaType: media.mediaType,
+    } catch (_) {
+      // Direct fetch failed — fall through to the Flow-tab proxy.
+    }
+
+    // 2) Flow-tab proxy. Required when:
+    //   - the URL is a Flow-style path the runner cannot resolve from
+    //     the extension / side panel context (cookie + same-origin
+    //     context missing);
+    //   - or the asset's source is google-flow (legacy / current path
+    //     both qualify).
+    const isFlowUrl = url.indexOf('https://labs.google/') === 0
+      || url.indexOf('http://labs.google/') === 0
+      || url.indexOf('labs.google/') !== -1
+    const isFlowSource = media.providerOrigin === 'google-flow' || (media as Record<string, unknown>).source === 'google-flow'
+    if (isFlowUrl || isFlowSource) {
+      const proxied = await this.fetchFlowMediaAsData(url)
+      if (proxied) return proxied
+    }
+
+    console.warn('[Runner] Failed to fetch upstream media URL for upload', {
+      name: media.name,
+      mediaType: media.mediaType,
+      urlSnippet: url.slice(0, 120),
+    })
+    return null
+  }
+
+  // Proxy a Flow-style URL through the BG's FLOW_FETCH_MEDIA_AS_DATA.
+  // Returns a MediaInput with `data` set to a data URL (or null on
+  // failure). The proxy fetch happens in the Flow tab's content script
+  // so it has the cookie + same-origin context the runner is missing.
+  private async fetchFlowMediaAsData(url: string): Promise<MediaInput | null> {
+    try {
+      if (!hasExtensionContextSafe()) {
+        return null
+      }
+      const response = await chrome.runtime.sendMessage({
+        action: 'FLOW_FETCH_MEDIA_AS_DATA',
+        payload: {
+          url,
+          maxBytes: 25 * 1024 * 1024,
+          asArrayBuffer: false,
+        }
+      }) as Record<string, unknown> | undefined
+      if (!response || response.success !== true) {
+        console.warn('[Runner] FLOW_FETCH_MEDIA_AS_DATA failed', {
+          urlSnippet: url.slice(0, 120),
+          error: (response && (response.error as string)) || 'unknown',
+        })
+        return null
+      }
+      const dataUrl = String(response.dataUrl || '')
+      if (!dataUrl) return null
+      const mimeType = String(response.mimeType || '')
+      return {
+        mediaType: 'image',
+        data: dataUrl,
+        url,
+        mimeType,
+        name: this.mediaNameFromMime('image', mimeType || 'image/png'),
+        providerOrigin: 'google-flow',
+        sourcePageUrl: url,
+      }
+    } catch (err) {
+      console.warn('[Runner] FLOW_FETCH_MEDIA_AS_DATA threw', {
         urlSnippet: url.slice(0, 120),
-        error,
+        error: err,
       })
       return null
     }

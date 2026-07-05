@@ -76,6 +76,17 @@ export interface GenerateNodeData extends BaseNodeData {
   aspectRatio?: '1:1' | '16:9' | '9:16' | '4:3' | '3:4' | 'custom'
   videoDuration?: string
   quantity?: number
+  /**
+   * Download resolution for Google Flow outputs. Distinct from
+   * `aspectRatio` (which is the generation ratio). Accepted values:
+   * `'1k'` | `'2k'` | `'4k'`. Defaults to `'1k'` when the
+   * provider is `google-flow`. Ignored for ChatGPT.
+   *
+   * Wired into `RUN_FLOW_PROMPT.payload.resolution` by runner. The
+   * Flow bridge passes this into `downloadTileMedia`'s resolution
+   * menu so manual / auto-downloads target the requested size.
+   */
+  resolution?: '1k' | '2k' | '4k'
   autoGenerate?: boolean
   waitForCompletion?: boolean
   timeout?: number
@@ -272,6 +283,8 @@ export type MessageAction =
   | 'INJECT_SCRIPT'
   | 'GET_TAB_INFO'
   | 'OPEN_TAB'
+  | 'OPEN_PROVIDER_TAB'
+  | 'ENSURE_PROVIDER_TAB_FOR_WORKFLOW'
   | 'FOCUS_TAB'
   | 'WAKE_LOCK_REQUEST'
   | 'WAKE_LOCK_RELEASE'
@@ -281,8 +294,11 @@ export type MessageAction =
   | 'NOTIFICATION'
   | 'OPEN_WORKFLOW_EDITOR_WINDOW'
   | 'REGISTER_WORKFLOW_EDITOR_TAB'
+  | 'RESTORE_EDITOR_FOCUS'
   | 'CHECK_FLOW_TAB'
   | 'RUN_FLOW_PROMPT'
+  | 'RUN_CHATGPT_PROMPT'
+  | 'GET_CHATGPT_JOB_STATUS'
   | 'FLOW_STATUS'
   | 'FLOW_INJECT_BRIDGE'
   | 'FLOW_GET_TILES'

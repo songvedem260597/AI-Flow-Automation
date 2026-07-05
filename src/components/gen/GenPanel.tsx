@@ -582,6 +582,23 @@ interface FlowPayload {
   outputFolder: string
   resolution: string
   videoDownloadResolution: string
+  // ── Source-of-call flags ─────────────────────────────────────
+  // 'gen-tab' → caller is GenPanel; autoDownload is honored.
+  // 'workflow' → caller is the workflow runner; autoDownload is
+  //   forced to false downstream regardless of this field so the
+  //   workflow node never auto-downloads files to the user's disk.
+  // Defaults to 'gen-tab' for any pre-existing code path that
+  // doesn't set this explicitly (back-compat).
+  source?: 'gen-tab' | 'workflow'
+  // Whether the caller wants the output assets collected and
+  // returned via `outputs[]` / `images[]` / `imageUrls[]` even
+  // when auto-download is suppressed. Default true.
+  collectOutputs?: boolean
+  // Hard switch: when true, flow-content never auto-downloads,
+  // even if `autoDownload === true`. Used by workflow callers
+  // that set `source: 'workflow'` — the field is redundant with
+  // `source` but explicit so future caller types can opt in.
+  suppressAutoDownload?: boolean
   debugGenState: {
     mode: string
     isVideoMode: boolean
@@ -656,6 +673,13 @@ function buildGenerationPayload(
     outputFolder: subFolder,
     resolution: downloadRes,
     videoDownloadResolution: videoDownloadRes,
+    // Source-of-call: Gen tab always honors autoDownload. Even if
+    // the global setting is off, we still want collectOutputs to
+    // run so the local UI can show thumbnails in the GenPanel
+    // results area (downloaded=false in that case).
+    source: 'gen-tab',
+    collectOutputs: true,
+    suppressAutoDownload: false,
     debugGenState: {
       mode,
       isVideoMode,
