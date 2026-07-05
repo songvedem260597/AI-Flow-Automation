@@ -1,3 +1,4 @@
+import React from 'react'
 import { clsx, type ClassValue } from 'clsx'
 import { twMerge } from 'tailwind-merge'
 
@@ -39,4 +40,60 @@ export function throttle<T extends (...args: unknown[]) => unknown>(fn: T, delay
       fn(...args)
     }
   }) as T
+}
+
+function readPersisted<T>(key: string, fallback: T): T {
+  if (typeof window === 'undefined' || typeof localStorage === 'undefined') return fallback
+  try {
+    const raw = localStorage.getItem(key)
+    if (raw === null) return fallback
+    return JSON.parse(raw) as T
+  } catch {
+    return fallback
+  }
+}
+
+function writePersisted<T>(key: string, value: T): void {
+  if (typeof window === 'undefined' || typeof localStorage === 'undefined') return
+  try {
+    localStorage.setItem(key, JSON.stringify(value))
+  } catch {
+    // quota or serialization failure — silently ignore so the UI stays usable
+  }
+}
+
+/**
+ * usePersistedState — drop-in useState replacement that mirrors the value
+ * into localStorage under `key`. Hydrates lazily on first render and stays
+ * in sync across tabs via the storage event. SSR-safe: returns the
+ * fallback when window/localStorage are unavailable.
+ *
+ * Persistence is per-component-key, so callers don't need to share one
+ * giant settings blob.
+ */
+export function usePersistedState<T>(
+  key: string,
+  defaultValue: T
+): [T, React.Dispatch<React.SetStateAction<T>>] {
+  const [value, setValue] = React.useState<T>(() => readPersisted<T>(key, defaultValue))
+
+  React.useEffect(() => {
+    writePersisted(key, value)
+  }, [key, value])
+
+  React.useEffect(() => {
+    if (typeof window === 'undefined') return
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== key || e.newValue === null) return
+      try {
+        setValue(JSON.parse(e.newValue) as T)
+      } catch {
+        // ignore malformed updates from other tabs
+      }
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [key])
+
+  return [value, setValue]
 }

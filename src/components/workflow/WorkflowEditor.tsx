@@ -3,7 +3,7 @@ import Drawflow from '@/lib/drawflow/drawflow.min.js'
 import '@/lib/drawflow/drawflow.min.css'
 import { autoUpdate, computePosition, flip, offset, shift } from '@floating-ui/dom'
 import { useWorkflowStore } from '@/stores/workflowStore'
-import { cn } from '@/lib/utils'
+import { cn, usePersistedState } from '@/lib/utils'
 import type { AIProvider, FlowNodeData, FlowNodeType, Workflow, WorkflowEdge, WorkflowNode } from '@/types'
 import {
   ArrowLeft,
@@ -4822,8 +4822,8 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   const importWorkflow = useWorkflowStore((s) => s.importWorkflow)
   const setActiveWorkflow = useWorkflowStore((s) => s.setActiveWorkflow)
 
-  const [view, setView] = useState<WorkflowShellView>(workflows.length > 0 ? 'workflows' : 'templates')
-  const [templateCategory, setTemplateCategory] = useState('All')
+  const [view, setView] = usePersistedState<WorkflowShellView>('workflow.view', workflows.length > 0 ? 'workflows' : 'templates')
+  const [templateCategory, setTemplateCategory] = usePersistedState<string>('workflow.templateCategory', 'All')
   const [workflowSearch, setWorkflowSearch] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
 

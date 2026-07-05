@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
+import { usePersistedState } from '@/lib/utils'
 import { TopNavigation } from '@/components/layout/TopNavigation'
 import { GenPanel } from '@/components/gen/GenPanel'
 import { WorkflowEditor } from '@/components/workflow/WorkflowEditor'
@@ -154,11 +155,11 @@ async function clickFlowProject(project: FlowProject) {
 }
 
 export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSidebar }) => {
-  const [activeTab, setActiveTab] = useState<string>('gen')
+  const [activeTab, setActiveTab] = usePersistedState<string>('sidepanel.activeTab', 'gen')
   const [hasFlowTab, setHasFlowTab] = useState<boolean>(false)
   const [showFlowOverlay, setShowFlowOverlay] = useState<boolean>(false)
   const [currentUrl, setCurrentUrl] = useState<string>('')
-  const [activeGenProvider, setActiveGenProvider] = useState<string>('flow')
+  const [activeGenProvider, setActiveGenProvider] = usePersistedState<string>('sidepanel.activeGenProvider', 'flow')
   const [initDone, setInitDone] = useState<boolean>(false)
   const [flowProjects, setFlowProjects] = useState<FlowProject[]>([])
   const [selectedProject, setSelectedProject] = useState<FlowProject | null>(null)

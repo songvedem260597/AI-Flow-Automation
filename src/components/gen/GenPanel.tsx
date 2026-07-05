@@ -4,7 +4,7 @@ import {
   Image as ImageIcon, Video, ChevronDown, Download, RotateCcw,
   Search, X, FileText, GripVertical
 } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, usePersistedState } from '@/lib/utils'
 
 // ─── Flow Model Constants ───────────────────────────────────────────────────────
 
@@ -284,9 +284,9 @@ export const GenPanel: React.FC<{
 }> = ({ activeGenProvider, onProviderChange, onHideFlowOverlay }) => {
   const [prompt, setPrompt] = useState('')
   const activeProvider = activeGenProvider as Provider
-  const [mode, setMode] = useState<GenMode>('image')
-  const [imageModel, setImageModel] = useState(DEFAULT_FLOW_IMAGE_MODEL)
-  const [videoModel, setVideoModel] = useState(DEFAULT_FLOW_VIDEO_MODEL)
+  const [mode, setMode] = usePersistedState<GenMode>('genpanel.mode', 'image')
+  const [imageModel, setImageModel] = usePersistedState<string>('genpanel.imageModel', DEFAULT_FLOW_IMAGE_MODEL)
+  const [videoModel, setVideoModel] = usePersistedState<string>('genpanel.videoModel', DEFAULT_FLOW_VIDEO_MODEL)
 
   // ── Derived values ──────────────────────────────────────────────────────────
   const isVideoMode = mode === 'video'
@@ -349,18 +349,18 @@ export const GenPanel: React.FC<{
   type FlowVideoDuration = '4s' | '6s' | '8s' | '10s'
   const FLOW_VIDEO_DURATIONS: readonly FlowVideoDuration[] = ['4s', '6s', '8s']
   const OMNI_FLASH_VIDEO_DURATIONS: readonly FlowVideoDuration[] = ['4s', '6s', '8s', '10s']
-  const [videoDuration, setVideoDuration] = useState<FlowVideoDuration>('8s')
+  const [videoDuration, setVideoDuration] = usePersistedState<FlowVideoDuration>('genpanel.videoDuration', '8s')
   const activeVideoDurationOptions = videoModel === 'Omni Flash'
     ? OMNI_FLASH_VIDEO_DURATIONS
     : FLOW_VIDEO_DURATIONS
 
-  const [aspectRatio, setAspectRatio] = useState<AspectRatio>('16:9')
-  const [quantity, setQuantity] = useState(1)
-  const [styleId, setStyleId] = useState('')
-  const [autoDownload, setAutoDownload] = useState(true)
-  const [subFolder, setSubFolder] = useState('tobyflow-01')
-  const [downloadRes, setDownloadRes] = useState('2k')
-  const [videoDownloadRes, setVideoDownloadRes] = useState('720p')
+  const [aspectRatio, setAspectRatio] = usePersistedState<AspectRatio>('genpanel.aspectRatio', '16:9')
+  const [quantity, setQuantity] = usePersistedState<number>('genpanel.quantity', 1)
+  const [styleId, setStyleId] = usePersistedState<string>('genpanel.styleId', '')
+  const [autoDownload, setAutoDownload] = usePersistedState<boolean>('genpanel.autoDownload', true)
+  const [subFolder, setSubFolder] = usePersistedState<string>('genpanel.subFolder', 'tobyflow-01')
+  const [downloadRes, setDownloadRes] = usePersistedState<string>('genpanel.downloadRes', '2k')
+  const [videoDownloadRes, setVideoDownloadRes] = usePersistedState<string>('genpanel.videoDownloadRes', '720p')
   const [refImages, setRefImages] = useState<RefImage[]>([])
   // frameFileIds: only populated when Video Frames mode is active (not implemented yet — future)
   // isFrames is true ONLY when frameFileIds is present; never inferred from refImages.length
@@ -381,8 +381,8 @@ export const GenPanel: React.FC<{
   const [tileMonitorActive, setTileMonitorActive] = useState(false)
   const [genCount, setGenCount] = useState(0)
   const [generatedCount, setGeneratedCount] = useState(0)
-  const [multiPrompt, setMultiPrompt] = useState(false)
-  const [refMode, setRefMode] = useState('all')
+  const [multiPrompt, setMultiPrompt] = usePersistedState<boolean>('genpanel.multiPrompt', false)
+  const [refMode, setRefMode] = usePersistedState<string>('genpanel.refMode', 'all')
   const [showSearch, setShowSearch] = useState(false)
   const [failedPrompts, setFailedPrompts] = useState<string[]>([])
   const [promptQueue, setPromptQueue] = useState<PromptRun[]>([])
