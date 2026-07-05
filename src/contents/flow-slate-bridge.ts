@@ -57,7 +57,7 @@
   // Build time marker — single source of truth for cache-busting verification
   // Bump this every time you make a runtime change so the Flow page console
   // verification (window.__FLOW_BRIDGE_BUILD_TIME__) matches the running bundle.
-  var FLOW_BRIDGE_BUILD_TIME = "2026-07-05 18:20:00"
+  var FLOW_BRIDGE_BUILD_TIME = "2026-07-05 19:35:00"
   bridgeLog('[Bridge] BUILD_TIME ' + FLOW_BRIDGE_BUILD_TIME + ' instance=' + BRIDGE_INSTANCE_ID)
   ;(window as Record<string, unknown>).__FLOW_BRIDGE_BUILD_TIME__ = FLOW_BRIDGE_BUILD_TIME
 

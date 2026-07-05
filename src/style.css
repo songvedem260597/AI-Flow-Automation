@@ -940,12 +940,23 @@ input::placeholder, textarea::placeholder {
   margin: -8px -10px 0;
 }
 
-.df-node-preview.ratio-16-9 {
+.df-node-preview.ratio-16-9,
+.df-node-output-preview.ratio-16-9 {
   aspect-ratio: 16 / 9;
 }
 
-.df-node-preview.ratio-9-16 {
+.df-node-preview.ratio-9-16,
+.df-node-output-preview.ratio-9-16 {
   aspect-ratio: 9 / 16;
+}
+
+.df-node-output-preview {
+  /* Stable footprint before the image has loaded. The aspect-ratio
+     class is added by renderDrawflowNode (e.g. `ratio-16-9`); the
+     explicit fallback covers 1:1, 4:3, 4:5 etc. so we never collapse
+     the node to 0px height while the image is in flight. */
+  min-height: 140px;
+  width: 100%;
 }
 
 .df-node-preview.ratio-4-3 {
@@ -1686,7 +1697,7 @@ svg.ai-edge-completed path,
   position: relative;
   border-radius: 0;
   overflow: hidden;
-  background: #0a0a0a;
+  background: linear-gradient(135deg, #0d0d10 0%, #15151a 100%);
 }
 
 .df-node-output-preview img {
@@ -1694,6 +1705,33 @@ svg.ai-edge-completed path,
   height: 100%;
   object-fit: cover;
   display: block;
+}
+
+/* Skeleton shown while the generated image is in flight. Sits behind
+   the <img> tag. The image gets a `df-node-preview-media-loaded`
+   class on load (added by WorkflowEditor via an inline onLoad
+   handler), which fades the skeleton out via the adjacent-sibling
+   rule below. The container keeps its aspect-ratio class from
+   renderDrawflowNode, so the node never collapses while loading. */
+.df-node-output-skeleton {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(135deg, rgba(124, 92, 246, 0.06) 0%, rgba(0, 0, 0, 0) 60%),
+    repeating-linear-gradient(
+      45deg,
+      rgba(255, 255, 255, 0.02) 0px,
+      rgba(255, 255, 255, 0.02) 8px,
+      rgba(255, 255, 255, 0.04) 8px,
+      rgba(255, 255, 255, 0.04) 16px
+    );
+  pointer-events: none;
+  z-index: 0;
+  transition: opacity 0.25s ease;
+  opacity: 1;
+}
+.df-node-output-preview img.df-node-preview-media-loaded ~ .df-node-output-skeleton {
+  opacity: 0;
 }
 
 /* Top gradient + hover-revealed output control strip for
@@ -1784,16 +1822,18 @@ svg.ai-edge-completed path,
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.02em;
   user-select: none;
-  min-width: 32px;
+  /* Sized for "9 / 10" — keep the bar from reflowing when the
+     index changes between 1-digit and 2-digit values. */
+  min-width: 42px;
   text-align: center;
   padding: 0 2px;
 }
 .df-node-output-carousel-sep {
-  display: inline-block;
   width: 1px;
   height: 14px;
-  background: rgba(255, 255, 255, 0.22);
-  margin: 0 1px;
+  background: rgba(255, 255, 255, 0.25);
+  margin: 0 2px;
+  flex: 0 0 auto;
 }
 
 /* Running spinner on Generate node */

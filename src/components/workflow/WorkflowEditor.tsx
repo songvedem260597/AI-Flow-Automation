@@ -9,6 +9,8 @@ import {
   ArrowLeft,
   Check,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Clock,
   Copy,
   Download,
@@ -162,6 +164,22 @@ interface ImagePreviewState {
   src: string
   name: string
   mediaType: MediaNodeType
+  /** Carousel context. When `outputItems.length > 1`, the lightbox
+   *  shows prev/next/counter and lets the user flip through outputs
+   *  without leaving the modal. Empty array → no carousel. */
+  outputItems?: GenerateOutputItem[]
+  /** Current selected index inside `outputItems`. Drives the counter
+   *  and which asset the download button targets. */
+  selectedIndex?: number
+  /** Display name for the asset currently being shown (synced with
+   *  `outputItems[selectedIndex].name` whenever the carousel moves).
+   *  Used by the lightbox header so the title tracks the visible
+   *  asset, not the asset that was open when the modal first opened. */
+  outputName?: string
+  /** Filename hint for the download button (the asset's
+   *  `savedFilename` basename). Same lifecycle as `outputName` —
+   *  re-synced on every carousel step. */
+  downloadFilename?: string
 }
 
 function normalizePillOptions(options: Array<{ value: string; label: string }> | string[]): NodePillOption[] {
@@ -1240,6 +1258,124 @@ function getGenerateOutputImageUrls(output: unknown): string[] {
   return Array.from(new Set(urls))
 }
 
+/**
+ * Rich descriptor for one Generate-node output. Used by both the
+ * node-bar download handler and the lightbox carousel so they share
+ * the same filename/URL resolution — no drift between surfaces.
+ *
+ * `source` distinguishes where the descriptor came from so callers
+ * can introspect when needed (`outputs` = rich auto-download record,
+ * `imageUrls` = legacy plain-string array, `fallback` = synthesized).
+ */
+interface GenerateOutputItem {
+  url: string
+  /** Best-effort display name (e.g. original filename in the chat
+   *  history, sans path). Used by the lightbox header. */
+  name?: string
+  /** Saved filename the auto-download pipeline produced locally
+   *  (e.g. `~/Downloads/flow-output/foo.png`). Used as download
+   *  filename preference when chrome.downloads.download needs a
+   *  `filename` hint. */
+  savedFilename?: string
+  /** Mime hint (`image` or `video`). Drives extension choice (.png /
+   *  .mp4) when synthesizing a filename. */
+  mediaType?: 'image' | 'video'
+  source: 'outputs' | 'imageUrls' | 'fallback'
+}
+
+/**
+ * Build a per-output item list for a Generate-node result. Joins the
+ * rich `outputs[]` descriptors with the flat `imageUrls[]` fallback so
+ * each output gets both a URL and (when available) a savedFilename.
+ *
+ * The returned list always has the same length as the deduplicated
+ * output URL list returned by `getGenerateOutputImageUrls`, so
+ * callers can index them interchangeably.
+ *
+ * `selectedOutputIndex` is the live node-bar index — the function
+ * does not read or mutate it. It only enriches the list.
+ */
+function buildGenerateOutputItems(
+  output: Record<string, unknown> | undefined,
+  outputUrls: string[]
+): GenerateOutputItem[] {
+  if (outputUrls.length === 0) return []
+
+  const richOutputs = Array.isArray(output?.outputs)
+    ? (output!.outputs as unknown[]).filter((o): o is Record<string, unknown> => !!o && typeof o === 'object')
+    : []
+
+  // Build a URL → rich-record map so we can join even when the
+  // order of `outputs[]` doesn't match `outputUrls` (e.g. legacy
+  // bundles or partial enrichment).
+  const richByUrl = new Map<string, Record<string, unknown>>()
+  for (const item of richOutputs) {
+    const url =
+      (typeof item.url === 'string' && item.url) ||
+      (typeof item.mediaUrl === 'string' && item.mediaUrl) ||
+      (typeof item.imageUrl === 'string' && item.imageUrl) ||
+      ''
+    if (url) richByUrl.set(url, item)
+  }
+
+  return outputUrls.map((url, idx) => {
+    const rich = richByUrl.get(url)
+    if (rich) {
+      const savedFilename =
+        (typeof rich.savedFilename === 'string' && rich.savedFilename) ||
+        (typeof rich.fileNameFromFlow === 'string' && rich.fileNameFromFlow) ||
+        undefined
+      const name =
+        (typeof rich.name === 'string' && rich.name) ||
+        (typeof rich.fileNameFromFlow === 'string' && rich.fileNameFromFlow) ||
+        (typeof rich.savedFilename === 'string'
+          ? (rich.savedFilename.split(/[\\/]/).pop() || rich.savedFilename)
+          : undefined) ||
+        undefined
+      const mediaType: 'image' | 'video' | undefined =
+        (typeof rich.mediaType === 'string' && rich.mediaType === 'video') ||
+        (typeof rich.type === 'string' && rich.type === 'video')
+          ? 'video'
+          : (typeof rich.mediaType === 'string' && rich.mediaType === 'image') ||
+            (typeof rich.type === 'string' && rich.type === 'image')
+            ? 'image'
+            : undefined
+      return {
+        url,
+        name,
+        savedFilename,
+        mediaType,
+        source: 'outputs' as const,
+      }
+    }
+
+    // Legacy fallback — flat `imageUrls[]` only. Synthesize a
+    // stable basename from the index so downloads are predictable.
+    return {
+      url,
+      name: `flow-output-${idx + 1}`,
+      savedFilename: undefined,
+      mediaType: url.includes('.mp4') || url.includes('video') ? 'video' : 'image',
+      source: 'imageUrls' as const,
+    }
+  })
+}
+
+/** Resolve a usable filename for a Generate output item, applying
+ *  the same extension-selection rule the SW download handler does.
+ *  `item` may be partial — falls back to `flow-output-N.ext`. */
+function resolveGenerateOutputFilename(item: GenerateOutputItem | undefined, idx: number): string {
+  const rawName =
+    (item?.savedFilename && item.savedFilename.split(/[\\/]/).pop()) ||
+    item?.name ||
+    `flow-output-${idx + 1}`
+  const base = rawName.replace(/\.(png|jpg|jpeg|webp|mp4|mov|webm|gif)$/i, '')
+  const isVideo =
+    item?.mediaType === 'video' ||
+    (typeof item?.url === 'string' && (item.url.includes('.mp4') || item.url.includes('video')))
+  return `${base}.${isVideo ? 'mp4' : 'png'}`
+}
+
 // Safe download helper for Generate-node outputs.
 //
 // Routing strategy (in order):
@@ -1426,8 +1562,9 @@ function renderDrawflowNode(node: WorkflowNode) {
     body = `
       <div class="df-node-preview-wrap df-node-generate-preview-wrap">
         ${hasOutput ? `
-          <div class="df-node-output-preview df-node-image-upload-target has-image" data-generated-output-preview="true" data-selected-output-index="${selectedOutputIndex}">
+          <div class="df-node-output-preview df-node-image-upload-target has-image ${generateRatioClass}" data-generated-output-preview="true" data-selected-output-index="${selectedOutputIndex}">
             <img class="df-node-preview-media" src="${escapeHtml(firstImageUrl)}" alt="Generated output" draggable="false">
+            <span class="df-node-output-skeleton" aria-hidden="true"></span>
             <span class="df-node-output-top-gradient" aria-hidden="true"></span>
             <button type="button" class="df-node-image-preview-button nodrag" data-node-action="preview-image" title="Preview output" aria-label="Preview output">
               ${DF_ICONS.zoom}
@@ -1437,14 +1574,14 @@ function renderDrawflowNode(node: WorkflowNode) {
                 <button type="button" class="df-node-output-carousel-prev nodrag" data-node-action="output-prev" title="Previous output" aria-label="Previous output">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
                 </button>
-                <span class="df-node-output-carousel-counter" aria-live="polite">${selectedOutputIndex + 1} / ${outputImageUrls.length}</span>
+              ` : ''}
+              <span class="df-node-output-carousel-counter" aria-live="polite">${selectedOutputIndex + 1} / ${outputImageUrls.length}</span>
+              ${hasMultipleOutputs ? `
                 <button type="button" class="df-node-output-carousel-next nodrag" data-node-action="output-next" title="Next output" aria-label="Next output">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
                 </button>
-                <span class="df-node-output-carousel-sep" aria-hidden="true"></span>
-              ` : `
-                <span class="df-node-output-carousel-counter" aria-live="polite">${outputImageUrls.length === 1 ? '1 / 1' : ''}</span>
-              `}
+              ` : ''}
+              <span class="df-node-output-carousel-sep" aria-hidden="true"></span>
               <button type="button" class="df-node-output-carousel-download nodrag" data-node-action="output-download" data-output-index="${selectedOutputIndex}" title="Download current output" aria-label="Download current output">
                 ${DF_ICONS.download}
               </button>
@@ -2665,6 +2802,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') setImagePreview(null)
+      else if (event.key === 'ArrowLeft') handleLightboxPrev()
+      else if (event.key === 'ArrowRight') handleLightboxNext()
     }
 
     document.addEventListener('keydown', handleKeyDown)
@@ -2677,46 +2816,95 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     if (!imagePreview || !imagePreview.src) return
 
     const src = imagePreview.src
-    const rawName = (imagePreview.name || '').trim()
-    const fallbackName = `image-${Date.now()}.png`
-    let filename = rawName || fallbackName
-    filename = filename.replace(/[^\w.\-]+/g, '-').replace(/^-+|-+$/g, '')
-    if (!filename) filename = fallbackName
+
+    // Resolve filename from the live carousel selection so the
+    // download tracks the asset the user is currently looking at,
+    // not the one that was visible when the lightbox first opened.
+    // Resolution order: cached `downloadFilename` (set when the
+    // carousel moves or when the modal opened) → fallback
+    // synthesized from the index.
+    let filename = ''
+    if (imagePreview.outputItems && imagePreview.outputItems.length > 0) {
+      const idx = imagePreview.selectedIndex ?? 0
+      const item = imagePreview.outputItems[idx]
+      // Re-derive from the item instead of trusting the cache, so
+      // a stale `downloadFilename` (e.g. one written by an older
+      // code path) can never win over the rich descriptor.
+      filename = resolveGenerateOutputFilename(item, idx)
+    }
+    if (!filename && imagePreview.downloadFilename) {
+      filename = imagePreview.downloadFilename
+    }
+    if (!filename) {
+      const rawName = (imagePreview.outputName || imagePreview.name || '').trim()
+      filename = rawName ? rawName.replace(/[^\w.\-]+/g, '-').replace(/^-+|-+$/g, '') : ''
+    }
+    if (!filename) {
+      filename = `image-${Date.now()}.png`
+    }
     if (!/\.[a-zA-Z0-9]{2,5}$/.test(filename)) {
       filename = `${filename}.png`
     }
 
-    const triggerAnchorDownload = (href: string) => {
-      const anchor = document.createElement('a')
-      anchor.href = href
-      anchor.download = filename
-      anchor.rel = 'noopener'
-      anchor.style.display = 'none'
-      document.body.appendChild(anchor)
-      anchor.click()
-      anchor.remove()
+    // Use the same SW-routed helper as the node-bar download so the
+    // path / error handling / chrome.downloads fallback chain stays
+    // consistent. We do NOT call chrome.downloads.download directly
+    // here — that was the original UI-side crash source.
+    const result = await downloadWorkflowOutputAsset({
+      url: src,
+      filename,
+      nodeId: selectedNode,
+      selectedOutputIndex: imagePreview.selectedIndex ?? 0,
+    })
+    if (!result.ok) {
+      console.warn('[WorkflowEditor] Preview download failed', {
+        reason: result.reason,
+        src,
+        filename,
+      })
+    } else {
+      console.log('[WorkflowEditor] Preview download started', {
+        path: result.path,
+        filename,
+      })
     }
+  }
 
-    try {
-      let blobUrl: string | null = null
-      if (/^https?:/i.test(src)) {
-        const response = await fetch(src)
-        if (!response.ok) throw new Error(`HTTP ${response.status}`)
-        const blob = await response.blob()
-        blobUrl = URL.createObjectURL(blob)
-        triggerAnchorDownload(blobUrl)
-        setTimeout(() => URL.revokeObjectURL(blobUrl!), 10000)
-        return
+  const handleLightboxPrev = () => {
+    setImagePreview((prev) => {
+      if (!prev || !prev.outputItems || prev.outputItems.length <= 1) return prev
+      const len = prev.outputItems.length
+      const idx = prev.selectedIndex ?? 0
+      const nextIdx = (idx - 1 + len) % len
+      const nextItem = prev.outputItems[nextIdx]
+      return {
+        ...prev,
+        selectedIndex: nextIdx,
+        src: nextItem.url,
+        // Re-sync the header label + download filename so each
+        // step of the carousel reflects the asset the user is
+        // looking at right now — not the asset they opened.
+        outputName: nextItem.name,
+        downloadFilename: resolveGenerateOutputFilename(nextItem, nextIdx),
       }
-      triggerAnchorDownload(src)
-    } catch (err) {
-      console.warn('[WorkflowEditor] Preview download fetch failed, trying direct anchor:', err)
-      try {
-        triggerAnchorDownload(src)
-      } catch (innerErr) {
-        console.error('[WorkflowEditor] Preview download failed:', innerErr)
+    })
+  }
+
+  const handleLightboxNext = () => {
+    setImagePreview((prev) => {
+      if (!prev || !prev.outputItems || prev.outputItems.length <= 1) return prev
+      const len = prev.outputItems.length
+      const idx = prev.selectedIndex ?? 0
+      const nextIdx = (idx + 1) % len
+      const nextItem = prev.outputItems[nextIdx]
+      return {
+        ...prev,
+        selectedIndex: nextIdx,
+        src: nextItem.url,
+        outputName: nextItem.name,
+        downloadFilename: resolveGenerateOutputFilename(nextItem, nextIdx),
       }
-    }
+    })
   }
 
   const handleCanvasContextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
@@ -3646,9 +3834,37 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         mediaSrc = getMediaNodeSource(data)
         mediaType = getMediaNodeType(data)
       } else if (node?.type === 'generate') {
-        mediaSrc = getGenerateOutputImageUrls(data._output)[0] || ''
+        const output = data._output as Record<string, unknown> | undefined
+        const outputUrls = getGenerateOutputImageUrls(output)
+        // Read `selectedOutputIndex` from the live node data, not
+        // from the rendered DOM attribute — the user may have cycled
+        // the carousel since the last render.
+        const liveIndex = Math.max(0, Math.min(outputUrls.length - 1, Number(data.selectedOutputIndex) || 0))
+        mediaSrc = outputUrls[liveIndex] || outputUrls[0] || ''
         mediaType = 'image'
         name = String(data.label || 'Generated output')
+        // Build rich per-output items so the lightbox can flip URLs
+        // AND keep the correct filename for each one. We do NOT
+        // mutate `data.selectedOutputIndex` here — that only changes
+        // when the user explicitly cycles the carousel via the node
+        // bar / lightbox controls / click handlers.
+        const outputItems = buildGenerateOutputItems(output, outputUrls)
+        const initialItem = outputItems[liveIndex] || outputItems[0]
+        const initialDownloadFilename = resolveGenerateOutputFilename(initialItem, liveIndex)
+        if (outputUrls.length > 0 && mediaSrc) {
+          closeNodePillMenu()
+          setSelectedNode(nodeId)
+          setImagePreview({
+            src: mediaSrc,
+            name,
+            mediaType,
+            outputItems,
+            selectedIndex: liveIndex,
+            outputName: initialItem?.name,
+            downloadFilename: initialDownloadFilename,
+          })
+          return
+        }
       }
 
       if (!node || !mediaSrc) return
@@ -3835,6 +4051,27 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       event.preventDefault()
       event.stopPropagation()
     }
+    // Delegated `load` listener for the Generate-node preview media.
+    // When an <img class="df-node-preview-media"> finishes decoding,
+    // we tag it `df-node-preview-media-loaded` so the CSS skeleton
+    // fades out (sits behind the image). Capture-phase on the canvas
+    // root so newly-rendered nodes get the listener without us
+    // re-binding after every renderDrawflowNode.
+    const handlePreviewMediaLoaded = (event: Event) => {
+      const target = event.target as Element | null
+      if (!target || target.tagName !== 'IMG') return
+      if (!target.classList.contains('df-node-preview-media')) return
+      target.classList.add('df-node-preview-media-loaded')
+    }
+    const handlePreviewMediaError = (event: Event) => {
+      const target = event.target as Element | null
+      if (!target || target.tagName !== 'IMG') return
+      if (!target.classList.contains('df-node-preview-media')) return
+      // Mark loaded anyway so the skeleton fades — the broken-image
+      // icon is preferable to a permanent placeholder behind a
+      // never-resolving image element.
+      target.classList.add('df-node-preview-media-loaded')
+    }
     const zoomOnWheel = (event: WheelEvent) => {
       const target = event.target as HTMLElement | null
       if (target?.closest('.tobyflow-node-picker, input, textarea, select')) return
@@ -3869,6 +4106,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     canvasEl.addEventListener('click', handleImagePreviewClick)
     canvasEl.addEventListener('click', handleOutputCarouselClick)
     canvasEl.addEventListener('click', handleOutputDownloadClick)
+    canvasEl.addEventListener('load', handlePreviewMediaLoaded, true)
+    canvasEl.addEventListener('error', handlePreviewMediaError, true)
     canvasEl.addEventListener('dragstart', preventNativeMediaDrag, true)
     canvasEl.addEventListener('wheel', zoomOnWheel, { passive: false })
 
@@ -3898,6 +4137,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       canvasEl.removeEventListener('click', handleNodeToolbarClick)
       canvasEl.removeEventListener('click', handleImagePreviewClick)
       canvasEl.removeEventListener('dragstart', preventNativeMediaDrag, true)
+      canvasEl.removeEventListener('load', handlePreviewMediaLoaded, true)
+      canvasEl.removeEventListener('error', handlePreviewMediaError, true)
       canvasEl.removeEventListener('wheel', zoomOnWheel)
       editorRef.current = null
       portDragCleanupRef.current?.()
@@ -4315,62 +4556,111 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
             </div>
           )}
 
-          {imagePreview && (
-            <div
-              className="absolute inset-0 z-[70] flex flex-col bg-black/85 backdrop-blur-sm"
-              onMouseDown={(event) => {
-                if (event.target === event.currentTarget) setImagePreview(null)
-              }}
-            >
-              <div className="flex h-12 shrink-0 items-center justify-between border-b border-white/[0.08] bg-[#111111]/92 px-4">
-                <div className="min-w-0 text-[11px] font-medium text-white/62">
-                  <span className="block truncate">{imagePreview.name}</span>
-                </div>
-                <div className="flex items-center gap-1">
-                  {imagePreview.mediaType === 'image' && imagePreview.src && (
-                    <button
-                      type="button"
-                      title="Download"
-                      aria-label="Download"
-                      onClick={handleDownloadPreview}
-                      className="flex h-8 w-8 items-center justify-center rounded-lg text-white/45 transition-colors hover:bg-white/[0.07] hover:text-white"
-                    >
-                      <Download className="h-4 w-4" />
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    title="Close preview"
-                    onClick={() => setImagePreview(null)}
-                    className="flex h-8 w-8 items-center justify-center rounded-lg text-white/45 transition-colors hover:bg-white/[0.07] hover:text-white"
-                  >
-                    <X className="h-4 w-4" />
-                  </button>
-                </div>
-              </div>
+          {imagePreview && (() => {
+            const lightboxOutputs = imagePreview.outputItems || []
+            const lightboxHasCarousel = lightboxOutputs.length > 1
+            const lightboxSelectedIndex = imagePreview.selectedIndex ?? 0
+            // Header title: when inside a Generate carousel, show
+            // the current item's name so the label tracks the
+            // visible asset. Otherwise fall back to the static
+            // preview title.
+            const headerTitle =
+              lightboxHasCarousel && imagePreview.outputItems
+                ? imagePreview.outputItems[lightboxSelectedIndex]?.name || imagePreview.name
+                : imagePreview.name
+            return (
               <div
-                className="flex min-h-0 flex-1 items-center justify-center p-5"
+                className="absolute inset-0 z-[70] flex flex-col bg-black/85 backdrop-blur-sm"
                 onMouseDown={(event) => {
                   if (event.target === event.currentTarget) setImagePreview(null)
                 }}
               >
-                {imagePreview.mediaType === 'video' ? (
-                  <video
-                    src={imagePreview.src}
-                    controls
-                    autoPlay
-                    className="max-h-full max-w-full rounded-lg border border-white/[0.08] object-contain shadow-2xl"
-                  />
-                ) : (
-                  <img
-                    src={imagePreview.src}
-                    alt={imagePreview.name}
-                    className="max-h-full max-w-full rounded-lg border border-white/[0.08] object-contain shadow-2xl"
-                  />
-                )}
+                <div className="flex h-12 shrink-0 items-center justify-between border-b border-white/[0.08] bg-[#111111]/92 px-4">
+                  <div className="flex min-w-0 items-center gap-3 text-[11px] font-medium text-white/62">
+                    <span className="block truncate">{headerTitle}</span>
+                    {lightboxHasCarousel && (
+                      <div className="flex items-center gap-1 rounded-md border border-white/[0.08] bg-white/[0.03] px-1 py-0.5 text-white/72">
+                        <button
+                          type="button"
+                          title="Previous output"
+                          aria-label="Previous output"
+                          onClick={handleLightboxPrev}
+                          className="flex h-6 w-6 items-center justify-center rounded text-white/55 transition-colors hover:bg-white/[0.08] hover:text-white"
+                        >
+                          <ChevronLeft className="h-3.5 w-3.5" />
+                        </button>
+                        <span className="min-w-[40px] px-1 text-center font-variant-numeric tabular-nums">
+                          {lightboxSelectedIndex + 1} / {lightboxOutputs.length}
+                        </span>
+                        <button
+                          type="button"
+                          title="Next output"
+                          aria-label="Next output"
+                          onClick={handleLightboxNext}
+                          className="flex h-6 w-6 items-center justify-center rounded text-white/55 transition-colors hover:bg-white/[0.08] hover:text-white"
+                        >
+                          <ChevronRight className="h-3.5 w-3.5" />
+                        </button>
+                        <span className="mx-1 inline-block h-3.5 w-px bg-white/[0.18]" aria-hidden="true" />
+                        <button
+                          type="button"
+                          title="Download current output"
+                          aria-label="Download current output"
+                          onClick={handleDownloadPreview}
+                          className="flex h-6 w-6 items-center justify-center rounded text-white/55 transition-colors hover:bg-white/[0.08] hover:text-white"
+                        >
+                          <Download className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-1">
+                    {imagePreview.mediaType === 'image' && imagePreview.src && !lightboxHasCarousel && (
+                      <button
+                        type="button"
+                        title="Download"
+                        aria-label="Download"
+                        onClick={handleDownloadPreview}
+                        className="flex h-8 w-8 items-center justify-center rounded-lg text-white/45 transition-colors hover:bg-white/[0.07] hover:text-white"
+                      >
+                        <Download className="h-4 w-4" />
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      title="Close preview"
+                      onClick={() => setImagePreview(null)}
+                      className="flex h-8 w-8 items-center justify-center rounded-lg text-white/45 transition-colors hover:bg-white/[0.07] hover:text-white"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+                </div>
+                <div
+                  className="flex min-h-0 flex-1 items-center justify-center p-5"
+                  onMouseDown={(event) => {
+                    if (event.target === event.currentTarget) setImagePreview(null)
+                  }}
+                >
+                  {imagePreview.mediaType === 'video' ? (
+                    <video
+                      src={imagePreview.src}
+                      controls
+                      autoPlay
+                      className="max-h-full max-w-full rounded-lg border border-white/[0.08] object-contain shadow-2xl"
+                    />
+                  ) : (
+                    <img
+                      key={imagePreview.src}
+                      src={imagePreview.src}
+                      alt={headerTitle}
+                      className="max-h-full max-w-full rounded-lg border border-white/[0.08] object-contain shadow-2xl"
+                    />
+                  )}
+                </div>
               </div>
-            </div>
-          )}
+            )
+          })()}
 
           {workflow.nodes.length === 0 && !isPaletteOpen && (
             <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
