@@ -2038,6 +2038,23 @@ button.df-node-tag {
   color: #B8A8FF;
 }
 
+/* Primary CTA — the first button in the toolbar (Add node `+`) gets a
+   filled purple tile so it reads as the workflow editor's main action,
+   mirroring how the Play button stands out on the other side of the
+   toolbar. Stays subtle enough not to compete with the canvas. */
+.tobyflow-wf-toolbar > .tobyflow-wf-tool-btn:first-child {
+  background: rgba(124, 92, 255, 0.18);
+  border: 1px solid rgba(124, 92, 255, 0.45);
+  color: #C8BAFF;
+}
+
+.tobyflow-wf-toolbar > .tobyflow-wf-tool-btn:first-child:hover,
+.tobyflow-wf-toolbar > .tobyflow-wf-tool-btn:first-child.active {
+  background: rgba(124, 92, 255, 0.32);
+  border-color: rgba(124, 92, 255, 0.65);
+  color: #FFFFFF;
+}
+
 .tobyflow-node-picker {
   background: rgba(22, 22, 22, 0.98);
   border-color: rgba(255, 255, 255, 0.08);
@@ -2304,4 +2321,196 @@ button.df-node-tag {
 
 .ai-drawflow-canvas .drawflow svg.connection:not([class*="node_in_"]) .main-path {
   stroke: rgba(124, 92, 255, 0.65) !important;
+}
+
+/* Workflow delete confirmation modal
+ *
+ * Typography & sizing follow the rest of the app (Inter via :root; primary
+ * text 11-12px; button height h-8 / h-9).
+ */
+.workflow-confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  animation: workflow-confirm-fade 0.18s ease-out;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+.workflow-confirm-modal {
+  width: min(420px, calc(100vw - 32px));
+  background: var(--bg-card);
+  border: 1px solid rgba(124, 92, 255, 0.35);
+  border-radius: 14px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  color: var(--text-primary);
+  animation: workflow-confirm-pop 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.workflow-confirm-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 999px;
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  color: #f87171;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.workflow-rename-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 999px;
+  background: rgba(124, 92, 255, 0.12);
+  border: 1px solid rgba(124, 92, 255, 0.35);
+  color: #B8A8FF;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.workflow-rename-input {
+  margin-top: 8px;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 8px;
+  background: #141414;
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 11px;
+  outline: none;
+  width: 100%;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.workflow-rename-input::placeholder {
+  color: var(--text-muted);
+}
+
+.workflow-rename-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(124, 92, 255, 0.2);
+}
+
+.workflow-confirm-delete:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.workflow-confirm-delete:disabled:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.workflow-confirm-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.workflow-confirm-title {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+  margin: 0;
+  word-break: break-word;
+}
+
+.workflow-confirm-desc {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin: 0;
+  line-height: 1.45;
+}
+
+.workflow-confirm-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.workflow-confirm-cancel {
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 8px;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.workflow-confirm-cancel:hover {
+  background: var(--bg-card-hover);
+  border-color: rgba(255, 255, 255, 0.16);
+  color: var(--text-primary);
+}
+
+.workflow-confirm-cancel:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(124, 92, 255, 0.25);
+}
+
+.workflow-confirm-cancel:active {
+  transform: translateY(1px);
+}
+
+.workflow-confirm-delete {
+  height: 32px;
+  padding: 0 14px;
+  border-radius: 8px;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.workflow-confirm-delete:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.workflow-confirm-delete:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(124, 92, 255, 0.35);
+}
+
+.workflow-confirm-delete:active {
+  transform: translateY(1px);
+}
+
+@keyframes workflow-confirm-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes workflow-confirm-pop {
+  from { opacity: 0; transform: translateY(6px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
 }

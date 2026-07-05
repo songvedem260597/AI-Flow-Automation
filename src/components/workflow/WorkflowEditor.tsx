@@ -24,6 +24,7 @@ import {
   PanelLeft,
   PanelLeftClose,
   Pause,
+  Pencil,
   Play,
   Plus,
   Search,
@@ -4833,6 +4834,10 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   const [view, setView] = usePersistedState<WorkflowShellView>('workflow.view', workflows.length > 0 ? 'workflows' : 'templates')
   const [templateCategory, setTemplateCategory] = usePersistedState<string>('workflow.templateCategory', 'All')
   const [workflowSearch, setWorkflowSearch] = useState('')
+  const [deleteConfirmWorkflow, setDeleteConfirmWorkflow] = useState<Workflow | null>(null)
+  const [renameWorkflow, setRenameWorkflow] = useState<Workflow | null>(null)
+  const [renameDraft, setRenameDraft] = useState('')
+  const renameInputRef = useRef<HTMLInputElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -4874,6 +4879,39 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
     chrome.storage.onChanged.addListener(handleStorageChange)
     return () => chrome.storage.onChanged.removeListener(handleStorageChange)
   }, [hydrateFromStorage])
+
+  useEffect(() => {
+    if (!deleteConfirmWorkflow && !renameWorkflow) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        if (renameWorkflow) {
+          handleCancelRenameWorkflow()
+        } else if (deleteConfirmWorkflow) {
+          setDeleteConfirmWorkflow(null)
+        }
+      } else if (event.key === 'Enter' && renameWorkflow) {
+        const target = event.target as HTMLElement | null
+        if (target && target.tagName === 'TEXTAREA') return
+        event.preventDefault()
+        handleConfirmRenameWorkflow()
+      }
+    }
+    document.addEventListener('keydown', handleKeyDown, true)
+    return () => document.removeEventListener('keydown', handleKeyDown, true)
+  }, [deleteConfirmWorkflow, renameWorkflow, renameDraft])
+
+  useEffect(() => {
+    if (!renameWorkflow) return
+    const handle = window.requestAnimationFrame(() => {
+      const element = renameInputRef.current
+      if (element) {
+        element.focus()
+        element.select()
+      }
+    })
+    return () => window.cancelAnimationFrame(handle)
+  }, [renameWorkflow])
 
   useEffect(() => {
     if (!activeWorkflowId && workflows.length > 0) {
@@ -4956,18 +4994,35 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   }
 
   const handleRenameWorkflow = (workflow: Workflow) => {
-    const name = window.prompt('Workflow name', workflow.name)
-    if (name?.trim()) {
-      updateWorkflow(workflow.id, { name: name.trim() })
-    }
+    setRenameDraft(workflow.name)
+    setRenameWorkflow(workflow)
+  }
+
+  const handleConfirmRenameWorkflow = () => {
+    if (!renameWorkflow) return
+    const nextName = renameDraft.trim()
+    if (!nextName) return
+    const renameId = renameWorkflow.id
+    setRenameWorkflow(null)
+    updateWorkflow(renameId, { name: nextName })
+  }
+
+  const handleCancelRenameWorkflow = () => {
+    setRenameWorkflow(null)
+    setRenameDraft('')
   }
 
   const handleDeleteWorkflow = (workflow: Workflow) => {
-    if (window.confirm(`Delete "${workflow.name}"?`)) {
-      deleteWorkflow(workflow.id)
-      if (activeWorkflowId === workflow.id) {
-        setView('workflows')
-      }
+    setDeleteConfirmWorkflow(workflow)
+  }
+
+  const handleConfirmDeleteWorkflow = () => {
+    if (!deleteConfirmWorkflow) return
+    const removedId = deleteConfirmWorkflow.id
+    setDeleteConfirmWorkflow(null)
+    deleteWorkflow(removedId)
+    if (activeWorkflowId === removedId) {
+      setView('workflows')
     }
   }
 
@@ -5292,6 +5347,109 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                 ))}
               </div>
             )}
+          </div>
+        </div>
+      )}
+      {deleteConfirmWorkflow && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="workflow-confirm-title"
+          aria-describedby="workflow-confirm-desc"
+          className="workflow-confirm-overlay"
+          onClick={() => setDeleteConfirmWorkflow(null)}
+        >
+          <div
+            className="workflow-confirm-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="workflow-confirm-icon">
+              <Trash2 className="h-4 w-4" />
+            </div>
+            <div className="workflow-confirm-body">
+              <h2 id="workflow-confirm-title" className="workflow-confirm-title">
+                Delete “{deleteConfirmWorkflow.name}”?
+              </h2>
+              <p id="workflow-confirm-desc" className="workflow-confirm-desc">
+                This action cannot be undone.
+              </p>
+            </div>
+            <div className="workflow-confirm-actions">
+              <button
+                type="button"
+                className="workflow-confirm-cancel"
+                onClick={() => setDeleteConfirmWorkflow(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="workflow-confirm-delete"
+                onClick={handleConfirmDeleteWorkflow}
+              >
+                <Trash2 className="h-4 w-4" />
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {renameWorkflow && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="workflow-rename-title"
+          aria-describedby="workflow-rename-desc"
+          className="workflow-confirm-overlay"
+          onClick={handleCancelRenameWorkflow}
+        >
+          <div
+            className="workflow-confirm-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="workflow-rename-icon">
+              <Pencil className="h-4 w-4" />
+            </div>
+            <div className="workflow-confirm-body">
+              <h2 id="workflow-rename-title" className="workflow-confirm-title">
+                Rename workflow
+              </h2>
+              <p id="workflow-rename-desc" className="workflow-confirm-desc">
+                Choose a new name for this workflow.
+              </p>
+              <input
+                ref={renameInputRef}
+                type="text"
+                value={renameDraft}
+                onChange={(event) => setRenameDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.stopPropagation()
+                    handleConfirmRenameWorkflow()
+                  }
+                }}
+                placeholder="Workflow name"
+                className="workflow-rename-input"
+              />
+            </div>
+            <div className="workflow-confirm-actions">
+              <button
+                type="button"
+                className="workflow-confirm-cancel"
+                onClick={handleCancelRenameWorkflow}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="workflow-confirm-delete"
+                onClick={handleConfirmRenameWorkflow}
+                disabled={!renameDraft.trim()}
+              >
+                <Pencil className="h-4 w-4" />
+                Save
+              </button>
+            </div>
           </div>
         </div>
       )}
