@@ -169,6 +169,7 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
   const [syncDone, setSyncDone] = useState<boolean>(false)
   const providerRef = useRef(activeGenProvider)
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const pendingProjectNavigationRef = useRef<{ projectId: string; startedAt: number } | null>(null)
 
   useEffect(() => {
     providerRef.current = activeGenProvider
@@ -255,13 +256,28 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
     if (showFlowOverlay) return
 
     if (!isFlowHomeUrl(currentUrl)) {
+      if (isFlowProjectUrl(currentUrl)) {
+        pendingProjectNavigationRef.current = null
+      }
       setShowProjectPicker(false)
       setSyncDone(false)
       return
     }
 
+    const pendingNavigation = pendingProjectNavigationRef.current
+    if (pendingNavigation) {
+      if (Date.now() - pendingNavigation.startedAt < 8000) {
+        setShowProjectPicker(false)
+        return
+      }
+      pendingProjectNavigationRef.current = null
+    }
+
     loadFlowProjects().then(() => {
-      setShowProjectPicker(!selectedProject)
+      if (selectedProject) {
+        setSelectedProject(null)
+      }
+      setShowProjectPicker(true)
       setSyncDone(true)
     })
   }, [activeGenProvider, currentUrl, showFlowOverlay, initDone, selectedProject])
@@ -276,6 +292,7 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
     if (isFlowHomeUrl(currentUrl)) {
       const projects = await readFlowProjectsFromActiveTab()
       setFlowProjects(projects)
+      setSelectedProject(null)
       setShowProjectPicker(projects.length > 0)
       setSyncDone(true)
     } else {
@@ -297,12 +314,14 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
   }
 
   const handleSelectFlowProject = async (project: FlowProject) => {
+    pendingProjectNavigationRef.current = { projectId: project.id, startedAt: Date.now() }
     setSelectedProject(project)
     await clickFlowProject(project)
     setShowProjectPicker(false)
   }
 
   const handleOpenFlowHome = async () => {
+    pendingProjectNavigationRef.current = null
     const flowHomeUrl = 'https://labs.google/fx/tools/flow'
     const result = await checkAllTabs()
     if (result.hasFlow && result.flowTabId) {
@@ -313,6 +332,7 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
     setCurrentUrl(flowHomeUrl)
     setHasFlowTab(true)
     setShowFlowOverlay(false)
+    setSelectedProject(null)
     setShowProjectPicker(true)
     setActiveGenProvider('flow')
   }
