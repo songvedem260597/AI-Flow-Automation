@@ -3,31 +3,57 @@ import { persist, createJSONStorage } from 'zustand/middleware'
 import type { HistoryEntry, SavedPrompt, PresetTemplate } from '@/types'
 import { v4 as uuid } from 'uuid'
 
-const chromeStorageCache: Record<string, string | null> = {}
-const chromeStoragePending: Record<string, boolean> = {}
+const chromeStorage = () => ({
+  getItem: (key: string): Promise<string | null> =>
+    new Promise((resolve) => {
+      try {
+        chrome.storage.local.get(key, (result) => {
+          const error = chrome.runtime.lastError
+          if (error) {
+            console.warn(`[dataStore] Failed to read ${key}:`, error.message)
+            resolve(null)
+            return
+          }
+          resolve(result[key] ?? null)
+        })
+      } catch (error) {
+        console.warn(`[dataStore] Failed to read ${key}:`, error)
+        resolve(null)
+      }
+    }),
 
-const chromeStorage = (key: string) => {
-  if (!(key in chromeStorageCache)) {
-    chromeStorageCache[key] = null
-    chromeStoragePending[key] = true
-    chrome.storage.local.get(key, (result) => {
-      chromeStorageCache[key] = result[key] ?? null
-      chromeStoragePending[key] = false
+  setItem: (key: string, value: string): Promise<void> =>
+    new Promise((resolve) => {
+      try {
+        chrome.storage.local.set({ [key]: value }, () => {
+          const error = chrome.runtime.lastError
+          if (error) {
+            console.warn(`[dataStore] Failed to write ${key}:`, error.message)
+          }
+          resolve()
+        })
+      } catch (error) {
+        console.warn(`[dataStore] Failed to write ${key}:`, error)
+        resolve()
+      }
+    }),
+
+  removeItem: (key: string): Promise<void> =>
+    new Promise((resolve) => {
+      try {
+        chrome.storage.local.remove(key, () => {
+          const error = chrome.runtime.lastError
+          if (error) {
+            console.warn(`[dataStore] Failed to remove ${key}:`, error.message)
+          }
+          resolve()
+        })
+      } catch (error) {
+        console.warn(`[dataStore] Failed to remove ${key}:`, error)
+        resolve()
+      }
     })
-  }
-
-  return {
-    getItem: () => chromeStorageCache[key] ?? null,
-    setItem: (value: string) => {
-      chromeStorageCache[key] = value
-      chrome.storage.local.set({ [key]: value })
-    },
-    removeItem: () => {
-      chromeStorageCache[key] = null
-      chrome.storage.local.remove(key)
-    }
-  }
-}
+})
 
 interface HistoryState {
   entries: HistoryEntry[]
@@ -81,23 +107,7 @@ export const useHistoryStore = create<HistoryState>()(
         return get().entries.slice(0, limit)
       }
     }),
-    { name: 'ai-flow-history', storage: createJSONStorage(() => chromeStorage('ai-flow-history')),
-      onRehydrateStorage: () => (state) => {
-        if (state) {
-          chrome.storage.local.get('ai-flow-history', (result) => {
-            const saved = result['ai-flow-history']
-            if (saved) {
-              try {
-                const parsed = JSON.parse(saved)
-                if (parsed.state?.entries?.length > 0) {
-                  state.entries = parsed.state.entries
-                }
-              } catch {}
-            }
-          })
-        }
-      }
-    }
+    { name: 'ai-flow-history', storage: createJSONStorage(() => chromeStorage()) }
   )
 )
 
@@ -143,23 +153,7 @@ export const usePromptStore = create<PromptStore>()(
         )
       }
     }),
-    { name: 'ai-flow-prompts', storage: createJSONStorage(() => chromeStorage('ai-flow-prompts')),
-      onRehydrateStorage: () => (state) => {
-        if (state) {
-          chrome.storage.local.get('ai-flow-prompts', (result) => {
-            const saved = result['ai-flow-prompts']
-            if (saved) {
-              try {
-                const parsed = JSON.parse(saved)
-                if (parsed.state?.prompts?.length > 0) {
-                  state.prompts = parsed.state.prompts
-                }
-              } catch {}
-            }
-          })
-        }
-      }
-    }
+    { name: 'ai-flow-prompts', storage: createJSONStorage(() => chromeStorage()) }
   )
 )
 
@@ -190,22 +184,6 @@ export const usePresetStore = create<PresetStore>()(
         return get().presets.filter((p) => p.category === category)
       }
     }),
-    { name: 'ai-flow-presets', storage: createJSONStorage(() => chromeStorage('ai-flow-presets')),
-      onRehydrateStorage: () => (state) => {
-        if (state) {
-          chrome.storage.local.get('ai-flow-presets', (result) => {
-            const saved = result['ai-flow-presets']
-            if (saved) {
-              try {
-                const parsed = JSON.parse(saved)
-                if (parsed.state?.presets?.length > 0) {
-                  state.presets = parsed.state.presets
-                }
-              } catch {}
-            }
-          })
-        }
-      }
-    }
+    { name: 'ai-flow-presets', storage: createJSONStorage(() => chromeStorage()) }
   )
 )
