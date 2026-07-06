@@ -1,70 +1,84 @@
+/**
+ * prebuild.js — runs before `plasmo build` (and `plasmo dev`).
+ *
+ * Feeds Plasmo's expected icon slots (`.plasmo/gen-assets/icon*.plasmo.png`)
+ * from the project's single source of truth: `assets/icon-source.png`.
+ *
+ * Pipeline:
+ *   1. If `assets/icon-source.png` is present, run
+ *      `node assets/build-icons-from-source.js` to (re)generate the
+ *      `assets/icon{16,32,48,64,128}.png` resized variants via `sharp`.
+ *   2. Copy each `assets/icon{16,32,48,64,128}.png` to the matching
+ *      `.plasmo/gen-assets/icon{16,32,48,64,128}.plasmo.png` slot that
+ *      Plasmo references from `.plasmo/chrome-mv3.plasmo.manifest.json`.
+ *   3. If no source is available and the resized PNGs are also missing,
+ *      fail with a clear error so the missing-artifact surface area is
+ *      obvious (the old gradient placeholder generator has been removed).
+ *
+ * Paths are resolved from `__dirname` so this script works regardless of
+ * the absolute location of the repo on disk.
+ */
 const fs = require('fs');
-const zlib = require('zlib');
+const path = require('path');
+const { spawnSync } = require('child_process');
 
-function makeTable() {
-  const t = [];
-  for (let i = 0; i < 256; i++) {
-    let v = 0xFFFFFFFF;
-    for (let j = 0; j < 8; j++) v = (v >>> 1) ^ (v & 1 ? 0xEDB88320 : 0);
-    t[i] = v >>> 0;
-  }
-  return t;
-}
+const repoRoot = __dirname;
+const assetsDir = path.join(repoRoot, 'assets');
+const plasmoDir = path.join(repoRoot, '.plasmo');
+const genDir = path.join(plasmoDir, 'gen-assets');
+const sourcePng = path.join(assetsDir, 'icon-source.png');
+const buildScript = path.join(assetsDir, 'build-icons-from-source.js');
+const sizes = [16, 32, 48, 64, 128];
 
-const table = makeTable();
-
-function crc32(data) {
-  let r = 0xFFFFFFFF >>> 0;
-  for (const b of data) r = (table[(r ^ b) & 0xFF] ^ (r >>> 8)) >>> 0;
-  return (r ^ 0xFFFFFFFF) >>> 0;
-}
-
-function png(s) {
-  const sig = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(s, 0);
-  ihdr.writeUInt32BE(s, 4);
-  ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
-
-  const raw = [];
-  for (let y = 0; y < s; y++) {
-    raw.push(0);
-    for (let x = 0; x < s; x++) {
-      const t = (x + y) / (s * 2);
-      raw.push(Math.round(124 + 112 * t));
-      raw.push(Math.round(92 - 20 * t));
-      raw.push(Math.round(246 - 93 * t));
-    }
-  }
-  const comp = zlib.deflateSync(Buffer.from(raw), { level: 9 });
-
-  function chunk(type, data) {
-    const len = Buffer.alloc(4);
-    len.writeUInt32BE(data.length);
-    const typeData = Buffer.concat([Buffer.from(type), data]);
-    const crcVal = crc32(typeData);
-    const crcBuf = Buffer.alloc(4);
-    crcBuf.writeUInt32BE(crcVal >>> 0);
-    return Buffer.concat([len, typeData, crcBuf]);
-  }
-
-  return Buffer.concat([sig, chunk('IHDR', ihdr), chunk('IDAT', comp), chunk('IEND', Buffer.alloc(0))]);
-}
-
-const baseDir = 'C:/Users/uchih/Desktop/ai-workflow-automation';
-const plasmoDir = baseDir + '/.plasmo';
-const genDir = plasmoDir + '/gen-assets';
-
-// Create gen-assets inside .plasmo
 if (!fs.existsSync(genDir)) {
   fs.mkdirSync(genDir, { recursive: true });
 }
 
-const sizes = [16, 32, 48, 64, 128];
-for (const s of sizes) {
-  const buf = png(s);
-  fs.writeFileSync(genDir + '/icon' + s + '.plasmo.png', buf);
-  console.log('Created .plasmo/gen-assets/icon' + s + '.plasmo.png (' + buf.length + ' bytes)');
+const resizedExists = (size) =>
+  fs.existsSync(path.join(assetsDir, `icon${size}.png`));
+
+if (fs.existsSync(sourcePng)) {
+  console.log(`[prebuild] Source icon found: ${path.relative(repoRoot, sourcePng)}`);
+  if (!fs.existsSync(buildScript)) {
+    console.error(`[prebuild] FATAL: ${path.relative(repoRoot, buildScript)} is missing.`);
+    process.exit(1);
+  }
+  const result = spawnSync(process.execPath, [buildScript], {
+    cwd: repoRoot,
+    stdio: 'inherit'
+  });
+  if (result.status !== 0) {
+    console.error('[prebuild] FATAL: assets/build-icons-from-source.js failed.');
+    process.exit(result.status ?? 1);
+  }
+} else {
+  console.warn(`[prebuild] Source icon not found: ${path.relative(repoRoot, sourcePng)}`);
 }
 
-console.log('Prebuild complete - icons ready!');
+const missing = sizes.filter((s) => !resizedExists(s));
+if (missing.length > 0) {
+  console.error(
+    `[prebuild] FATAL: missing resized icon(s) in assets/: ${missing
+      .map((s) => `icon${s}.png`)
+      .join(', ')}.`
+  );
+  console.error(
+    '[prebuild] Add assets/icon-source.png (1024x1024 PNG) so the build pipeline can resize it.'
+  );
+  process.exit(1);
+}
+
+for (const size of sizes) {
+  const src = path.join(assetsDir, `icon${size}.png`);
+  const dst = path.join(genDir, `icon${size}.plasmo.png`);
+  fs.copyFileSync(src, dst);
+  const dstStat = fs.statSync(dst);
+  console.log(
+    `[prebuild] Copied ${path.relative(repoRoot, src)} -> ${path.relative(
+      repoRoot,
+      dst
+    )} (${dstStat.size} bytes)`
+  );
+}
+
+console.log('[prebuild] Prebuild complete - icons ready!');

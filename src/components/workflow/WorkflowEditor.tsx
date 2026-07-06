@@ -45,6 +45,16 @@ import { runPipeline, stopPipeline, pausePipeline, resumePipeline } from '@/pipe
 import type { PipelineCallbacks } from '@/pipeline'
 import { usePipelineStore } from '@/stores/pipelineStore'
 import { debugLog, debugWarn } from '@/lib/debug'
+import {
+  getAssetBlob,
+  getAssetObjectUrl,
+  getAssetMeta,
+  revokeAssetObjectUrl,
+  saveAssetFromBlob,
+  saveAssetFromDataUrl,
+  deleteAsset,
+  type StoredAssetMeta
+} from '@/lib/assetStore'
 
 const WORKFLOW_PERSIST_DEBUG = (): boolean => {
   try {
@@ -52,6 +62,232 @@ const WORKFLOW_PERSIST_DEBUG = (): boolean => {
   } catch {
     return false
   }
+}
+
+// [WorkflowList] Diagnostic logs gated behind `AI_FLOW_DEBUG` to confirm
+// the stable sort policy at runtime (render order, sort policy, and any
+// time a workflow reorder would have shifted cards around).
+const WORKFLOW_LIST_DEBUG = (): boolean => {
+  try {
+    return typeof localStorage !== 'undefined' && localStorage.getItem('AI_FLOW_DEBUG') === '1'
+  } catch {
+    return false
+  }
+}
+
+// [AssetResolution] Per-render resolved-asset cache.
+//
+// Heavy Media-node blobs live in IndexedDB (see `src/lib/assetStore.ts`)
+// and the workflow store only carries an `assetId`. To keep the rest of
+// the editor working unchanged — Drawflow's HTML preview reads
+// `data.mediaData / imageData / videoData`, the runner reads the same
+// fields, the lightbox reads `data.videoUrl / imageUrl` — we mirror
+// the resolved blob back into a transient `liveData` map keyed by
+// nodeId. This map is render-time only; it never flows back into the
+// workflow store and never crosses the chrome.storage.local boundary.
+//
+// Each entry carries:
+//   - objectUrl : for Drawflow <img> / <video> preview rendering
+//                 (URL.revokeObjectURL is called on unmount).
+//   - dataUrl   : legacy `data:image/...` data URL used by `getMediaNodeSource`,
+//                 the lightbox, and the runner's `dataUrlToUploadPayload`.
+//   - meta      : lightweight StoredAssetMeta for debug logs.
+interface ResolvedAssetEntry {
+  objectUrl: string | null
+  dataUrl: string | null
+  meta: StoredAssetMeta | null
+  status: 'pending' | 'resolved' | 'missing' | 'error'
+}
+
+const blobToDataUrl = (blob: Blob): Promise<string> =>
+  new Promise<string>((resolve, reject) => {
+    try {
+      const reader = new FileReader()
+      reader.onload = () => (typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('FileReader non-string result')))
+      reader.onerror = () => reject(reader.error || new Error('FileReader failed'))
+      reader.readAsDataURL(blob)
+    } catch (err) {
+      reject(err as Error)
+    }
+  })
+
+const useResolvedAssets = (
+  nodes: WorkflowNode[] | undefined,
+  enabled: boolean
+): Map<string, ResolvedAssetEntry> => {
+  const [map, setMap] = useState<Map<string, ResolvedAssetEntry>>(() => new Map())
+  const nodesKeyRef = useRef<string>('')
+  // Collect assetIds referenced by visible nodes. We use this as the
+  // dependency key so unrelated re-renders don't trigger refetches.
+  const assetKey = useMemo(() => {
+    if (!enabled || !Array.isArray(nodes)) return ''
+    const ids: string[] = []
+    for (const node of nodes) {
+      const data = (node.data || {}) as Record<string, unknown>
+      const assetId = typeof data.assetId === 'string' ? data.assetId : ''
+      if (assetId) ids.push(`${node.id}:${assetId}`)
+    }
+    return ids.sort().join('|')
+  }, [nodes, enabled])
+  useEffect(() => {
+    if (!enabled) {
+      // Drop everything if we are not on the editor view (avoids
+      // running IDB queries for the dashboard list).
+      setMap((prev) => {
+        if (prev.size === 0) return prev
+        for (const id of prev.keys()) {
+          const entry = prev.get(id)
+          if (entry?.objectUrl) revokeAssetObjectUrl(entry.objectUrl)
+        }
+        return new Map()
+      })
+      nodesKeyRef.current = ''
+      return
+    }
+    if (assetKey === nodesKeyRef.current) return
+    nodesKeyRef.current = assetKey
+    let cancelled = false
+    const run = async () => {
+      const next = new Map<string, ResolvedAssetEntry>()
+      if (!Array.isArray(nodes)) {
+        if (!cancelled) setMap(next)
+        return
+      }
+      for (const node of nodes) {
+        const data = (node.data || {}) as Record<string, unknown>
+        const assetId = typeof data.assetId === 'string' ? data.assetId : ''
+        if (!assetId) continue
+        try {
+          const [blob, meta, objectUrl] = await Promise.all([
+            getAssetBlob(assetId),
+            getAssetMeta(assetId),
+            getAssetObjectUrl(assetId)
+          ])
+          if (cancelled) return
+          if (!blob || !meta) {
+            next.set(node.id, { objectUrl: null, dataUrl: null, meta: null, status: 'missing' })
+            continue
+          }
+          const dataUrl = await blobToDataUrl(blob)
+          if (cancelled) return
+          next.set(node.id, { objectUrl, dataUrl, meta, status: 'resolved' })
+        } catch (err) {
+          if (!cancelled) {
+            next.set(node.id, { objectUrl: null, dataUrl: null, meta: null, status: 'error' })
+            debugWarn('AI_FLOW_DEBUG', '[AssetResolution] failed for', node.id, (err as Error).message)
+          }
+        }
+      }
+      if (!cancelled) {
+        setMap((prev) => {
+          for (const id of prev.keys()) {
+            if (!next.has(id)) {
+              const entry = prev.get(id)
+              if (entry?.objectUrl) revokeAssetObjectUrl(entry.objectUrl)
+            }
+          }
+          return next
+        })
+      }
+    }
+    run()
+    return () => {
+      cancelled = true
+    }
+  }, [assetKey, nodes, enabled])
+  // Revoke all cached object URLs on unmount.
+  useEffect(() => {
+    return () => {
+      for (const entry of map.values()) {
+        if (entry.objectUrl) revokeAssetObjectUrl(entry.objectUrl)
+      }
+    }
+    // We intentionally exclude `map` from deps — only revoke on unmount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  return map
+}
+
+// [AssetResolution] Helper to merge resolved blob into the live node
+// data passed to Drawflow templates and the runner. NEVER write back
+// to `node.data` — this is read-only mirror.
+const mergeResolvedAsset = <T extends Record<string, unknown>>(data: T, resolved: ResolvedAssetEntry | undefined): T => {
+  if (!resolved || resolved.status !== 'resolved' || !resolved.dataUrl) return data
+  const out: Record<string, unknown> = { ...data }
+  const mediaType = String(out.mediaType || '').toLowerCase()
+  const isVideo = mediaType === 'video' || typeof out.videoData === 'string' || typeof out.videoUrl === 'string'
+  if (isVideo) {
+    out.videoData = resolved.dataUrl
+    if (!out.videoUrl) out.videoUrl = resolved.dataUrl
+  } else {
+    out.imageData = resolved.dataUrl
+    if (!out.imageUrl) out.imageUrl = resolved.dataUrl
+  }
+  out.mediaData = resolved.dataUrl
+  if (!out.mediaUrl) out.mediaUrl = resolved.dataUrl
+  if (resolved.meta?.mimeType) {
+    if (!out.mimeType) out.mimeType = resolved.meta.mimeType
+    if (!out.mediaMimeType) out.mediaMimeType = resolved.meta.mimeType
+  }
+  if (resolved.meta?.width !== undefined && out.mediaWidth === undefined) out.mediaWidth = resolved.meta.width
+  if (resolved.meta?.height !== undefined && out.mediaHeight === undefined) out.mediaHeight = resolved.meta.height
+  return out as T
+}
+
+/**
+ * [AssetResolution] Run-time hydration for the pipeline runner.
+ * The runner reads `data.mediaData / imageData / videoData / urls`
+ * directly off each node. Our workflow store no longer carries those
+ * fields — heavy blobs live in IndexedDB. This helper produces a
+ * shallow-cloned workflow where every node with `assetId` has the
+ * resolved blob inlined back into `data` so the runner sees what it
+ * used to see. The returned workflow is intentionally a deep clone
+ * for `nodes` so the original Zustand-owned workflow is untouched.
+ *
+ * Resolution sources (in priority order):
+ *   1. The supplied `resolvedAssets` map (preferred — already-loaded).
+ *   2. A fresh `getAssetObjectUrl` / `blobToDataUrl` lookup.
+ *
+ * If an assetId is missing in IndexedDB, the node is passed through
+ * with `data.mediaData = ''` so the runner's downstream failure path
+ * is loud rather than silent.
+ */
+const hydrateWorkflowAssetsForRunner = async (
+  workflow: Workflow,
+  resolvedAssets?: Map<string, ResolvedAssetEntry>
+): Promise<Workflow> => {
+  const nodes: WorkflowNode[] = []
+  for (const node of workflow.nodes) {
+    const data = (node.data || {}) as Record<string, unknown>
+    const assetId = typeof data.assetId === 'string' ? data.assetId : ''
+    if (!assetId) {
+      nodes.push(node)
+      continue
+    }
+    let entry = resolvedAssets?.get(node.id)
+    if (!entry || entry.status === 'pending') {
+      try {
+        const blob = await getAssetBlob(assetId)
+        if (!blob) {
+          nodes.push({ ...node, data })
+          continue
+        }
+        const dataUrl = await blobToDataUrl(blob)
+        const meta = await getAssetMeta(assetId)
+        entry = { objectUrl: null, dataUrl, meta, status: 'resolved' }
+      } catch (err) {
+        debugWarn('AI_FLOW_DEBUG', '[AssetResolution][runner.hydrate.failed]', node.id, (err as Error).message)
+        nodes.push({ ...node, data })
+        continue
+      }
+    }
+    if (!entry || entry.status !== 'resolved' || !entry.dataUrl) {
+      nodes.push({ ...node, data })
+      continue
+    }
+    nodes.push({ ...node, data: mergeResolvedAsset(data, entry) })
+  }
+  return { ...workflow, nodes }
 }
 
 const SUPPORTED_NODE_TYPES: FlowNodeType[] = [
@@ -1507,8 +1743,10 @@ async function downloadWorkflowOutputAsset(args: {
   }
 }
 
-function renderDrawflowNode(node: WorkflowNode) {
-  const data = node.data as Record<string, unknown>
+function renderDrawflowNode(node: WorkflowNode, resolvedAssets?: Map<string, ResolvedAssetEntry>) {
+  const rawData = (node.data || {}) as Record<string, unknown>
+  const resolvedEntry = resolvedAssets?.get(node.id)
+  const data = resolvedEntry ? mergeResolvedAsset(rawData, resolvedEntry) : rawData
   const generateData = node.type === 'generate'
     ? { ...data, ...sanitizeGenerateDataPatch(data, {}) }
     : data
@@ -1683,7 +1921,7 @@ function renderDrawflowNode(node: WorkflowNode) {
   `
 }
 
-function buildDrawflowData(workflow: Workflow) {
+function buildDrawflowData(workflow: Workflow, resolvedAssets?: Map<string, ResolvedAssetEntry>) {
   const data: Record<string, DrawflowNodeRecord> = {}
 
   for (const node of workflow.nodes) {
@@ -1694,7 +1932,7 @@ function buildDrawflowData(workflow: Workflow) {
       name: node.type,
       data: cloneDeep(node.data),
       class: `ai-df-wrapper ai-df-wrapper-${node.type} df-port-${portType}`,
-      html: renderDrawflowNode(node),
+      html: renderDrawflowNode(node, resolvedAssets),
       typenode: false,
       inputs: createInputConnections(ports.inputs),
       outputs: createOutputConnections(ports.outputs),
@@ -2170,6 +2408,12 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null)
   const [inspectorNodeId, setInspectorNodeId] = useState<string | null>(null)
 
+  // [AssetResolution] Resolve Media-node assetIds → blob / dataUrl /
+  // objectUrl. The map is consumed by renderDrawflowNode (Drawflow
+  // preview HTML) and by `imagePreview` (lightbox). NEVER write the
+  // resolved values back into `node.data`.
+  const resolvedAssets = useResolvedAssets(workflow?.nodes, true)
+
   // ── Pipeline run visual state ─────────────────────────────────────────
   type NodeRunStatus = 'idle' | 'running' | 'completed' | 'failed'
   const [nodeRunStates, setNodeRunStates] = useState<Record<string, NodeRunStatus>>({})
@@ -2382,7 +2626,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
               const updatedNode = { ...node, data: { ...node.data, ...renderPatch } }
               const content = domNode.closest('.drawflow_content_node') || domNode.parentElement
               if (content) {
-                content.innerHTML = renderDrawflowNode(updatedNode)
+                content.innerHTML = renderDrawflowNode(updatedNode, resolvedAssets)
                 applyPortAttributesForNode(updatedNode)
                 applyNodeVisualRunState(nodeId, 'completed')
                 attachNodeResizeObserver(nodeId)
@@ -3176,7 +3420,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     if (!editor || !node) return
 
     const content = canvasRef.current?.querySelector(`#node-${CSS.escape(node.id)} .drawflow_content_node`)
-    if (content) content.innerHTML = renderDrawflowNode(node)
+    if (content) content.innerHTML = renderDrawflowNode(node, resolvedAssets)
     applyPortAttributesForNode(node)
     syncNodeRunStates()
     attachNodeResizeObserver(node.id)
@@ -3368,7 +3612,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
 
     disconnectNodeResizeObservers()
     suppressEdgeEventRef.current = true
-    editor.import(buildDrawflowData(workflowRef.current), false)
+    editor.import(buildDrawflowData(workflowRef.current, resolvedAssets), false)
     suppressEdgeEventRef.current = false
 
     requestAnimationFrame(() => {
@@ -3778,7 +4022,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         }
 
         const reader = new FileReader()
-        reader.onload = () => {
+        reader.onload = async () => {
           const imageData = typeof reader.result === 'string' ? reader.result : ''
           if (!imageData) {
             cleanup()
@@ -3786,35 +4030,77 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
           }
 
           const finishUpload = (width?: number, height?: number, poster?: string) => {
-            const aspectRatio = width && height ? closestImageAspectRatio(width, height) : fileMediaType === 'video' ? '16:9' : '1:1'
-            const basePatch: Record<string, unknown> = {
-              mediaType: fileMediaType,
-              mediaData: imageData,
-              mediaUrl: '',
-              mediaName: file.name,
-              mediaMimeType: file.type,
-              mediaWidth: width,
-              mediaHeight: height,
-              mediaPoster: fileMediaType === 'video' ? poster || '' : '',
-              aspectRatio
-            }
-
-            updateNode(nodeId, {
-              ...basePatch,
-              imageData: fileMediaType === 'image' ? imageData : '',
-              imageUrl: '',
-              imageName: fileMediaType === 'image' ? file.name : '',
-              imageWidth: fileMediaType === 'image' ? width : undefined,
-              imageHeight: fileMediaType === 'image' ? height : undefined,
-              videoData: fileMediaType === 'video' ? imageData : '',
-              videoUrl: '',
-              videoName: fileMediaType === 'video' ? file.name : '',
-              videoWidth: fileMediaType === 'video' ? width : undefined,
-              videoHeight: fileMediaType === 'video' ? height : undefined,
-              videoPoster: fileMediaType === 'video' ? poster || '' : ''
-            } as Partial<FlowNodeData>)
-            scheduleDrawflowConnectionRefresh(nodeId)
-            cleanup()
+            void (async () => {
+              try {
+                // [AssetResolution] Heavy blob lives in IndexedDB. We
+                // save the raw file via saveAssetFromBlob when we can
+                // (preferred — avoids an extra base64 round-trip); we
+                // fall back to saveAssetFromDataUrl if the File has
+                // already been consumed.
+                let assetMeta: StoredAssetMeta | null = null
+                try {
+                  assetMeta = await (file && file.size > 0
+                    ? saveAssetFromBlob(file, {
+                        kind: fileMediaType,
+                        mimeType: file.type,
+                        fileName: file.name,
+                        width,
+                        height
+                      })
+                    : saveAssetFromDataUrl(imageData, {
+                        kind: fileMediaType,
+                        mimeType: file.type,
+                        fileName: file.name,
+                        width,
+                        height
+                      }))
+                } catch (err) {
+                  console.warn('[AssetStore][save.failed]', fileMediaType, file.name, (err as Error).message)
+                  return
+                }
+                if (!assetMeta) return
+                // Drop any previously-stored Media asset for this node
+                // (single-asset-per-node policy).
+                const existingAssetId = (workflowRef.current.nodes.find((n) => n.id === nodeId)?.data as Record<string, unknown> | undefined)?.assetId
+                if (typeof existingAssetId === 'string' && existingAssetId && existingAssetId !== assetMeta.assetId) {
+                  try { await deleteAsset(existingAssetId) } catch { /* best effort */ }
+                }
+                // [AssetStore] Patch only the metadata. The blob is in
+                // IndexedDB; runtime readers (Drawflow preview, lightbox,
+                // runner) pull it via useResolvedAssets() / getAssetBlob().
+                const aspectRatio = width && height ? closestImageAspectRatio(width, height) : fileMediaType === 'video' ? '16:9' : '1:1'
+                updateNode(nodeId, {
+                  assetId: assetMeta.assetId,
+                  mimeType: assetMeta.mimeType,
+                  mediaMimeType: assetMeta.mimeType,
+                  mediaType: fileMediaType,
+                  mediaName: file.name,
+                  mediaWidth: width,
+                  mediaHeight: height,
+                  size: assetMeta.size,
+                  mediaPoster: fileMediaType === 'video' ? poster || '' : '',
+                  mediaUrl: '',
+                  mediaData: '',
+                  imageUrl: '',
+                  imageName: fileMediaType === 'image' ? file.name : '',
+                  imageWidth: fileMediaType === 'image' ? width : undefined,
+                  imageHeight: fileMediaType === 'image' ? height : undefined,
+                  imageData: '',
+                  videoUrl: '',
+                  videoName: fileMediaType === 'video' ? file.name : '',
+                  videoWidth: fileMediaType === 'video' ? width : undefined,
+                  videoHeight: fileMediaType === 'video' ? height : undefined,
+                  videoData: '',
+                  videoPoster: fileMediaType === 'video' ? poster || '' : '',
+                  aspectRatio
+                } as Partial<FlowNodeData>)
+                scheduleDrawflowConnectionRefresh(nodeId)
+              } catch (err) {
+                console.warn('[AssetStore][upload.flow.failed]', (err as Error).message)
+              } finally {
+                cleanup()
+              }
+            })()
           }
 
           if (fileMediaType === 'video') {
@@ -3927,8 +4213,18 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       let name = String(data.mediaName || data.videoName || data.imageName || data.label || 'Media')
 
       if (node?.type === 'image') {
-        mediaSrc = getMediaNodeSource(data)
+        // [AssetResolution] Prefer the resolved blob from IndexedDB
+        // over the empty inline data fields.
+        const resolved = resolvedAssets.get(nodeId)
+        if (resolved && resolved.status === 'resolved' && resolved.dataUrl) {
+          mediaSrc = resolved.dataUrl
+        } else {
+          mediaSrc = getMediaNodeSource(data)
+        }
         mediaType = getMediaNodeType(data)
+        if (resolved?.status === 'missing') {
+          name = `${name} (missing local asset — please re-upload)`
+        }
       } else if (node?.type === 'generate') {
         const output = data._output as Record<string, unknown> | undefined
         const outputUrls = getGenerateOutputImageUrls(output)
@@ -4031,7 +4327,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         }
         const content = domNode.closest('.drawflow_content_node') || domNode.parentElement
         if (content) {
-          content.innerHTML = renderDrawflowNode(updatedNode)
+          content.innerHTML = renderDrawflowNode(updatedNode, resolvedAssets)
           applyPortAttributesForNode(updatedNode)
         }
       })
@@ -4258,7 +4554,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       try {
         editor.updateNodeDataFromId(node.id, cloneDeep(node.data))
         const content = canvasRef.current?.querySelector(`#node-${CSS.escape(node.id)} .drawflow_content_node`)
-        if (content) content.innerHTML = renderDrawflowNode(node)
+        if (content) content.innerHTML = renderDrawflowNode(node, resolvedAssets)
         applyPortAttributesForNode(node)
         attachNodeResizeObserver(node.id)
         scheduleDrawflowConnectionRefresh(node.id)
@@ -4402,7 +4698,12 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     setActiveEdges({})
     setNodeOutputs({})
 
-    await runPipeline(workflow, pipelineCallbacks)
+    // [AssetResolution] Re-inflate Media-node blobs from IndexedDB
+    // before handing the workflow to the runner. The runner still
+    // reads `data.mediaData / imageData / videoData` off each node,
+    // and we never persist those fields anymore.
+    const hydrated = await hydrateWorkflowAssetsForRunner(workflow, resolvedAssets)
+    await runPipeline(hydrated, pipelineCallbacks)
   }
 
   const handleStop = () => {
@@ -5300,9 +5601,51 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   const filteredTemplates = templateCategory === 'All'
     ? BUILT_IN_TEMPLATES
     : BUILT_IN_TEMPLATES.filter((template) => template.category === templateCategory)
-  const filteredWorkflows = workflows
-    .filter((workflow) => workflow.name.toLowerCase().includes(workflowSearch.toLowerCase()))
-    .sort((a, b) => b.updatedAt - a.updatedAt)
+  // [WorkflowList] Stable ordering policy — sort by `createdAt` desc (with id
+  // tie-break). The Zustand `workflows` array is kept in insertion order; the
+  // dashboard renders a derived `[...filtered]` snapshot here. This means
+  // every operation that bumps `updatedAt` (autosave, mount/open editor,
+  // run, name rename, undo/redo, setActive, etc.) is a no-op for the visible
+  // card order — only `createWorkflow` / `duplicateWorkflow` /
+  // `importWorkflow` and `deleteWorkflow` change what the user sees.
+  //
+  // Acceptance cases (createdAt-desc — newest first, never insertion order):
+  //   A. Create W1, W2, W3 → visual order: W3, W2, W1.
+  //      Close/reopen side panel → still W3, W2, W1.
+  //   B. Open W1, autosave fires `updateWorkflow` → W1 must NOT jump to top.
+  //      Order remains W3, W2, W1 (updatedAt changes are ignored).
+  //   C. Create W4 → W4, W3, W2, W1.
+  //   D. Delete W2 → W4, W3, W1.
+  // To switch to insertion order instead, do NOT just delete the comparator;
+  // use a stable `sortOrder` field or render `workflows` directly (the array
+  // is already in insertion order) so the policy remains explicit.
+  const filteredWorkflows = useMemo(() => {
+    const lowerSearch = workflowSearch.toLowerCase()
+    const filtered = workflows.filter((workflow) =>
+      workflow.name.toLowerCase().includes(lowerSearch)
+    )
+    const sorted = [...filtered].sort((a, b) => {
+      const ac = typeof a.createdAt === 'number' ? a.createdAt : 0
+      const bc = typeof b.createdAt === 'number' ? b.createdAt : 0
+      if (bc !== ac) return bc - ac
+      return String(a.id).localeCompare(String(b.id))
+    })
+    if (WORKFLOW_LIST_DEBUG()) {
+      console.log('[WorkflowList][renderOrder]', JSON.stringify({
+        policy: 'createdAt-desc',
+        search: workflowSearch,
+        order: sorted.map((w) => ({
+          id: w.id,
+          name: w.name,
+          createdAt: w.createdAt,
+          updatedAt: w.updatedAt,
+          nodeCount: Array.isArray(w.nodes) ? w.nodes.length : 0
+        }))
+      }))
+      console.log('[WorkflowList][sortPolicy]', JSON.stringify({ policy: 'createdAt-desc' }))
+    }
+    return sorted
+  }, [workflows, workflowSearch])
 
   const handleCreateBlank = async () => {
     const workflow = createWorkflow(`Workflow ${workflows.length + 1}`)
@@ -5383,7 +5726,13 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
     setActiveWorkflow(workflow.id)
     try {
       await openWorkflowEditorWindow(workflow)
-      await runPipeline(workflow)
+      // [AssetResolution] Re-inflate Media-node blobs from IndexedDB
+      // before the runner sees the workflow. The dashboard route
+      // doesn't pre-load `resolvedAssets` because the canvas isn't
+      // mounted, so hydrateWorkflowAssetsForRunner does the IDB
+      // lookup inline.
+      const hydrated = await hydrateWorkflowAssetsForRunner(workflow)
+      await runPipeline(hydrated)
     } catch (error) {
       window.alert(error instanceof Error ? error.message : 'Unable to run workflow.')
     }

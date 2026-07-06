@@ -2,6 +2,10 @@ import { create } from 'zustand'
 import { persist, createJSONStorage, type StateStorage } from 'zustand/middleware'
 import type { Workflow, WorkflowNode, WorkflowEdge, FlowNodeType } from '@/types'
 import { v4 as uuid } from 'uuid'
+import {
+  saveAssetFromDataUrl,
+  type StoredAssetMeta
+} from '@/lib/assetStore'
 
 type WorkflowHistory = {
   past: Workflow[]
@@ -277,6 +281,261 @@ const createDefaultNodeData = (type: FlowNodeType): Record<string, unknown> => {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// ASSET MIGRATION + PERSIST SANITIZATION
+// ═══════════════════════════════════════════════════════════════
+//
+// Heavy media (base64 dataUrls) used to live inline in `node.data` and
+// were persisted to `chrome.storage.local` together with the rest of
+// the workflow. That blew past the ~10 MB MV3 quota as soon as a user
+// uploaded a few high-res images. We now keep only metadata
+// (`assetId`, `mimeType`, `width`, `height`, `size`, `fileName`) in
+// the workflow store and store the actual bytes in IndexedDB
+// (see `src/lib/assetStore.ts`).
+//
+// This block owns two responsibilities:
+//   1. sanitizeWorkflowForPersist — strip anything heavy BEFORE the
+//      zustand `persist` middleware writes to chrome.storage.local.
+//   2. migrateWorkflowAssets — one-shot upgrade that reads existing
+//      workflows, saves any inline `data:` blob to IndexedDB, and
+//      rewrites the workflow with `assetId` metadata instead.
+
+const HEAVY_KEYS = [
+  'mediaData',
+  'imageData',
+  'videoData',
+  'base64',
+  'dataUrl',
+  'thumbnailData',
+  'rawFile',
+  'file',
+  'blob',
+  'outputs',
+  'images',
+  'result',
+  'runResult',
+  'logs',
+  'mediaPoster',
+  'videoPoster'
+] as const
+
+const INLINE_BLOB_KEYS = ['mediaData', 'imageData', 'videoData'] as const
+
+const PERSIST_BUDGET_WARN_KB = 5000
+const PERSIST_STRING_LENGTH_LIMIT = 100_000
+
+const stripHeavyKeysDeep = (value: unknown): unknown => {
+  if (value === null || value === undefined) return value
+  if (Array.isArray(value)) return value.map(stripHeavyKeysDeep)
+  if (typeof value !== 'object') return value
+  const obj = value as Record<string, unknown>
+  const out: Record<string, unknown> = {}
+  for (const key of Object.keys(obj)) {
+    if ((HEAVY_KEYS as readonly string[]).includes(key)) continue
+    out[key] = stripHeavyKeysDeep(obj[key])
+  }
+  return out
+}
+
+const isHeavyString = (value: unknown): boolean => {
+  if (typeof value !== 'string') return false
+  if (value.startsWith('data:') || value.startsWith('blob:')) return true
+  return value.length > PERSIST_STRING_LENGTH_LIMIT
+}
+
+const stripHeavyStringFieldsDeep = (value: unknown): unknown => {
+  if (value === null || value === undefined) return value
+  if (Array.isArray(value)) return value.map(stripHeavyStringFieldsDeep)
+  if (typeof value !== 'object') return value
+  const obj = value as Record<string, unknown>
+  const out: Record<string, unknown> = {}
+  for (const key of Object.keys(obj)) {
+    const v = obj[key]
+    if (isHeavyString(v)) continue
+    out[key] = stripHeavyStringFieldsDeep(v)
+  }
+  return out
+}
+
+/**
+ * sanitizeWorkflowForPersist — strip heavy Media-node blobs (and any
+ * `data:`/`blob:` strings or oversized strings) from a workflow before
+ * it is written to chrome.storage.local.
+ *
+ * This is intentionally conservative: when in doubt, drop the field.
+ * Heavy state lives in IndexedDB; the workflow store only carries
+ * pointers + metadata.
+ */
+const sanitizeWorkflowForPersist = (workflow: Workflow): Workflow => {
+  let sanitized = stripHeavyKeysDeep(workflow) as Workflow
+  sanitized = stripHeavyStringFieldsDeep(sanitized) as Workflow
+  return sanitized
+}
+
+const approxKb = (value: unknown): number => {
+  try {
+    return Math.round(JSON.stringify(value ?? {}).length / 1024 * 10) / 10
+  } catch {
+    return 0
+  }
+}
+
+const sanitizeWorkflowForSizeReport = (workflow: Workflow): Workflow =>
+  stripHeavyStringFieldsDeep(stripHeavyKeysDeep(workflow)) as Workflow
+
+const storageSizeGuard = (workflows: Workflow[]): void => {
+  if (!DEBUG_PERSIST()) return
+  const sanitized = workflows.map(sanitizeWorkflowForSizeReport)
+  const kb = approxKb(sanitized)
+  let heavyBlobCount = 0
+  const stack: unknown[] = [workflows]
+  while (stack.length) {
+    const v = stack.pop()
+    if (!v) continue
+    if (typeof v === 'string') {
+      if (v.startsWith('data:image/') || v.startsWith('data:video/') || v.startsWith('data:application/')) {
+        heavyBlobCount++
+      }
+      continue
+    }
+    if (typeof v !== 'object') continue
+    if (Array.isArray(v)) {
+      for (const x of v) stack.push(x)
+    } else {
+      for (const k of Object.keys(v as Record<string, unknown>)) stack.push((v as Record<string, unknown>)[k])
+    }
+  }
+  if (kb > PERSIST_BUDGET_WARN_KB || heavyBlobCount > 0) {
+    console.warn('[WorkflowPersist][storage.size.warning]', JSON.stringify({
+      sanitizedKb: kb,
+      workflowCount: workflows.length,
+      survivingDataUrls: heavyBlobCount,
+      budgetKb: PERSIST_BUDGET_WARN_KB,
+      hint: 'dataUrl/blob: strings slipped past sanitizeWorkflowForPersist; quota likely exceeded'
+    }))
+  }
+}
+
+interface MigrationEntry {
+  workflowId: string
+  nodeId: string
+  movedFields: string[]
+  assetId: string
+  beforeKb: number
+  afterKb: number
+}
+
+/**
+ * migrateWorkflowAssets — one-shot upgrade. Reads each workflow, finds
+ * any inline `data:` blob fields, persists them to IndexedDB, and
+ * replaces them with `{ assetId, ...metadata }`. Idempotent: if the
+ * node already has `assetId` and no inline blob, it's a no-op.
+ *
+ * Migration reports are written to the console under
+ * `[AssetMigration]` so we can audit how much storage we freed.
+ */
+const migrateWorkflowAssets = async (
+  workflows: Workflow[]
+): Promise<{ workflows: Workflow[]; entries: MigrationEntry[] }> => {
+  const entries: MigrationEntry[] = []
+  const out: Workflow[] = []
+  for (const workflow of workflows) {
+    let mutated = false
+    const nodes: WorkflowNode[] = []
+    // De-dupe identical inline blobs across nodes so we only store
+    // one copy in IndexedDB (the user reported `mediaData` AND
+    // `imageData` being byte-identical for the same node).
+    const seenBlobs = new Map<string, string>()
+    for (const node of workflow.nodes) {
+      const data = { ...(node.data as Record<string, unknown> || {}) }
+      const inlineValues: Array<{ key: string; value: string }> = []
+      for (const key of INLINE_BLOB_KEYS) {
+        const v = data[key]
+        if (typeof v === 'string' && v.startsWith('data:')) {
+          inlineValues.push({ key, value: v })
+        }
+      }
+      if (inlineValues.length === 0 && !data.assetId) {
+        nodes.push(node)
+        continue
+      }
+      const beforeKb = approxKb(data)
+      let assetId = typeof data.assetId === 'string' ? data.assetId : ''
+      let assetMeta: StoredAssetMeta | null = null
+      const movedFields: string[] = []
+      if (inlineValues.length > 0) {
+        const primary = inlineValues[0]
+        const cachedId = seenBlobs.get(primary.value)
+        if (cachedId) {
+          assetId = cachedId
+        } else {
+          try {
+            const mime = (primary.value.match(/^data:([^;]+);/) || [, ''])[1] || 'application/octet-stream'
+            const kind = mime.startsWith('image/') ? 'image' : mime.startsWith('video/') ? 'video' : 'file'
+            assetMeta = await saveAssetFromDataUrl(primary.value, {
+              kind: kind as 'image' | 'video' | 'file',
+              mimeType: mime,
+              fileName: typeof data.mediaName === 'string' ? data.mediaName : undefined
+            })
+            assetId = assetMeta.assetId
+            seenBlobs.set(primary.value, assetId)
+          } catch (err) {
+            console.warn('[AssetMigration][save.failed]', JSON.stringify({
+              workflowId: workflow.id,
+              nodeId: node.id,
+              error: (err as Error).message
+            }))
+            nodes.push(node)
+            continue
+          }
+        }
+        for (const { key } of inlineValues) {
+          delete data[key]
+          movedFields.push(key)
+        }
+      }
+      // Drop poster fields that may carry base64.
+      if (typeof data.mediaPoster === 'string' && data.mediaPoster.startsWith('data:')) {
+        delete data.mediaPoster
+        movedFields.push('mediaPoster')
+      }
+      if (typeof data.videoPoster === 'string' && data.videoPoster.startsWith('data:')) {
+        delete data.videoPoster
+        movedFields.push('videoPoster')
+      }
+      data.assetId = assetId
+      if (assetMeta) {
+        if (!data.mimeType && assetMeta.mimeType) data.mimeType = assetMeta.mimeType
+        if (!data.mediaMimeType && assetMeta.mimeType) data.mediaMimeType = assetMeta.mimeType
+        if (data.mediaWidth === undefined && assetMeta.width !== undefined) data.mediaWidth = assetMeta.width
+        if (data.mediaHeight === undefined && assetMeta.height !== undefined) data.mediaHeight = assetMeta.height
+        if (data.size === undefined && assetMeta.size !== undefined) data.size = assetMeta.size
+      }
+      const afterKb = approxKb(data)
+      entries.push({
+        workflowId: workflow.id,
+        nodeId: node.id,
+        movedFields,
+        assetId,
+        beforeKb,
+        afterKb
+      })
+      console.log('[AssetMigration]', JSON.stringify({
+        workflowId: workflow.id,
+        nodeId: node.id,
+        movedFields,
+        assetId,
+        beforeKb,
+        afterKb
+      }))
+      nodes.push({ ...node, data: data as WorkflowNode['data'] })
+      mutated = true
+    }
+    out.push(mutated ? { ...workflow, nodes } : workflow)
+  }
+  return { workflows: out, entries }
+}
+
 export const useWorkflowStore = create<WorkflowState>()(
   persist(
     (set, get) => ({
@@ -333,21 +592,64 @@ export const useWorkflowStore = create<WorkflowState>()(
 
         if (!state?.workflows) return
 
+        // [AssetMigration] One-shot upgrade: any workflow node still
+        // carrying inline `data:image/...` blobs gets migrated to
+        // IndexedDB and replaced with an `assetId`. The migration is
+        // idempotent — re-running on already-migrated workflows is a
+        // no-op (inline blob count is 0 and `assetId` is already set).
+        const { workflows: migratedWorkflows, entries } = await migrateWorkflowAssets(state.workflows as Workflow[])
+        if (DEBUG_PERSIST() && entries.length > 0) {
+          const beforeKb = entries.reduce((acc, e) => acc + e.beforeKb, 0)
+          const afterKb = entries.reduce((acc, e) => acc + e.afterKb, 0)
+          console.log('[WorkflowPersist][hydrateFromStorage:migration]', JSON.stringify({
+            migratedNodes: entries.length,
+            beforeKb: Math.round(beforeKb * 10) / 10,
+            afterKb: Math.round(afterKb * 10) / 10,
+            savedKb: Math.round((beforeKb - afterKb) * 10) / 10
+          }))
+        }
+
         if (DEBUG_PERSIST()) {
           console.log('[WorkflowPersist][hydrateFromStorage:set]', JSON.stringify({
-            workflowCount: wc,
-            activeWorkflowId: aw
+            workflowCount: migratedWorkflows.length,
+            activeWorkflowId: aw,
+            migratedCount: entries.length
           }))
-          if (wc === 0) {
+          if (migratedWorkflows.length === 0) {
             console.trace('[WorkflowPersist][hydrateFromStorage:set:zero-workflows]')
           }
         }
         set({
-          workflows: state.workflows,
-          activeWorkflowId: state.activeWorkflowId ?? state.workflows[0]?.id ?? null,
+          workflows: migratedWorkflows,
+          activeWorkflowId: state.activeWorkflowId ?? migratedWorkflows[0]?.id ?? null,
           selectedNodeId: state.selectedNodeId ?? null,
           selectedEdgeId: state.selectedEdgeId ?? null
         })
+
+        // If migration produced a smaller workflow, persist it back so
+        // chrome.storage.local no longer carries the bytes. We bypass
+        // partialize here because the migrated workflows are already
+        // sanitized — writing them straight avoids an unnecessary
+        // re-sanitization round-trip.
+        if (entries.length > 0) {
+          try {
+            const sanitizedPayload = JSON.stringify({
+              state: {
+                workflows: migratedWorkflows,
+                activeWorkflowId: state.activeWorkflowId ?? migratedWorkflows[0]?.id ?? null
+              }
+            })
+            await chrome.storage.local.set({ 'ai-flow-workflows': sanitizedPayload })
+            if (DEBUG_PERSIST()) {
+              console.log('[WorkflowPersist][hydrateFromStorage:persist-back]', JSON.stringify({
+                kb: Math.round(sanitizedPayload.length / 1024 * 10) / 10,
+                workflowCount: migratedWorkflows.length
+              }))
+            }
+          } catch (err) {
+            console.warn('[WorkflowPersist][hydrateFromStorage:persist-back:failed]', (err as Error).message)
+          }
+        }
       },
 
       createWorkflow: (name) => {
@@ -381,6 +683,10 @@ export const useWorkflowStore = create<WorkflowState>()(
       },
 
       updateWorkflow: (id, updates) => {
+        const beforeOrder = get().workflows.map((w) => w.id)
+        const before = get().workflows.find((w) => w.id === id)
+        const beforeUpdatedAt = before?.updatedAt ?? null
+        const changedKeys = Object.keys(updates)
         set((state) => ({
           history: pushWorkflowHistory(state, id),
           workflows: state.workflows.map((w) =>
@@ -388,6 +694,22 @@ export const useWorkflowStore = create<WorkflowState>()(
           ),
           isDirty: true
         }))
+        if (DEBUG_PERSIST()) {
+          const after = get().workflows.find((w) => w.id === id)
+          const afterUpdatedAt = after?.updatedAt ?? null
+          const afterOrder = get().workflows.map((w) => w.id)
+          console.log('[WorkflowStore][updateWorkflow]', JSON.stringify({
+            action: 'updateWorkflow',
+            workflowId: id,
+            changedKeys,
+            updatedAtChanged: beforeUpdatedAt !== afterUpdatedAt,
+            beforeOrder,
+            afterOrder,
+            reorderedIds: false,
+            mutating: true,
+            note: 'stable list policy: createdAt-desc; updatedAt changes do not reorder'
+          }))
+        }
       },
 
       deleteWorkflow: (id) => {
@@ -424,16 +746,29 @@ export const useWorkflowStore = create<WorkflowState>()(
 
       setActiveWorkflow: (id) => {
         if (DEBUG_PERSIST()) {
+          const beforeOrder = get().workflows.map((w) => w.id)
           console.log('[WorkflowPersist][setActiveWorkflow:before]', JSON.stringify({
             currentCount: get().workflows.length,
-            nextActiveWorkflowId: id
+            currentActiveWorkflowId: get().activeWorkflowId,
+            nextActiveWorkflowId: id,
+            beforeOrder
+          }))
+          console.log('[WorkflowStore][setActiveWorkflow]', JSON.stringify({
+            action: 'setActiveWorkflow',
+            beforeOrder,
+            afterOrder: beforeOrder,
+            mutating: false,
+            reorderedIds: false,
+            updatedAtChanged: false
           }))
         }
         set({ activeWorkflowId: id, selectedNodeId: null, selectedEdgeId: null })
         if (DEBUG_PERSIST()) {
+          const afterOrder = get().workflows.map((w) => w.id)
           console.log('[WorkflowPersist][setActiveWorkflow:after]', JSON.stringify({
             nextCount: get().workflows.length,
-            activeWorkflowId: get().activeWorkflowId
+            activeWorkflowId: get().activeWorkflowId,
+            afterOrder
           }))
         }
       },
@@ -732,10 +1067,17 @@ export const useWorkflowStore = create<WorkflowState>()(
       name: 'ai-flow-workflows',
       storage: createJSONStorage(() => chromeStorage),
       partialize: (state) => {
+        const sanitized = (state.workflows || []).map(sanitizeWorkflowForPersist)
         const partialized: Partial<WorkflowState> = {
-          workflows: state.workflows,
+          workflows: sanitized,
           activeWorkflowId: state.activeWorkflowId
         }
+        // [WorkflowPersist][storage.size.warning] — sanity check the
+        // sanitized payload before it crosses the chrome.storage.local
+        // boundary. Anything > 5 MB or with surviving `data:image` /
+        // `data:video` strings indicates the sanitizer missed a path
+        // and we are about to hit the quota again.
+        storageSizeGuard(sanitized)
         if (DEBUG_PERSIST()) {
           console.log('[WorkflowPersist][partialize]', JSON.stringify({
             workflowCount: state.workflows?.length,

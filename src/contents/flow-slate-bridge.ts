@@ -57,7 +57,7 @@
   // Build time marker — single source of truth for cache-busting verification
   // Bump this every time you make a runtime change so the Flow page console
   // verification (window.__FLOW_BRIDGE_BUILD_TIME__) matches the running bundle.
-  var FLOW_BRIDGE_BUILD_TIME = "2026-07-05 19:55:00"
+  var FLOW_BRIDGE_BUILD_TIME = "2026-07-07 00:50:00"
   bridgeLog('[Bridge] BUILD_TIME ' + FLOW_BRIDGE_BUILD_TIME + ' instance=' + BRIDGE_INSTANCE_ID)
   ;(window as Record<string, unknown>).__FLOW_BRIDGE_BUILD_TIME__ = FLOW_BRIDGE_BUILD_TIME
 
@@ -4842,52 +4842,284 @@
     return { success: true, clickedText: safeText(matchedItem.textContent) }
   }
 
-  async function selectDuration(targetDuration: string): Promise<Record<string, unknown>> {
+  async function selectDuration(
+    targetDuration: string,
+    panel?: Element | null
+  ): Promise<Record<string, unknown>> {
     bridgeLog('[Bridge][rs] select duration START', targetDuration)
 
     if (!targetDuration) {
       return { success: false, error: 'FLOW_DURATION_MISSING', details: { targetDuration: targetDuration } }
     }
 
-    // Parse duration value (e.g. "8s" -> "8")
-    var durNum = targetDuration.replace(/s$/i, '').trim()
-    var durSelectors = [
-      'button[id$="-trigger-' + durNum + '"]',
-      'button[id$="-trigger-' + targetDuration + '"]',
-    ]
-    for (var si = 0; si < durSelectors.length; si++) {
-      var selBtn = document.querySelector(durSelectors[si]) as HTMLElement | null
-      if (selBtn) {
-        dispatchFullClick(selBtn)
-        await sleep(200)
-        bridgeLog('[Bridge][rs] select duration SUCCESS (id)', targetDuration)
-        return { success: true }
+    var rawTarget = safeText(targetDuration)
+    var lowerTarget = rawTarget.toLowerCase()
+    // [Bridge][rs][duration] Normalize target to one of {4s,6s,8s,10s}.
+    // Bare numeric like "4" is explicitly rejected: it is ambiguous with
+    // the quantity row (x4 / 4x). The duration chip must always carry "s".
+    var normalizedTarget = ''
+    var candidates4 = ['10s', '8s', '6s', '4s']
+    for (var ci = 0; ci < candidates4.length; ci++) {
+      if (
+        lowerTarget === candidates4[ci].toLowerCase() ||
+        lowerTarget === candidates4[ci].toLowerCase().replace(/s$/, '')
+      ) {
+        normalizedTarget = candidates4[ci]
+        break
+      }
+    }
+    if (!normalizedTarget) {
+      return {
+        success: false,
+        error: 'FLOW_DURATION_UNSUPPORTED',
+        details: { targetDuration: rawTarget, supported: candidates4 },
       }
     }
 
-    // Text-based: button with "4s", "6s", "8s", "10s"
-    var durBtns = Array.from(document.querySelectorAll('button')) as HTMLElement[]
-    for (var di = 0; di < durBtns.length; di++) {
-      var db = durBtns[di]
-      var dbText = safeLower(db.textContent)
-      if (dbText === targetDuration.toLowerCase() || dbText === durNum + 's' || dbText === durNum) {
-        dispatchFullClick(db)
-        await sleep(200)
-        bridgeLog('[Bridge][rs] select duration SUCCESS (text)', db.textContent)
-        return { success: true }
+    // [Bridge][rs][duration] Resolve panel scope. We must NEVER query
+    // document-wide — quantity buttons live on the same DOM and use
+    // numeric triggers (e.g. "-trigger-4") that would clash with the
+    // duration row's id pattern.
+    var activePanel = (panel && panel !== document) ? panel : getActiveFlowSettingsPanel()
+    var scope: ParentNode = (activePanel && activePanel !== document) ? activePanel : document
+
+    // [Bridge][rs][duration] Reject any candidate whose accessible text
+    // matches a quantity shape. Quantity chips render as "x4", "4x", or
+    // bare "4" alongside "<something> ratio" / "Image" / "Video" labels.
+    // The duration row is the only place a button with text exactly
+    // "4s" / "6s" / "8s" / "10s" exists in this settings panel.
+    var isQuantityShape = function (txt: string): boolean {
+      var t = safeLower(txt).replace(/\s+/g, '')
+      if (!t) return false
+      if (/^x\d+$/i.test(t)) return true
+      if (/^\d+x$/i.test(t)) return true
+      if (/^\d+$/.test(t)) return true
+      return false
+    }
+
+    var buildCandidate = function (el: HTMLElement): {
+      text: string
+      ariaLabel: string
+      id: string
+      visible: boolean
+      disabled: boolean
+      rejectedReason: string
+    } {
+      var txt = safeText(el.textContent)
+      var ariaLabel = el.getAttribute('aria-label') || ''
+      var id = el.id || ''
+      var visible = isVisible(el)
+      var disabled = !!(el as HTMLButtonElement).disabled || el.getAttribute('aria-disabled') === 'true'
+      var rejectedReason = ''
+      if (!visible) rejectedReason = 'not_visible'
+      else if (disabled) rejectedReason = 'disabled'
+      else if (isQuantityShape(txt)) rejectedReason = 'quantity_shape_text'
+      else if (isQuantityShape(ariaLabel)) rejectedReason = 'quantity_shape_aria'
+      return { text: txt, ariaLabel, id, visible, disabled, rejectedReason }
+    }
+
+    var findDurationOption = function (scopeEl: ParentNode): {
+      el: HTMLElement
+      info: { text: string; ariaLabel: string; id: string; visible: boolean; disabled: boolean; rejectedReason: string }
+    } | null {
+      var btns = Array.from(scopeEl.querySelectorAll('button, [role="radio"], [role="option"], [role="menuitem"]')) as HTMLElement[]
+      for (var bi = 0; bi < btns.length; bi++) {
+        var b = btns[bi]
+        if (!isVisible(b)) continue
+        if ((b as HTMLButtonElement).disabled || b.getAttribute('aria-disabled') === 'true') continue
+        var t = safeText(b.textContent)
+        if (!t) continue
+        // Strict text match: exact "4s" / "6s" / "8s" / "10s".
+        if (safeLower(t) === normalizedTarget.toLowerCase()) {
+          return { el: b, info: buildCandidate(b) }
+        }
+        // aria-label fallback (Radix sometimes omits text when chosen).
+        var aria = b.getAttribute('aria-label') || ''
+        if (aria && safeLower(aria) === normalizedTarget.toLowerCase()) {
+          if (!isQuantityShape(aria)) {
+            return { el: b, info: buildCandidate(b) }
+          }
+        }
+        // data-value fallback (Radix select uses data-value="4s")
+        var dv = b.getAttribute('data-value') || ''
+        if (dv && safeLower(dv) === normalizedTarget.toLowerCase()) {
+          if (!isQuantityShape(dv)) {
+            return { el: b, info: buildCandidate(b) }
+          }
+        }
+      }
+      return null
+    }
+
+    var dumpDurationOptions = function (reasonLabel: string): void {
+      try {
+        var allBtns = Array.from(scope.querySelectorAll('button, [role="radio"], [role="option"], [role="menuitem"]')) as HTMLElement[]
+        var dump: Array<Record<string, unknown>> = []
+        for (var di = 0; di < allBtns.length; di++) {
+          var info = buildCandidate(allBtns[di])
+          // Only emit candidates whose accessible text even mentions a digit,
+          // so the dump is readable in the console.
+          if (!/\d/.test(info.text) && !/\d/.test(info.ariaLabel)) continue
+          dump.push({
+            text: info.text,
+            ariaLabel: info.ariaLabel,
+            id: info.id,
+            visible: info.visible,
+            disabled: info.disabled,
+            rejectedReason: info.rejectedReason,
+          })
+        }
+        console.log('[Bridge][DURATION_OPTIONS_DUMP]', JSON.stringify({
+          targetDuration: normalizedTarget,
+          reason: reasonLabel,
+          scopeTag: (scope as Element).tagName || '#document',
+          options: dump,
+        }))
+      } catch (e) {
+        // never let logging crash the pipeline
       }
     }
 
+    // Up to 2 attempts — Radix sometimes re-renders the chip list after
+    // a sibling (ratio / quantity) change. NEVER click an ambiguous match.
+    var clicked = false
+    var clickedInfo: { text: string; ariaLabel: string; id: string } | null = null
+    for (var attempt = 0; attempt < 2 && !clicked; attempt++) {
+      // Re-rescope panel in case Radix re-mounted it.
+      if (attempt > 0) {
+        activePanel = (panel && panel !== document) ? panel : getActiveFlowSettingsPanel()
+        scope = (activePanel && activePanel !== document) ? activePanel : document
+      }
+      var found = findDurationOption(scope)
+      if (found) {
+        dispatchFullClick(found.el)
+        await sleep(220)
+        clicked = true
+        clickedInfo = { text: found.info.text, ariaLabel: found.info.ariaLabel, id: found.info.id }
+        bridgeLog('[Bridge][rs] select duration CLICKED ' + normalizedTarget, {
+          attempt: attempt + 1,
+          text: found.info.text,
+          id: found.info.id,
+          ariaLabel: found.info.ariaLabel,
+          scope: (activePanel && activePanel !== document) ? 'panel' : 'document',
+        })
+        break
+      }
+      if (attempt === 0) await sleep(280)
+    }
+
+    if (!clicked) {
+      dumpDurationOptions('not_found_in_scope')
+      return {
+        success: false,
+        error: 'FLOW_DURATION_UNSUPPORTED_FOR_CURRENT_COMBO',
+        details: { targetDuration: normalizedTarget, attemptedInScope: (activePanel && activePanel !== document) ? 'panel' : 'document' },
+      }
+    }
+
+    // [Bridge][rs][duration] VERIFIED gate: success only when the
+    // post-click snapshot actually shows the target duration. We poll
+    // for 1500–2500ms because Flow UI applies settings asynchronously
+    // and can briefly show the new value before normalizing it back
+    // (e.g. 4s → 8s when the model doesn't actually support 4s).
+    var settingsBtnForVerify = (typeof getFlowSettingsButton === 'function' ? getFlowSettingsButton() : null)
+    var sawTargetTransiently = false
+    var finalActual = ''
+    var verdict: 'VERIFIED' | 'NOT_APPLIED' | 'NORMALIZED' = 'NOT_APPLIED'
+
+    // Capture the very first poll so we can compare against the eventual
+    // settled value. If the first read is target (or transitions through
+    // target on its way back to model-default), that's "NORMALIZED".
+    for (var pollI = 0; pollI < 10; pollI++) {
+      await sleep(220)
+      var snap = readFlowSettingsSnapshot(settingsBtnForVerify) as Record<string, unknown> | null
+      var cur = snap ? String(snap.duration || '') : ''
+      finalActual = cur
+
+      if (pollI === 0) {
+        // First post-click read. If it's already not-target but is a
+        // different value, we still want to see whether it transitions
+        // through target on a later poll (Radix can be slow).
+        if (cur.length > 0 && cur !== normalizedTarget) {
+          initialOther = cur
+        }
+      }
+
+      if (cur === normalizedTarget) {
+        // Keep polling — Flow can show 4s and then snap back to 8s
+        // when the active model doesn't actually support 4s. We
+        // only declare VERIFIED if the target is still present at
+        // the last poll tick.
+        sawTargetTransiently = true
+        if (pollI >= 5) {
+          verdict = 'VERIFIED'
+        }
+        continue
+      }
+
+      // We saw the target on a prior poll AND it has now changed to
+      // some other value (model-default normalize-back) → NORMALIZED.
+      if (sawTargetTransiently && cur.length > 0) {
+        verdict = 'NORMALIZED'
+        // one more tick to capture the post-normalize actual
+        await sleep(220)
+        var snap2 = readFlowSettingsSnapshot(settingsBtnForVerify) as Record<string, unknown> | null
+        if (snap2) finalActual = String(snap2.duration || '')
+        break
+      }
+    }
+
+    if (verdict === 'VERIFIED') {
+      bridgeLog('[Bridge][rs] select duration VERIFIED ' + normalizedTarget, {
+        clicked: clickedInfo,
+        actual: finalActual,
+      })
+      return {
+        success: true,
+        targetDuration: normalizedTarget,
+        actualDuration: finalActual,
+        verified: true,
+      }
+    }
+
+    if (verdict === 'NORMALIZED' || sawTargetTransiently) {
+      bridgeWarn('[Bridge][rs] select duration NORMALIZED_BY_UI', {
+        target: normalizedTarget,
+        actual: finalActual,
+        transientlyMatched: true,
+        clicked: clickedInfo,
+      })
+      dumpDurationOptions('normalized_after_click')
+      return {
+        success: false,
+        error: 'FLOW_DURATION_NORMALIZED_BY_UI',
+        targetDuration: normalizedTarget,
+        actualDuration: finalActual,
+        wasTemporarilySelected: true,
+        details: { clicked: clickedInfo },
+      }
+    }
+
+    // Never saw the target at all → click did not register.
+    dumpDurationOptions('click_did_not_apply')
+    bridgeWarn('[Bridge][rs] select duration NOT_APPLIED', {
+      target: normalizedTarget,
+      actual: finalActual,
+      clicked: clickedInfo,
+    })
     return {
       success: false,
-      error: 'FLOW_DURATION_NOT_FOUND',
-      details: { targetDuration: targetDuration }
+      error: 'FLOW_DURATION_CLICK_DID_NOT_APPLY',
+      targetDuration: normalizedTarget,
+      actualDuration: finalActual,
+      details: { clicked: clickedInfo },
     }
   }
 
   async function applyFlowSettings(rawPayload: any): Promise<Record<string, unknown>> {
     try {
       var target = normalizeFlowSettingsPayload(rawPayload)
+      var isVideo = target.mode === 'video'
 
       bridgeLog('[Bridge] Target: MODEL=' + target.model + ' MODE=' + target.mode + ' RATIO=' + target.ratio + ' QTY=' + target.quantity + ' DURATION=' + (target.duration as string || '') + ' IS_FRAMES=' + target.isFrames + ' REFS=' + ((target.fileIds as string[])?.length || 0))
 
@@ -4959,7 +5191,7 @@
         return { success: false, error: 'FLOW_SETTINGS_PANEL_NOT_FOUND' }
       }
 
-      // ── Step 4: Select mode ───────────────────────────────────────
+      // ── Step 4: Select mode (always first — sets the layout) ─────
       console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_MODE_RESULT', JSON.stringify({
         targetMode: target.mode,
         beforeSettings: beforeSnapshot ? { mode: (beforeSnapshot as Record<string, unknown>).mode } : null,
@@ -4981,63 +5213,169 @@
         return { success: false, error: 'FLOW_SETTINGS_PANEL_NOT_FOUND' }
       }
 
-      // ── Step 5: Select ratio ────────────────────────────────────
-      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_RATIO_RESULT', JSON.stringify({
-        targetRatio: target.ratio,
+      // ── Steps 5-8: Branch on mode ─────────────────────────────────
+      // VIDEO order: mode → model → ratio → quantity → duration
+      //   Rationale: duration was previously placed after model, but in
+      //   practice ratio/quantity changes can re-render the duration row
+      //   and Flow can normalize duration back to the model default. By
+      //   placing duration LAST we guarantee the final click writes into
+      //   a settled chip list, and the verify gate catches any subsequent
+      //   normalize-back so we surface
+      //   FLOW_DURATION_NORMALIZED_BY_UI rather than silently submit.
+      //
+      // IMAGE order: ratio → quantity → model (unchanged — image
+      //   models don't reset duration/quantity the same way).
+      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_ORDER', JSON.stringify({
+        mode: target.mode,
+        order: isVideo
+          ? ['mode', 'model', 'ratio', 'quantity', 'duration']
+          : ['mode', 'ratio', 'quantity', 'model'],
       }))
-      var ratioResult = await selectRatio(activePanel, target.ratio as string)
-      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_RATIO_DONE', JSON.stringify({
-        success: !!ratioResult.success,
-        method: ratioResult.method || '',
-        error: ratioResult.error || '',
-      }))
-      if (!ratioResult.success) {
-        return ratioResult
-      }
 
-      // ── Step 6: Select quantity ─────────────────────────────────
-      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_QTY_RESULT', JSON.stringify({
-        targetQuantity: target.quantity,
-      }))
-      var qtyResult = await selectFlowQuantity(target.quantity as number, settingsBtn)
-      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_QTY_DONE', JSON.stringify({
-        success: !!qtyResult.success,
-        method: qtyResult.method || '',
-        error: qtyResult.error || '',
-      }))
-      if (!qtyResult.success) {
-        return qtyResult
-      }
-
-      // ── Step 7: Select model ────────────────────────────────────
-      bridgeLog('[Bridge][rs] select model START', target.model)
-      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_MODEL_RESULT', JSON.stringify({
-        targetModel: target.model,
-      }))
-      var modelResult = await selectModelDropdown(activePanel, target.model as string)
-      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_MODEL_DONE', JSON.stringify({
-        success: !!modelResult.success,
-        method: modelResult.method || '',
-        error: modelResult.error || '',
-        clickedText: modelResult.clickedText || '',
-        detailsKeys: Object.keys((modelResult as Record<string, unknown>).details as Record<string, unknown> || {}),
-      }))
-      if (!modelResult.success) {
-        return modelResult
-      }
-
-      // ── Step 8: Select duration (video only) ─────────────────────
-      if (target.mode === 'video' && target.duration) {
-        await sleep(400) // wait for duration list to render
-        var durResult = await selectDuration(target.duration as string)
-        console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_DURATION_DONE', JSON.stringify({
-          targetDuration: target.duration,
-          success: !!durResult.success,
-          error: durResult.error || '',
+      if (isVideo) {
+        // ── Video branch ──────────────────────────────────────────
+        // ── Step 5v: Select model FIRST ────────────────────────────
+        bridgeLog('[Bridge][rs] select model START', target.model)
+        console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_MODEL_RESULT', JSON.stringify({
+          targetModel: target.model,
         }))
-        // Duration errors are warnings — don't fail the whole flow
-        if (!durResult.success) {
-          bridgeWarn('[Bridge][rs] select duration FAILED', durResult)
+        var videoModelResult = await selectModelDropdown(activePanel, target.model as string)
+        console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_MODEL_DONE', JSON.stringify({
+          success: !!videoModelResult.success,
+          method: videoModelResult.method || '',
+          error: videoModelResult.error || '',
+          clickedText: videoModelResult.clickedText || '',
+          detailsKeys: Object.keys((videoModelResult as Record<string, unknown>).details as Record<string, unknown> || {}),
+        }))
+        if (!videoModelResult.success) {
+          return videoModelResult
+        }
+
+        activePanel = getActiveFlowSettingsPanel()
+        if (!activePanel || activePanel === document) {
+          return { success: false, error: 'FLOW_SETTINGS_PANEL_NOT_FOUND' }
+        }
+
+        // ── Step 6v: Select ratio (was Step 7v) ───────────────────
+        // Ratio goes before quantity because changing ratio can re-mount
+        // the quantity chip row on some builds; we want quantity to land
+        // last (alongside duration) in a fully settled panel.
+        console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_RATIO_RESULT', JSON.stringify({
+          targetRatio: target.ratio,
+          order: 'after model selection',
+        }))
+        var videoRatioResult = await selectRatio(activePanel, target.ratio as string)
+        console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_RATIO_DONE', JSON.stringify({
+          success: !!videoRatioResult.success,
+          method: videoRatioResult.method || '',
+          error: videoRatioResult.error || '',
+        }))
+        if (!videoRatioResult.success) {
+          return videoRatioResult
+        }
+        await sleep(250)
+
+        activePanel = getActiveFlowSettingsPanel()
+        if (!activePanel || activePanel === document) {
+          return { success: false, error: 'FLOW_SETTINGS_PANEL_NOT_FOUND' }
+        }
+
+        // ── Step 7v: Select quantity (was Step 8v) ────────────────
+        console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_QTY_RESULT', JSON.stringify({
+          targetQuantity: target.quantity,
+          order: 'before duration (so duration lands last)',
+        }))
+        var videoQtyResult = await selectFlowQuantity(target.quantity as number, settingsBtn)
+        console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_QTY_DONE', JSON.stringify({
+          success: !!videoQtyResult.success,
+          method: videoQtyResult.method || '',
+          error: videoQtyResult.error || '',
+        }))
+        if (!videoQtyResult.success) {
+          return videoQtyResult
+        }
+        await sleep(250)
+
+        activePanel = getActiveFlowSettingsPanel()
+        if (!activePanel || activePanel === document) {
+          return { success: false, error: 'FLOW_SETTINGS_PANEL_NOT_FOUND' }
+        }
+
+        // ── Step 8v: Select duration LAST (was Step 6v) ───────────
+        // Duration is now last so its final click lands in a settled
+        // chip list and the post-click snapshot verify below catches
+        // any normalize-back (Flow "freezing" 4s back to 8s when the
+        // active model doesn't actually support 4s). Failures here
+        // are HARD — the verify step in __flowContent__ won't paper
+        // over a duration normalize-by-UI.
+        if (target.duration) {
+          await sleep(450)
+          console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_DURATION_RESULT', JSON.stringify({
+            targetDuration: target.duration,
+            order: 'last (after model + ratio + quantity)',
+          }))
+          var durResult = await selectDuration(target.duration as string, activePanel)
+          console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_DURATION_DONE', JSON.stringify({
+            targetDuration: target.duration,
+            success: !!durResult.success,
+            method: durResult.method || '',
+            error: durResult.error || '',
+            actualDuration: durResult.actualDuration || '',
+            verified: durResult.verified === true,
+          }))
+          if (!durResult.success) {
+            // HARD-FAIL: don't proceed to submit with a missing/wrong duration.
+            // The user's video will not match the requested setting and we
+            // would otherwise report a fake "SUCCESS".
+            return durResult
+          }
+          await sleep(200)
+        }
+      } else {
+        // ── Image branch (unchanged order) ────────────────────────
+        // ── Step 5i: Select ratio ─────────────────────────────────
+        console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_RATIO_RESULT', JSON.stringify({
+          targetRatio: target.ratio,
+        }))
+        var ratioResult = await selectRatio(activePanel, target.ratio as string)
+        console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_RATIO_DONE', JSON.stringify({
+          success: !!ratioResult.success,
+          method: ratioResult.method || '',
+          error: ratioResult.error || '',
+        }))
+        if (!ratioResult.success) {
+          return ratioResult
+        }
+
+        // ── Step 6i: Select quantity ──────────────────────────────
+        console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_QTY_RESULT', JSON.stringify({
+          targetQuantity: target.quantity,
+        }))
+        var qtyResult = await selectFlowQuantity(target.quantity as number, settingsBtn)
+        console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_QTY_DONE', JSON.stringify({
+          success: !!qtyResult.success,
+          method: qtyResult.method || '',
+          error: qtyResult.error || '',
+        }))
+        if (!qtyResult.success) {
+          return qtyResult
+        }
+
+        // ── Step 7i: Select model ─────────────────────────────────
+        bridgeLog('[Bridge][rs] select model START', target.model)
+        console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_MODEL_RESULT', JSON.stringify({
+          targetModel: target.model,
+        }))
+        var modelResult = await selectModelDropdown(activePanel, target.model as string)
+        console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_MODEL_DONE', JSON.stringify({
+          success: !!modelResult.success,
+          method: modelResult.method || '',
+          error: modelResult.error || '',
+          clickedText: modelResult.clickedText || '',
+          detailsKeys: Object.keys((modelResult as Record<string, unknown>).details as Record<string, unknown> || {}),
+        }))
+        if (!modelResult.success) {
+          return modelResult
         }
       }
 
@@ -5052,20 +5390,119 @@
       var freshSettingsBtn = (typeof getFlowSettingsButton === 'function' ? getFlowSettingsButton() : null) || settingsBtn
       var afterSnapshot = readFlowSettingsSnapshot(freshSettingsBtn)
       var afterCompare = compareFlowSettings(target, afterSnapshot)
-      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_VERIFY_DONE', JSON.stringify({
-        target: target,
-        afterSnapshot: afterSnapshot,
-        compare: afterCompare,
+      console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_VERIFY_1', JSON.stringify({
+        mode: target.mode,
+        targetDuration: target.duration || '',
+        actualDuration: (afterSnapshot as Record<string, unknown>)?.duration || '',
+        targetQuantity: target.quantity,
+        actualQuantity: (afterSnapshot as Record<string, unknown>)?.quantity ?? null,
+        ok: afterCompare.ok,
       }))
       if (afterCompare.ok) {
         bridgeLog('[Bridge][settings verify] OK')
       } else {
-        bridgeWarn('[Bridge][settings verify] MISMATCH', {
+        bridgeWarn('[Bridge][settings verify] MISMATCH (initial)', {
           target: target,
           current: afterSnapshot,
           compare: afterCompare,
         })
       }
+
+      // ── Step 10a: Targeted retry for VIDEO mode mismatch ──────────
+      // If duration or quantity don't match after the first verify,
+      // re-open the panel (Escape closed it above if we reached this
+      // path) and retry just the failing fields. The applied model
+      // already has the correct duration list and quantity chips,
+      // so re-clicking should land cleanly. Duration click is now
+      // last (after quantity) to match the new primary path; some
+      // builds re-render the duration row when quantity changes,
+      // so quantity goes first in the retry order only when it was
+      // the failing field — when duration alone fails we just
+      // re-click duration.
+      var videoMismatchFixed = false
+      if (isVideo && !afterCompare.ok) {
+        var diffDuration = !(afterCompare.diff as Record<string, unknown>).duration
+          || (afterCompare.diff as Record<string, { match: boolean }>).duration.match === false
+        var diffQuantity = !(afterCompare.diff as Record<string, unknown>).quantity
+          || (afterCompare.diff as Record<string, { match: boolean }>).quantity.match === false
+        var diffMode = !(afterCompare.diff as Record<string, unknown>).mode
+          || (afterCompare.diff as Record<string, { match: boolean }>).mode.match === false
+        var diffRatio = !(afterCompare.diff as Record<string, unknown>).ratio
+          || (afterCompare.diff as Record<string, { match: boolean }>).ratio.match === false
+
+        // Mode / ratio mismatches are HARD — no retry can fix them.
+        if (diffMode || diffRatio) {
+          bridgeWarn('[Bridge][settings verify] mode/ratio mismatch — NO retry (hard stop)', {
+            diffMode: diffMode,
+            diffRatio: diffRatio,
+          })
+        } else if (diffDuration || diffQuantity) {
+          console.log('[FlowTrace][Bridge] APPLY_SETTINGS_RETRY', JSON.stringify({
+            retryDuration: diffDuration,
+            retryQuantity: diffQuantity,
+            targetDuration: target.duration || '',
+            targetQuantity: target.quantity,
+          }))
+          bridgeLog('[Bridge][settings verify] VIDEO retry START', {
+            diffDuration: diffDuration,
+            diffQuantity: diffQuantity,
+          })
+
+          // Re-open panel if closed (verify path closes it on mismatch)
+          var retryPanel = getActiveFlowSettingsPanel()
+          if (!retryPanel || retryPanel === document || !hasSettingsPanelControls(retryPanel)) {
+            var retryBtn = (typeof getFlowSettingsButton === 'function' ? getFlowSettingsButton() : null) || settingsBtn
+            dispatchFullClick(retryBtn)
+            retryPanel = await waitForFlowSettingsPanel(5000)
+          }
+
+          if (!retryPanel || retryPanel === document || !hasSettingsPanelControls(retryPanel)) {
+            bridgeWarn('[Bridge][settings verify] VIDEO retry — settings panel not available, cannot fix')
+          } else {
+            // Duration retry — quantity is now ordered LAST in the
+            // primary path, so on a mismatch we re-apply quantity
+            // before duration (some builds re-render the duration
+            // row when quantity changes mid-retry).
+            if (diffQuantity && target.quantity) {
+              await sleep(300)
+              var retryQty = await selectFlowQuantity(target.quantity as number, settingsBtn)
+              bridgeLog('[Bridge][rs] VIDEO retry quantity', retryQty)
+              await sleep(300)
+            }
+            if (diffDuration && target.duration) {
+              await sleep(400)
+              var retryDur = await selectDuration(target.duration as string, retryPanel)
+              bridgeLog('[Bridge][rs] VIDEO retry duration', retryDur)
+              await sleep(300)
+            }
+
+            // Re-verify
+            var retrySettingsBtn = (typeof getFlowSettingsButton === 'function' ? getFlowSettingsButton() : null) || settingsBtn
+            var retrySnapshot = readFlowSettingsSnapshot(retrySettingsBtn)
+            var retryCompare = compareFlowSettings(target, retrySnapshot)
+            console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_VERIFY_2', JSON.stringify({
+              mode: target.mode,
+              targetDuration: target.duration || '',
+              actualDuration: (retrySnapshot as Record<string, unknown>)?.duration || '',
+              targetQuantity: target.quantity,
+              actualQuantity: (retrySnapshot as Record<string, unknown>)?.quantity ?? null,
+              ok: retryCompare.ok,
+            }))
+            if (retryCompare.ok) {
+              videoMismatchFixed = true
+              afterSnapshot = retrySnapshot
+              afterCompare = retryCompare
+              bridgeLog('[Bridge][settings verify] VIDEO retry — FIXED')
+            } else {
+              bridgeWarn('[Bridge][settings verify] VIDEO retry — STILL MISMATCH', {
+                retryCompare: retryCompare,
+                retrySnapshot: retrySnapshot,
+              })
+            }
+          }
+        }
+      }
+
       if (FLOW_DEBUG_VERBOSE) {
         bridgeDebug('[Bridge][settings compare AFTER]', {
           target: target,
@@ -5084,6 +5521,9 @@
             target: target,
             current: afterSnapshot,
             compare: afterCompare,
+            videoRetryApplied: isVideo && (afterCompare.diff as Record<string, { match: boolean }>).duration.match === false
+              || (afterCompare.diff as Record<string, { match: boolean }>).quantity.match === false,
+            videoMismatchFixed: videoMismatchFixed,
           },
         }
       }

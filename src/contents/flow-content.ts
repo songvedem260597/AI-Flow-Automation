@@ -704,15 +704,78 @@ async function runFlowPrompt(payload: {
       payloadSummary: payloadSummary,
       extra: { settingsError: settingsError, settingsDetails: (settingsResult as Record<string, unknown>)?.details },
     })
-    // ── SOFT-FAIL POLICY ──────────────────────────────────────────────
-    // The bridge has ENABLE_FLOW_SETTINGS_AUTOMATION=false as a kill switch,
-    // but the production action handler still calls applyFlowSettings which
-    // can fail when Flow UI doesn't match selectors. Instead of aborting the
-    // whole queue, we continue with insert/submit using whatever settings
-    // are currently visible on the Flow page. The user gets a soft warning
-    // and a flowStep message, but the queue keeps progressing.
+
+    // ── HARD-STOP POLICY (video mismatch) ────────────────────────────
+    // FLOW_SETTINGS_VERIFY_MISMATCH means the bridge successfully applied
+    // every step AND re-tried where applicable, but the actual values
+    // on the Flow page still don't match (e.g. Omni Flash reset
+    // duration to 8s / quantity to x4 after a late model re-render).
+    //
+    // Submitting under these conditions would silently submit the wrong
+    // settings — a video "4s x2" prompt would actually generate
+    // "8s x4". That is the original bug. Therefore:
+    //   - mode/ratio mismatch   → HARD STOP (visible so the user can
+    //                             pick a different combination)
+    //   - video duration mismatch → HARD STOP
+    //   - video quantity mismatch → HARD STOP
+    //   - model mismatch (image) → HARD STOP (was previously the same
+    //                                "soft-fail" path, but submitting
+    //                                with the wrong model is also a
+    //                                silent incorrectness bug)
+    //
+    // Image quantity model-render drift is left to soft-fail because
+    // it has not been observed to silently produce wrong outputs in
+    // practice (the image apply order is stable).
+    var isVerifyMismatch = settingsError.includes('FLOW_SETTINGS_VERIFY_MISMATCH')
+    var mismatchDetails = (settingsResult as Record<string, unknown>)?.details as Record<string, unknown> | undefined
+    var mismatchCompare = mismatchDetails?.compare as { diff?: { mode?: { match?: boolean }; ratio?: { match?: boolean }; model?: { match?: boolean }; duration?: { match?: boolean }; quantity?: { match?: boolean } } } | undefined
+    var isHardStop = false
+    var hardStopReason = ''
+    if (isVerifyMismatch && mismatchCompare?.diff) {
+      var d = mismatchCompare.diff
+      if (d.mode?.match === false) { isHardStop = true; hardStopReason = 'mode mismatch' }
+      else if (d.ratio?.match === false) { isHardStop = true; hardStopReason = 'ratio mismatch' }
+      else if (payload.mode === 'video' && d.duration?.match === false) { isHardStop = true; hardStopReason = 'video duration mismatch' }
+      else if (payload.mode === 'video' && d.quantity?.match === false) { isHardStop = true; hardStopReason = 'video quantity mismatch' }
+      else if (payload.mode === 'image' && d.model?.match === false) { isHardStop = true; hardStopReason = 'image model mismatch' }
+    }
+
+    if (isHardStop) {
+      var targetDuration = (payload as Record<string, unknown>).duration || ''
+      var targetQuantity = (payload as Record<string, unknown>).quantity
+      var currentSnap = mismatchDetails?.current as Record<string, unknown> | undefined
+      console.error('[FlowTrace][Fail]', JSON.stringify({
+        step: 'applySettings',
+        reason: 'VIDEO_SETTINGS_VERIFY_MISMATCH',
+        hardStop: true,
+        details: hardStopReason,
+        target: { duration: targetDuration, quantity: targetQuantity, mode: payload.mode, ratio: (payload as Record<string, unknown>).aspectRatio, model: payload.model },
+        current: currentSnap ? { duration: currentSnap.duration, quantity: currentSnap.quantity, mode: currentSnap.mode, ratio: currentSnap.ratioIcon, rawText: currentSnap.rawText } : null,
+      }))
+      return {
+        success: false,
+        status: 'FLOW_SETTINGS_VERIFY_MISMATCH',
+        error: 'Video settings mismatch: expected '
+          + (payload.mode === 'video' ? `${targetDuration} x${targetQuantity}` : `${(payload as Record<string, unknown>).aspectRatio} ${payload.model}`)
+          + ', got '
+          + (currentSnap ? `${currentSnap.rawText || ''}` : 'unknown'),
+        settingsHardStop: true,
+        hardStopReason: hardStopReason,
+        settings: mismatchDetails,
+      }
+    }
+
+    // ── SOFT-FAIL POLICY (image-only drift, non-verify-mismatch) ─────
+    // For non-verify-mismatch settings errors AND image-mode apply
+    // drift, we keep the legacy soft-fail behavior: continue with
+    // insert/submit using whatever settings are currently visible on
+    // the Flow page. The user gets a soft warning and a flowStep
+    // message, but the queue keeps progressing.
+    //
+    // Video mismatch is NEVER soft-fail — see hard-stop above.
     console.warn('[FlowTrace][Content] APPLY_SETTINGS_SOFT_FAIL_CONTINUE', JSON.stringify({
       reason: settingsReason,
+      mode: payload.mode,
       softFailed: true,
       willContinueWith: 'insert/submit using current Flow page settings',
     }))
