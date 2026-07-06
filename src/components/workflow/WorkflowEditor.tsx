@@ -3,6 +3,7 @@ import Drawflow from '@/lib/drawflow/drawflow.min.js'
 import '@/lib/drawflow/drawflow.min.css'
 import { autoUpdate, computePosition, flip, offset, shift } from '@floating-ui/dom'
 import { useWorkflowStore } from '@/stores/workflowStore'
+import { canvasLog } from '@/lib/canvasInvestigate'
 import { cn, usePersistedState } from '@/lib/utils'
 import type { AIProvider, FlowNodeData, FlowNodeType, Workflow, WorkflowEdge, WorkflowNode } from '@/types'
 import {
@@ -45,16 +46,6 @@ import { runPipeline, stopPipeline, pausePipeline, resumePipeline } from '@/pipe
 import type { PipelineCallbacks } from '@/pipeline'
 import { usePipelineStore } from '@/stores/pipelineStore'
 import { debugLog, debugWarn } from '@/lib/debug'
-import {
-  getAssetBlob,
-  getAssetObjectUrl,
-  getAssetMeta,
-  revokeAssetObjectUrl,
-  saveAssetFromBlob,
-  saveAssetFromDataUrl,
-  deleteAsset,
-  type StoredAssetMeta
-} from '@/lib/assetStore'
 
 const WORKFLOW_PERSIST_DEBUG = (): boolean => {
   try {
@@ -73,236 +64,6 @@ const WORKFLOW_LIST_DEBUG = (): boolean => {
   } catch {
     return false
   }
-}
-
-// [AssetResolution] Per-render resolved-asset cache.
-//
-// Heavy Media-node blobs live in IndexedDB (see `src/lib/assetStore.ts`)
-// and the workflow store only carries an `assetId`. To keep the rest of
-// the editor working unchanged — Drawflow's HTML preview reads
-// `data.mediaData / imageData / videoData`, the runner reads the same
-// fields, the lightbox reads `data.videoUrl / imageUrl` — we mirror
-// the resolved blob back into a transient `liveData` map keyed by
-// nodeId. This map is render-time only; it never flows back into the
-// workflow store and never crosses the chrome.storage.local boundary.
-//
-// Each entry carries:
-//   - objectUrl : for Drawflow <img> / <video> preview rendering
-//                 (URL.revokeObjectURL is called on unmount).
-//   - dataUrl   : legacy `data:image/...` data URL used by `getMediaNodeSource`,
-//                 the lightbox, and the runner's `dataUrlToUploadPayload`.
-//   - meta      : lightweight StoredAssetMeta for debug logs.
-interface ResolvedAssetEntry {
-  objectUrl: string | null
-  dataUrl: string | null
-  meta: StoredAssetMeta | null
-  status: 'pending' | 'resolved' | 'missing' | 'error'
-}
-
-const blobToDataUrl = (blob: Blob): Promise<string> =>
-  new Promise<string>((resolve, reject) => {
-    try {
-      const reader = new FileReader()
-      reader.onload = () => (typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('FileReader non-string result')))
-      reader.onerror = () => reject(reader.error || new Error('FileReader failed'))
-      reader.readAsDataURL(blob)
-    } catch (err) {
-      reject(err as Error)
-    }
-  })
-
-const useResolvedAssets = (
-  nodes: WorkflowNode[] | undefined,
-  enabled: boolean
-): Map<string, ResolvedAssetEntry> => {
-  const [map, setMap] = useState<Map<string, ResolvedAssetEntry>>(() => new Map())
-  const nodesKeyRef = useRef<string>('')
-  // Collect assetIds referenced by visible nodes. We use this as the
-  // dependency key so unrelated re-renders don't trigger refetches.
-  const assetKey = useMemo(() => {
-    if (!enabled || !Array.isArray(nodes)) return ''
-    const ids: string[] = []
-    for (const node of nodes) {
-      const data = (node.data || {}) as Record<string, unknown>
-      const assetId = typeof data.assetId === 'string' ? data.assetId : ''
-      if (assetId) ids.push(`${node.id}:${assetId}`)
-    }
-    return ids.sort().join('|')
-  }, [nodes, enabled])
-  useEffect(() => {
-    if (!enabled) {
-      // Drop everything if we are not on the editor view (avoids
-      // running IDB queries for the dashboard list).
-      setMap((prev) => {
-        if (prev.size === 0) return prev
-        for (const id of prev.keys()) {
-          const entry = prev.get(id)
-          if (entry?.objectUrl) revokeAssetObjectUrl(entry.objectUrl)
-        }
-        return new Map()
-      })
-      nodesKeyRef.current = ''
-      return
-    }
-    if (assetKey === nodesKeyRef.current) return
-    nodesKeyRef.current = assetKey
-    let cancelled = false
-    const run = async () => {
-      const next = new Map<string, ResolvedAssetEntry>()
-      if (!Array.isArray(nodes)) {
-        if (!cancelled) setMap(next)
-        return
-      }
-      for (const node of nodes) {
-        const data = (node.data || {}) as Record<string, unknown>
-        const assetId = typeof data.assetId === 'string' ? data.assetId : ''
-        if (!assetId) continue
-        try {
-          const [blob, meta, objectUrl] = await Promise.all([
-            getAssetBlob(assetId),
-            getAssetMeta(assetId),
-            getAssetObjectUrl(assetId)
-          ])
-          if (cancelled) return
-          if (!blob || !meta) {
-            next.set(node.id, { objectUrl: null, dataUrl: null, meta: null, status: 'missing' })
-            continue
-          }
-          const dataUrl = await blobToDataUrl(blob)
-          if (cancelled) return
-          next.set(node.id, { objectUrl, dataUrl, meta, status: 'resolved' })
-        } catch (err) {
-          if (!cancelled) {
-            next.set(node.id, { objectUrl: null, dataUrl: null, meta: null, status: 'error' })
-            debugWarn('AI_FLOW_DEBUG', '[AssetResolution] failed for', node.id, (err as Error).message)
-          }
-        }
-      }
-      if (!cancelled) {
-        setMap((prev) => {
-          for (const id of prev.keys()) {
-            if (!next.has(id)) {
-              const entry = prev.get(id)
-              if (entry?.objectUrl) revokeAssetObjectUrl(entry.objectUrl)
-            }
-          }
-          return next
-        })
-      }
-    }
-    run()
-    return () => {
-      cancelled = true
-    }
-  }, [assetKey, nodes, enabled])
-  // Revoke all cached object URLs on unmount.
-  useEffect(() => {
-    return () => {
-      for (const entry of map.values()) {
-        if (entry.objectUrl) revokeAssetObjectUrl(entry.objectUrl)
-      }
-    }
-    // We intentionally exclude `map` from deps — only revoke on unmount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-  return map
-}
-
-// [AssetResolution] Helper to merge resolved blob into the live node
-// data passed to Drawflow templates and the runner. NEVER write back
-// to `node.data` — this is read-only mirror.
-const mergeResolvedAsset = <T extends Record<string, unknown>>(data: T, resolved: ResolvedAssetEntry | undefined): T => {
-  if (!resolved || resolved.status !== 'resolved' || !resolved.dataUrl) return data
-  const out: Record<string, unknown> = { ...data }
-  // [AssetResolution] Determine the asset's actual kind. We must NOT
-  // rely on `typeof out.videoData === 'string'` here: the upload
-  // handler initializes `data.videoData = ''` to clear legacy fields,
-  // and `typeof '' === 'string'` would falsely classify an image as
-  // a video. We use:
-  //   1. explicit `mediaType` if the user (or migration) set it,
-  //   2. the stored asset's `meta.kind` (authoritative for IDB-backed
-  //      uploads — derived from the File mime at save time),
-  //   3. mime prefix as a tie-breaker.
-  const explicitMediaType = String(out.mediaType || '').toLowerCase()
-  const metaKind = String(resolved.meta?.kind || '').toLowerCase()
-  const metaMime = String(resolved.meta?.mimeType || '').toLowerCase()
-  const isVideo =
-    explicitMediaType === 'video' ||
-    metaKind === 'video' ||
-    (!explicitMediaType && !metaKind && metaMime.startsWith('video/'))
-  if (isVideo) {
-    out.videoData = resolved.dataUrl
-    out.videoUrl = resolved.objectUrl || resolved.dataUrl
-  } else {
-    out.imageData = resolved.dataUrl
-    out.imageUrl = resolved.objectUrl || resolved.dataUrl
-  }
-  out.mediaType = isVideo ? 'video' : 'image'
-  out.mediaData = resolved.dataUrl
-  out.mediaUrl = resolved.objectUrl || resolved.dataUrl
-  if (resolved.meta?.mimeType) {
-    out.mimeType = resolved.meta.mimeType
-    out.mediaMimeType = resolved.meta.mimeType
-  }
-  if (resolved.meta?.width !== undefined && out.mediaWidth === undefined) out.mediaWidth = resolved.meta.width
-  if (resolved.meta?.height !== undefined && out.mediaHeight === undefined) out.mediaHeight = resolved.meta.height
-  return out as T
-}
-
-/**
- * [AssetResolution] Run-time hydration for the pipeline runner.
- * The runner reads `data.mediaData / imageData / videoData / urls`
- * directly off each node. Our workflow store no longer carries those
- * fields — heavy blobs live in IndexedDB. This helper produces a
- * shallow-cloned workflow where every node with `assetId` has the
- * resolved blob inlined back into `data` so the runner sees what it
- * used to see. The returned workflow is intentionally a deep clone
- * for `nodes` so the original Zustand-owned workflow is untouched.
- *
- * Resolution sources (in priority order):
- *   1. The supplied `resolvedAssets` map (preferred — already-loaded).
- *   2. A fresh `getAssetObjectUrl` / `blobToDataUrl` lookup.
- *
- * If an assetId is missing in IndexedDB, the node is passed through
- * with `data.mediaData = ''` so the runner's downstream failure path
- * is loud rather than silent.
- */
-const hydrateWorkflowAssetsForRunner = async (
-  workflow: Workflow,
-  resolvedAssets?: Map<string, ResolvedAssetEntry>
-): Promise<Workflow> => {
-  const nodes: WorkflowNode[] = []
-  for (const node of workflow.nodes) {
-    const data = (node.data || {}) as Record<string, unknown>
-    const assetId = typeof data.assetId === 'string' ? data.assetId : ''
-    if (!assetId) {
-      nodes.push(node)
-      continue
-    }
-    let entry = resolvedAssets?.get(node.id)
-    if (!entry || entry.status === 'pending') {
-      try {
-        const blob = await getAssetBlob(assetId)
-        if (!blob) {
-          nodes.push({ ...node, data })
-          continue
-        }
-        const dataUrl = await blobToDataUrl(blob)
-        const meta = await getAssetMeta(assetId)
-        entry = { objectUrl: null, dataUrl, meta, status: 'resolved' }
-      } catch (err) {
-        debugWarn('AI_FLOW_DEBUG', '[AssetResolution][runner.hydrate.failed]', node.id, (err as Error).message)
-        nodes.push({ ...node, data })
-        continue
-      }
-    }
-    if (!entry || entry.status !== 'resolved' || !entry.dataUrl) {
-      nodes.push({ ...node, data })
-      continue
-    }
-    nodes.push({ ...node, data: mergeResolvedAsset(data, entry) })
-  }
-  return { ...workflow, nodes }
 }
 
 const SUPPORTED_NODE_TYPES: FlowNodeType[] = [
@@ -586,27 +347,13 @@ function closestImageAspectRatio(width: number, height: number): ImageAspectRati
 
 function getMediaNodeType(data: Record<string, unknown>): MediaNodeType {
   const raw = String(data.mediaType || '').toLowerCase()
-  // [AssetResolution] Empty strings from the post-migration
-  // placeholder fields are NOT a video source — only count
-  // non-empty `videoData` / `videoUrl`. (Previously this used
-  // truthy coercion on `data.videoData` which is correct, but the
-  // surrounding callsite now writes `''` explicitly to clear legacy
-  // fields and we want to be defensive about that.)
-  const videoData = typeof data.videoData === 'string' ? data.videoData : ''
-  const videoUrl = typeof data.videoUrl === 'string' ? data.videoUrl : ''
-  const hasVideo = videoData.length > 0 || videoUrl.length > 0
-  if (raw === 'video' || hasVideo) return 'video'
+  const videoSource = String(data.videoData || data.videoUrl || '')
+  if (raw === 'video' || videoSource.length > 0) return 'video'
   return 'image'
 }
 
 function getMediaNodeSource(data: Record<string, unknown>) {
   const mediaType = getMediaNodeType(data)
-  // [AssetResolution] Pick the first NON-EMPTY string. The migration
-  // writes `''` into legacy fields to drop inline base64, so a
-  // naive `||` chain still works here (empty string is falsy), but
-  // the chain below is the contract for templates: image assets
-  // resolve through `imageData / imageUrl / mediaData / mediaUrl`,
-  // video assets through `videoData / videoUrl / mediaData / mediaUrl`.
   if (mediaType === 'video') {
     return String(data.videoData || data.videoUrl || data.mediaData || data.mediaUrl || '')
   }
@@ -1541,16 +1288,58 @@ function getGenerateOutputImageUrls(output: unknown): string[] {
     seenObjects.add(value)
 
     const record = value as Record<string, unknown>
+    // URL walking — order matters:
+    //   1. videoUrl is read FIRST so a video-only output (where
+    //      `url` / `mediaUrl` / `imageUrl` may be empty or carry
+    //      the thumbnail image URL) still surfaces the playable
+    //      video URL.
+    //   2. url, imageUrl, mediaUrl cover the legacy / image
+    //      shapes. `imageUrl` is intentionally NOT cleared for
+    //      image outputs — ChatGPT and older Flow responses put
+    //      the asset URL there.
+    //
+    // Why this matters:
+    //   flow-content.ts + runner.normalizeWorkflowOutput guarantee
+    //   that for `mediaType === 'video'` items, `videoUrl` is
+    //   populated and `imageUrl` is cleared. Walking `videoUrl`
+    //   first lets the Workflow UI surface video URLs even when
+    //   the raw `url` / `mediaUrl` happen to be the thumbnail.
+    pushUrl(record.videoUrl)
     pushUrl(record.url)
     pushUrl(record.imageUrl)
     pushUrl(record.mediaUrl)
+    pushUrl(record.thumbnailUrl)
+    pushUrl(record.poster)
     visit(record.images, depth + 1)
     visit(record.imageUrls, depth + 1)
+    visit(record.outputs, depth + 1)
     visit(record.result, depth + 1)
   }
 
   visit(output)
   return Array.from(new Set(urls))
+}
+
+/**
+ * Per-asset media type detection for a Generate-node output descriptor.
+ * Walks the same fields `buildGenerateOutputItems` reads so the Workflow
+ * UI's preview/lightbox can render a `<video>` element for video outputs
+ * instead of `<img>` (which silently fails on a video URL).
+ *
+ * Order of preference:
+ *   1. Explicit `mediaType` / `type` field on the descriptor.
+ *   2. URL heuristic — `.mp4` / `.mov` / `.webm` / `video` markers.
+ *   3. Default to `image` (matches the legacy behavior).
+ */
+function detectGenerateOutputMediaType(item: Record<string, unknown> | undefined): 'image' | 'video' {
+  if (!item || typeof item !== 'object') return 'image'
+  const rawType = String(item.mediaType || item.type || '').toLowerCase()
+  if (rawType === 'video') return 'video'
+  if (rawType === 'image') return 'image'
+  const url = String(item.url || item.videoUrl || item.mediaUrl || item.imageUrl || '')
+  if (/\.(mp4|mov|webm|m4v)(\?|$)/i.test(url)) return 'video'
+  if (url.toLowerCase().includes('video')) return 'video'
+  return 'image'
 }
 
 /**
@@ -1605,7 +1394,15 @@ function buildGenerateOutputItems(
   // bundles or partial enrichment).
   const richByUrl = new Map<string, Record<string, unknown>>()
   for (const item of richOutputs) {
+    // [Workflow] URL resolution now walks `videoUrl` first so a
+    // video-only descriptor (where `url` / `mediaUrl` /
+    // `imageUrl` may be empty) still surfaces the playable
+    // URL. After `runner.normalizeWorkflowOutput`, video items
+    // have `videoUrl` / `mediaUrl` / `url` all set to the same
+    // video URL and `imageUrl` cleared — this means buildGenerateOutputItems
+    // can join them on any of those three URLs.
     const url =
+      (typeof item.videoUrl === 'string' && item.videoUrl) ||
       (typeof item.url === 'string' && item.url) ||
       (typeof item.mediaUrl === 'string' && item.mediaUrl) ||
       (typeof item.imageUrl === 'string' && item.imageUrl) ||
@@ -1772,10 +1569,8 @@ async function downloadWorkflowOutputAsset(args: {
   }
 }
 
-function renderDrawflowNode(node: WorkflowNode, resolvedAssets?: Map<string, ResolvedAssetEntry>) {
-  const rawData = (node.data || {}) as Record<string, unknown>
-  const resolvedEntry = resolvedAssets?.get(node.id)
-  const data = resolvedEntry ? mergeResolvedAsset(rawData, resolvedEntry) : rawData
+function renderDrawflowNode(node: WorkflowNode) {
+  const data = node.data as Record<string, unknown>
   const generateData = node.type === 'generate'
     ? { ...data, ...sanitizeGenerateDataPatch(data, {}) }
     : data
@@ -1806,22 +1601,6 @@ function renderDrawflowNode(node: WorkflowNode, resolvedAssets?: Map<string, Res
     const mediaType = getMediaNodeType(data)
     const mediaSrc = getMediaNodeSource(data)
     const mediaPoster = getMediaNodePoster(data)
-    // [MediaPreview] Debug log for the Media-node render path. Lets
-    // the user verify the kind detection, assetId resolution, and
-    // placeholder-vs-real-image decision. Gated by the master
-    // `AI_FLOW_DEBUG` flag — silent by default.
-    debugLog('AI_FLOW_DEBUG', '[MediaPreview][render]', JSON.stringify({
-      nodeId: node.id,
-      assetId: String((rawData as Record<string, unknown>).assetId || ''),
-      dataMediaType: String(rawData.mediaType || ''),
-      resolvedStatus: resolvedEntry?.status || 'none',
-      resolvedKind: resolvedEntry?.meta?.kind || '',
-      mimeType: String(data.mimeType || ''),
-      hasObjectUrl: Boolean(resolvedEntry?.objectUrl),
-      hasDataUrl: Boolean(resolvedEntry?.dataUrl),
-      sourceKind: mediaSrc ? (mediaType === 'video' ? 'video' : 'image') : 'none',
-      sourcePreview: mediaSrc ? mediaSrc.slice(0, 12) : null,
-    }))
     body = `
       <div class="df-node-preview df-node-image-upload-target ${mediaSrc ? 'has-image' : ''} ${ratioClass}" data-image-upload-target="true">
         ${
@@ -1874,15 +1653,67 @@ function renderDrawflowNode(node: WorkflowNode, resolvedAssets?: Map<string, Res
       outputImageUrls.length - 1,
       Number((data as Record<string, unknown>).selectedOutputIndex) || 0
     ))
+    // Build rich per-output items so the preview can branch on
+    // `mediaType === 'video'` (render `<video>`) vs `image` (render
+    // `<img>`). Without this branch, the preview would render every
+    // generated output as `<img src=...>` and video outputs would
+    // silently fail (broken image icon).
+    const outputItems = buildGenerateOutputItems(
+      output as Record<string, unknown> | undefined,
+      outputImageUrls
+    )
     const firstImageUrl = outputImageUrls[selectedOutputIndex] || outputImageUrls[0] || ''
+    const selectedOutputItem = outputItems[selectedOutputIndex] || outputItems[0]
+    const previewMediaType: 'image' | 'video' = selectedOutputItem?.mediaType === 'video'
+      ? 'video'
+      : 'image'
+    // For video previews: resolve the playable URL and poster. The
+    // runner.normalizeWorkflowOutput contract guarantees `videoUrl`
+    // is populated for video outputs; we still fall back to mediaUrl
+    // / url / thumbnailUrl for legacy bundles.
+    const previewVideoSrc = selectedOutputItem
+      ? String(selectedOutputItem.url || '')
+      : ''
+    const previewPoster = selectedOutputItem
+      ? String(
+        (output as Record<string, unknown> | undefined)?.thumbnailUrl ||
+        (output as Record<string, unknown> | undefined)?.poster ||
+        ''
+      )
+      : ''
     const hasOutput = firstImageUrl.length > 0
 
     body = `
       <div class="df-node-preview-wrap df-node-generate-preview-wrap">
         ${hasOutput ? `
-          <div class="df-node-output-preview df-node-image-upload-target has-image ${generateRatioClass}" data-generated-output-preview="true" data-selected-output-index="${selectedOutputIndex}">
-            <img class="df-node-preview-media" src="${escapeHtml(firstImageUrl)}" alt="Generated output" draggable="false">
-            <span class="df-node-output-skeleton" aria-hidden="true"></span>
+          <div class="df-node-output-preview df-node-image-upload-target has-image ${generateRatioClass} ${previewMediaType === 'video' ? 'df-node-output-preview-video' : 'df-node-output-preview-image'}" data-generated-output-preview="true" data-selected-output-index="${selectedOutputIndex}" data-preview-media-type="${previewMediaType}">
+            ${previewMediaType === 'video' ? `
+              <video
+                class="df-node-preview-media df-node-preview-video"
+                src="${escapeHtml(previewVideoSrc)}"
+                ${previewPoster ? `poster="${escapeHtml(previewPoster)}"` : ''}
+                muted
+                playsinline
+                preload="metadata"
+                draggable="false"
+                aria-label="Generated video preview"
+              ></video>
+              <span class="df-node-video-play-badge" aria-hidden="true">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+              </span>
+            ` : `
+              <img class="df-node-preview-media" src="${escapeHtml(firstImageUrl)}" alt="Generated output" draggable="false">
+            `}
+            ${/* [Workflow] Skeleton / shimmer only renders while a
+                generated output is in flight (no usable URL yet). Once
+                `hasOutput` is true — image decoded or video metadata
+                ready — we drop the overlay so it doesn't paint stripes
+                on top of the finished content. The `df-node-output-top-gradient`
+                + preview button + carousel bar still give the user the
+                same hover affordances. CSS below also hides the
+                skeleton when `data-run-state="completed"` as a safety net. */
+              hasOutput ? '' : '<span class="df-node-output-skeleton" aria-hidden="true"></span>'
+            }
             <span class="df-node-output-top-gradient" aria-hidden="true"></span>
             <button type="button" class="df-node-image-preview-button nodrag" data-node-action="preview-image" title="Preview output" aria-label="Preview output">
               ${DF_ICONS.zoom}
@@ -1966,7 +1797,7 @@ function renderDrawflowNode(node: WorkflowNode, resolvedAssets?: Map<string, Res
   `
 }
 
-function buildDrawflowData(workflow: Workflow, resolvedAssets?: Map<string, ResolvedAssetEntry>) {
+function buildDrawflowData(workflow: Workflow) {
   const data: Record<string, DrawflowNodeRecord> = {}
 
   for (const node of workflow.nodes) {
@@ -1977,7 +1808,7 @@ function buildDrawflowData(workflow: Workflow, resolvedAssets?: Map<string, Reso
       name: node.type,
       data: cloneDeep(node.data),
       class: `ai-df-wrapper ai-df-wrapper-${node.type} df-port-${portType}`,
-      html: renderDrawflowNode(node, resolvedAssets),
+      html: renderDrawflowNode(node),
       typenode: false,
       inputs: createInputConnections(ports.inputs),
       outputs: createOutputConnections(ports.outputs),
@@ -2010,14 +1841,42 @@ function getNodePortSignature(node: WorkflowNode) {
   return `in(${inputSignature})|out(${outputSignature})`
 }
 
+// [CanvasFix] Hotfix for canvas drag flicker.
+//
+// PREVIOUSLY: signature included `Math.round(node.position.x)` and
+// `Math.round(node.position.y)`. Drawflow fires `nodeMoved`
+// 30–60 Hz during drag, each tick calling `updateNodePosition`,
+// which mutated `position` and bumped `updatedAt`. Math.round()
+// crossing a pixel boundary changed the signature →
+// `hydrateDrawflow()` ran → `editor.import(...)` rebuilt the
+// entire DOM mid-drag → every node + line flickered.
+//
+// NOW: signature only includes structural fields (id, type,
+// ports, edges, workflow id). Position changes cannot trigger
+// reimport. A separate `positionSignature` consumer (currently
+// unused — see `getWorkflowPositionSignature` below) is kept so
+// any future code that DOES need position-aware re-render has an
+// explicit opt-in rather than piggybacking on the structural key.
 function getWorkflowStructureSignature(workflow: Workflow) {
   const nodes = workflow.nodes
-    .map((node) => `${node.id}:${node.type}:${Math.round(node.position.x)}:${Math.round(node.position.y)}:${getNodePortSignature(node)}`)
+    .map((node) => `${node.id}:${node.type}:${getNodePortSignature(node)}`)
     .join('|')
   const edges = workflow.edges
     .map((edge) => `${edge.source}:${edge.target}:${edge.sourceHandle || ''}:${edge.targetHandle || ''}`)
     .join('|')
   return `${workflow.id}::${nodes}::${edges}`
+}
+
+// Position-only signature — kept intentionally NOT wired into the
+// hydrate effect. If a future feature needs to react to drag-end
+// position changes only, it should consume this directly (e.g.
+// snap-to-grid alignment, layout analytics) rather than the
+// structural signature.
+function getWorkflowPositionSignature(workflow: Workflow): string {
+  const positions = workflow.nodes
+    .map((node) => `${node.id}:${Math.round(node.position.x)}:${Math.round(node.position.y)}`)
+    .join('|')
+  return `${workflow.id}::${positions}`
 }
 
 function getWorkflowDataSignature(workflow: Workflow) {
@@ -2442,6 +2301,34 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const nodePillMenuRef = useRef<HTMLDivElement | null>(null)
   const selectionMouseDownRef = useRef<{ nodeId: string | null; clearOnUnselect: boolean } | null>(null)
   const portDragCleanupRef = useRef<(() => void) | null>(null)
+  // [CanvasInvestigate] observation-only ref — does NOT change
+  // production behavior. Set true while Drawflow is firing
+  // `nodeMoved` for an active drag, false on the next non-drawflow
+  // tick that exceeds `dragInactivityMs`. Used by the probe logs
+  // to disambiguate "during drag" vs "idle dragfinish".
+  const canvasDragInFlightRef = useRef<{ nodeId: string | null; lastTickAt: number }>({
+    nodeId: null,
+    lastTickAt: 0,
+  })
+
+  // [CanvasFix] Accumulator of per-node positions captured during
+  // a drag. While Drawflow is dispatching `nodeMoved` (30–60 Hz),
+  // we write the latest (x, y) here WITHOUT touching the store.
+  // On `mouseUp`, the map is drained into a single
+  // `updateNodePositions` bulk call so the store + persist +
+  // undo history each receives exactly one write per drag.
+  const pendingDragPositionsRef = useRef<Map<string, { x: number; y: number }>>(new Map())
+
+  // [CanvasFix] Per-node lightweight rAF handle for `nodeMoved`
+  // ticks. Unlike `scheduleDrawflowConnectionRefresh`, this does
+  // NOT call applyPortAttributes / attachNodeResizeObservers /
+  // refreshAllConnections — it only repaints the SVG paths
+  // attached to the dragged node via Drawflow's
+  // `editor.updateConnectionNodes(nodeId)`. Throttled by rAF so
+  // 60 Hz draw ticks collapse to ~60 Hz repaints but never
+  // trigger the heavy full-canvas path.
+  const lightweightConnectionRefreshFrameRef = useRef<number | null>(null)
+  const lightweightConnectionRefreshNodeIdRef = useRef<string | null>(null)
 
   const [isPaletteOpen, setIsPaletteOpen] = useState(false)
   const [nodePickerSearch, setNodePickerSearch] = useState('')
@@ -2452,12 +2339,6 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const [zoomLevel, setZoomLevel] = useState(100)
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null)
   const [inspectorNodeId, setInspectorNodeId] = useState<string | null>(null)
-
-  // [AssetResolution] Resolve Media-node assetIds → blob / dataUrl /
-  // objectUrl. The map is consumed by renderDrawflowNode (Drawflow
-  // preview HTML) and by `imagePreview` (lightbox). NEVER write the
-  // resolved values back into `node.data`.
-  const resolvedAssets = useResolvedAssets(workflow?.nodes, true)
 
   // ── Pipeline run visual state ─────────────────────────────────────────
   type NodeRunStatus = 'idle' | 'running' | 'completed' | 'failed'
@@ -2646,6 +2527,43 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
             nextData.selectedOutputIndex = 0
           }
           updateNode(nodeId, nextData as Partial<FlowNodeData>)
+
+          // [Workflow][NodeOutputPreview] — emitted exactly once per
+          // Generate-node completion so operators can confirm the
+          // editor sees the right shape: which URL fields are
+          // populated, what media type is detected, and which DOM
+          // element (`<img>` vs `<video>`) will be rendered. Catches
+          // the "Flow succeeded with outputsCount=1 but Generate
+          // node renders blank" bug class — if `firstMediaType` is
+          // 'image' for a video output, the video URL is being
+          // routed into the wrong field downstream.
+          try {
+            const outputRecord = (output as Record<string, unknown> | undefined) || {}
+            const outputList = Array.isArray(outputRecord.outputs)
+              ? (outputRecord.outputs as unknown[]).filter((o): o is Record<string, unknown> => !!o && typeof o === 'object')
+              : []
+            const firstOutput = outputList[0] || {}
+            const firstType = String(firstOutput.type || firstOutput.mediaType || '')
+            const firstMediaType = detectGenerateOutputMediaType(firstOutput)
+            const url = String(firstOutput.url || '')
+            const mediaUrl = String(firstOutput.mediaUrl || '')
+            const videoUrl = String(firstOutput.videoUrl || '')
+            const imageUrl = String(firstOutput.imageUrl || '')
+            const previewRenderAs = firstMediaType === 'video' ? '<video>' : '<img>'
+            console.log('[Workflow][NodeOutputPreview] ' + JSON.stringify({
+              nodeId,
+              outputsCount: outputList.length,
+              outputsAvailableCount: outputList.filter((o) => o.outputAvailable === true).length,
+              firstType,
+              firstMediaType,
+              url,
+              mediaUrl,
+              videoUrl,
+              imageUrl,
+              renderAs: previewRenderAs,
+              note: 'video outputs should render as <video>, image outputs as <img>'
+            }))
+          } catch (_) {}
         }
         // Refresh node DOM so Generate node shows output preview.
         // We intentionally DO NOT activate outgoing edges here — the
@@ -2671,7 +2589,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
               const updatedNode = { ...node, data: { ...node.data, ...renderPatch } }
               const content = domNode.closest('.drawflow_content_node') || domNode.parentElement
               if (content) {
-                content.innerHTML = renderDrawflowNode(updatedNode, resolvedAssets)
+                content.innerHTML = renderDrawflowNode(updatedNode)
                 applyPortAttributesForNode(updatedNode)
                 applyNodeVisualRunState(nodeId, 'completed')
                 attachNodeResizeObserver(nodeId)
@@ -3001,6 +2919,34 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
 
   const activeTask = tasks.find((task) => task.id === activeTaskId)
   const taskLogs = logs.filter((log) => log.pipelineId === activeTaskId).slice(0, 24)
+  // [CanvasFix] Hotfix for canvas drag flicker (round 2 — undo/redo).
+  //
+  // After the round-1 fix removed `position` from the structural
+  // signature so per-tick drag writes wouldn't re-import the whole
+  // canvas, undo/redo (which mutates `workflow.nodes[].position`
+  // via the workflow store) stopped updating the visual canvas
+  // — the store said the node was at the restored position, but
+  // Drawflow's DOM `node-xxx` element was still at the dragged
+  // position.
+  //
+  // Round 2 introduces a SEPARATE `positionSignature` consumer
+  // that mirrors position changes from the store into Drawflow
+  // DOM via a lightweight, per-node sync effect. This effect:
+  //   - does NOT call hydrateDrawflow / editor.import
+  //   - does NOT call renderDrawflowNode / content.innerHTML
+  //   - does NOT reapply port attributes or resize observers
+  //     for unrelated nodes
+  //   - DOES update Drawflow's internal `pos_x/pos_y` model +
+  //     move the DOM `<div class="drawflow-node">` left/top +
+  //     call `editor.updateConnectionNodes(id)` for each touched
+  //     node.
+  //
+  // Skipped during an in-flight drag so per-tick store updates do
+  // not fight Drawflow's own DOM moves (they would have anyway
+  // because `nodeMoved` already wrote to Drawflow DOM).
+  const positionSignature = useMemo(() => getWorkflowPositionSignature(workflow), [workflow])
+  const lastAppliedPositionsRef = useRef<Map<string, { x: number; y: number }>>(new Map())
+
   const structureSignature = useMemo(() => getWorkflowStructureSignature(workflow), [workflow])
   const dataSignature = useMemo(() => getWorkflowDataSignature(workflow), [workflow])
   const pickerItems = useMemo(() => {
@@ -3268,6 +3214,11 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         // looking at right now — not the asset they opened.
         outputName: nextItem.name,
         downloadFilename: resolveGenerateOutputFilename(nextItem, nextIdx),
+        // Track the asset's media type so the lightbox switches
+        // between <img> and <video> as the user flips through
+        // mixed outputs (e.g. quantity=2 with one image + one
+        // video).
+        mediaType: nextItem.mediaType === 'video' ? 'video' : 'image',
       }
     })
   }
@@ -3285,6 +3236,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         src: nextItem.url,
         outputName: nextItem.name,
         downloadFilename: resolveGenerateOutputFilename(nextItem, nextIdx),
+        // Track the asset's media type — see handleLightboxPrev.
+        mediaType: nextItem.mediaType === 'video' ? 'video' : 'image',
       }
     })
   }
@@ -3408,6 +3361,17 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
 
     if (connectionRefreshFrameRef.current !== null) return
 
+    // [CanvasInvestigate] probe — fires when a connection refresh
+    // is scheduled. The lambda inside rAF below is the "execute"
+    // marker; this one is the "intent" marker. Pair with the
+    // inner lambda log to count throttled-vs-executed ratio.
+    canvasLog('connectionRefresh-schedule', {
+      nodeId: nodeId != null ? String(nodeId) : null,
+      all: !!options?.all,
+      canvasDragInFlight: !!canvasDragInFlightRef.current.nodeId,
+      dragNodeId: canvasDragInFlightRef.current.nodeId,
+    })
+
     connectionRefreshFrameRef.current = window.requestAnimationFrame(() => {
       connectionRefreshFrameRef.current = window.requestAnimationFrame(() => {
         connectionRefreshFrameRef.current = null
@@ -3416,6 +3380,17 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
 
         refreshAllConnectionsRef.current = false
         pendingConnectionRefreshIdsRef.current.clear()
+
+        // [CanvasInvestigate] probe — actual execute of the
+        // throttled connection refresh. Counts how often a drag
+        // tick ultimately triggers applyPortAttributes +
+        // attachNodeResizeObservers (full per-frame work).
+        canvasLog('connectionRefresh-execute', {
+          forceAll,
+          pendingCount: pendingIds.size,
+          canvasDragInFlight: !!canvasDragInFlightRef.current.nodeId,
+        })
+
         applyPortAttributes()
         attachNodeResizeObservers()
         refreshDrawflowConnectionsNow(forceAll ? null : pendingIds)
@@ -3459,13 +3434,108 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     mountedIds.forEach((nodeId) => attachNodeResizeObserver(nodeId))
   }
 
+  // [CanvasFix] Lightweight per-node connection repaint used during
+  // a node drag. The full `scheduleDrawflowConnectionRefresh` is
+  // correct for structural events (node added/deleted, port
+  // structure changed, hydrate complete), but mid-drag it would
+  // re-run applyPortAttributes + attachNodeResizeObservers + full
+  // refresh per draw tick, causing the line flicker.
+  //
+  // This function only repaints the SVG paths attached to the
+  // dragged node via `editor.updateConnectionNodes(draggedNodeId)`.
+  // Throttled by requestAnimationFrame so 60 Hz draw ticks
+  // collapse to at most one repaint per animation frame.
+  //
+  // Used by:
+  //   - the `nodeMoved` event handler (per draw tick)
+  //   - the `mouseUp` → `commitNodePositions` path defers a full
+  //     refresh AFTER committing, not mid-drag.
+  function lightweightDragConnectionRefresh(nodeId: string) {
+    lightweightConnectionRefreshNodeIdRef.current = nodeId
+    if (lightweightConnectionRefreshFrameRef.current !== null) return
+    lightweightConnectionRefreshFrameRef.current = window.requestAnimationFrame(() => {
+      lightweightConnectionRefreshFrameRef.current = null
+      const editor = editorRef.current
+      const target = lightweightConnectionRefreshNodeIdRef.current
+      if (!editor || !target) return
+      try {
+        editor.updateConnectionNodes(toDrawflowElementId(target))
+      } catch {
+        // Drawflow can briefly miss DOM nodes mid-rehydrate.
+      }
+    })
+  }
+
+  // [CanvasFix] Hotfix for canvas drag flicker (round 2 — undo/redo).
+  //
+  // Move a single Drawflow node to (x, y) WITHOUT calling
+  // editor.import / buildDrawflowData / renderDrawflowNode /
+  // hydrateDrawflow. Steps:
+  //   1. update Drawflow's internal model (pos_x/pos_y) so future
+  //      `editor.getNodeFromId(...)` reads see the new position;
+  //   2. mutate the DOM `<div class="drawflow-node" id="node-X">`
+  //      left/top so the visual moves;
+  //   3. redraw the connections touching that node so the lines
+  //      follow the new endpoint.
+  //
+  // This is the only path used by the `positionSignature` sync
+  // effect (round-2 hotfix). It must remain cheap enough to call
+  // for several nodes in one frame (multi-node bulk moves).
+  function applyDrawflowNodePosition(nodeId: string, position: { x: number; y: number }) {
+    const editor = editorRef.current
+    if (!editor) return
+    const elementId = toDrawflowElementId(nodeId)
+
+    // 1. Update Drawflow's internal model.
+    try {
+      const internal = editor.getNodeFromId(nodeId)
+      if (internal) {
+        internal.pos_x = position.x
+        internal.pos_y = position.y
+      }
+    } catch {
+      // Node may not be mounted yet — DOM mutation below will
+      // still be applied when the structural hydrate runs.
+    }
+
+    // 2. Move the DOM element. Drawflow's CSS positions nodes via
+    //    inline `left/top` on the .drawflow-node element.
+    const nodeEl = canvasRef.current?.querySelector<HTMLElement>(`#${CSS.escape(elementId)}`)
+    if (nodeEl) {
+      nodeEl.style.left = `${position.x}px`
+      nodeEl.style.top = `${position.y}px`
+    }
+
+    // 3. Redraw the connections touching this node.
+    try {
+      editor.updateConnectionNodes(elementId)
+    } catch {
+      // Drawflow can briefly miss DOM nodes mid-rehydrate.
+    }
+  }
+
   const rerenderDrawflowNode = (nodeId: string) => {
     const editor = editorRef.current
     const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
     if (!editor || !node) return
 
+    // [CanvasInvestigate] probe — fires every time a SINGLE node's
+    // HTML is replaced. Pair with [hydrateDrawflow] to distinguish
+    // "per-node rerender" (cheap) from "full canvas re-import"
+    // (expensive). If rerenderDrawflowNode is called for a node
+    // that is NOT the dragged node, and the call site is NOT a
+    // genuine output-preview change, that is the per-node
+    // flicker source.
+    canvasLog('rerenderDrawflowNode', {
+      nodeId,
+      reason: 'rerenderDrawflowNode-invoke',
+      canvasDragInFlight: !!canvasDragInFlightRef.current.nodeId,
+      dragNodeId: canvasDragInFlightRef.current.nodeId,
+      hasOutput: !!node.data?._output,
+    })
+
     const content = canvasRef.current?.querySelector(`#node-${CSS.escape(node.id)} .drawflow_content_node`)
-    if (content) content.innerHTML = renderDrawflowNode(node, resolvedAssets)
+    if (content) content.innerHTML = renderDrawflowNode(node)
     applyPortAttributesForNode(node)
     syncNodeRunStates()
     attachNodeResizeObserver(node.id)
@@ -3655,10 +3725,38 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     const editor = editorRef.current
     if (!editor) return
 
+    // [CanvasInvestigate] probe — fires every time a structural
+    // signature change causes a full canvas re-import. Confirms
+    // whether position-drag is rebuilding the entire canvas.
+    // Caller context is captured by `reason` so we can map a
+    // signature-flip back to the upstream event (drag, add,
+    // delete, paste, output update, etc.).
+    canvasLog('hydrateDrawflow', {
+      reason: 'hydrateDrawflow-invoke',
+      structureSignatureNow: structureSignature,
+      canvasDragInFlight: !!canvasDragInFlightRef.current.nodeId,
+      dragNodeId: canvasDragInFlightRef.current.nodeId,
+      nodeCount: workflowRef.current?.nodes?.length ?? 0,
+      edgeCount: workflowRef.current?.edges?.length ?? 0,
+    })
+
     disconnectNodeResizeObservers()
     suppressEdgeEventRef.current = true
-    editor.import(buildDrawflowData(workflowRef.current, resolvedAssets), false)
+    editor.import(buildDrawflowData(workflowRef.current), false)
     suppressEdgeEventRef.current = false
+
+    // [CanvasFix] round-2: re-seed the position mirror after a
+    // full import so the positionSignature effect does not treat
+    // every node as "changed" on the next render. `editor.import`
+    // already placed each DOM node at the workflow's stored
+    // position, so the mirror must agree.
+    lastAppliedPositionsRef.current.clear()
+    for (const node of workflowRef.current.nodes) {
+      lastAppliedPositionsRef.current.set(node.id, {
+        x: node.position.x,
+        y: node.position.y,
+      })
+    }
 
     requestAnimationFrame(() => {
       applyPortAttributes()
@@ -3709,12 +3807,50 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       }
     })
 
+    // [CanvasFix] Hotfix for canvas drag flicker.
+    //
+    // PREVIOUSLY: every drawflow tick (~30–60 Hz) called
+    //   updateNodePosition(...)            // per-tick store write
+    //   refreshDrawflowConnectionsNow(...) // per-tick refresh
+    //   scheduleDrawflowConnectionRefresh(...) // per-tick full reapply
+    // Each updateNodePosition mutated `position`, bumped `updatedAt`,
+    // pushed a workflow history entry, and set `isDirty`. Combined
+    // with `Math.round(position.x|y)` in the structural signature,
+    // this caused the canvas to be `editor.import`ed multiple times
+    // per drag.
+    //
+    // NOW: store the latest position in a ref only (no React render,
+    // no history push, no updatedAt bump). At mouseUp, the ref is
+    // drained into a single `updateNodePositions` bulk call so the
+    // store receives ONE write per drag gesture — history + persist
+    // each happen exactly once.
     editor.on('nodeMoved', (id: string | number) => {
       if (suppressEdgeEventRef.current) return
       const node = editor.getNodeFromId(id)
-      updateNodePosition(String(id), { x: node.pos_x, y: node.pos_y })
-      refreshDrawflowConnectionsNow([String(id)])
-      scheduleDrawflowConnectionRefresh(String(id))
+      const nodeId = String(id)
+      const now = performance.now()
+      const prevTick = canvasDragInFlightRef.current
+      canvasDragInFlightRef.current = {
+        nodeId,
+        lastTickAt: now,
+      }
+      canvasLog('nodeMoved', {
+        nodeId,
+        x: node.pos_x,
+        y: node.pos_y,
+        ticksSincePrev: prevTick.nodeId === nodeId ? Math.round(now - prevTick.lastTickAt) : -1,
+        nodeCount: workflowRef.current?.nodes?.length ?? 0,
+      })
+      // Transient only — Drawflow already moved the DOM. We just
+      // remember where to commit on mouseUp. No store write, no
+      // history, no `isDirty`, no `updatedAt`.
+      pendingDragPositionsRef.current.set(nodeId, { x: node.pos_x, y: node.pos_y })
+      // Lightweight per-node connection repaint — only the line
+      // endpoints touching this node. One rAF; one
+      // `editor.updateConnectionNodes(draggedId)` call. No
+      // applyPortAttributes / no attachNodeResizeObservers / no
+      // full canvas pass.
+      lightweightDragConnectionRefresh(nodeId)
     })
 
     editor.on('nodeRemoved', (id: string | number) => {
@@ -3773,6 +3909,65 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     editor.on('connectionStart', scheduleConnectionSync)
     editor.on('connectionCancel', scheduleConnectionSync)
     editor.on('mouseUp', () => {
+      // [CanvasFix] Hotfix for canvas drag flicker.
+      //
+      // PREVIOUSLY: this `mouseUp` handler only cleared the
+      // investigation ref and ran `scheduleConnectionSync`. All
+      // position data was already in the store (because per-tick
+      // writes fired throughout the drag).
+      //
+      // NOW: this is where the drag's accumulated position data
+      // finally commits to the store. The pending map is drained
+      // into a single `updateNodePositions` bulk call so the
+      // store receives exactly ONE workflow write per drag
+      // gesture — one history push, one updatedAt bump, one
+      // `isDirty` flip. From an undo/redo standpoint, the entire
+      // gesture counts as one user action.
+      const pending = pendingDragPositionsRef.current
+      if (pending.size > 0) {
+        const positions: Record<string, { x: number; y: number }> = {}
+        for (const [nodeId, position] of pending.entries()) {
+          positions[nodeId] = position
+        }
+        pending.clear()
+        const activeWorkflowId = useWorkflowStore.getState().activeWorkflowId
+        canvasLog('commitNodePositions', {
+          count: Object.keys(positions).length,
+          workflowId: activeWorkflowId,
+          source: 'mouseUp',
+        })
+        updateNodePositions(positions, activeWorkflowId ?? undefined)
+        // [CanvasFix] round-2: after committing, sync the
+        // `lastAppliedPositionsRef` mirror so the
+        // `positionSignature` effect does NOT re-apply the same
+        // positions to the DOM on the next render. Drawflow has
+        // already moved the DOM during the drag; we're just
+        // catching up the ref so future undo/redo from THIS
+        // position can correctly detect the diff.
+        for (const [nodeId, position] of Object.entries(positions)) {
+          lastAppliedPositionsRef.current.set(nodeId, position)
+        }
+        // After committing positions, make sure the persisted
+        // node DOM matches the new workflow state. We use the
+        // already-existing full-fingerprint refresh path: it
+        // handles the case where multiple nodes share a
+        // connection endpoint correctly.
+        scheduleDrawflowConnectionRefresh(null, { all: true })
+      }
+
+      // [CanvasInvestigate] probe boundary — drag finished.
+      // Cleared on the first non-drag tick so subsequent calls
+      // are tagged "idle" instead of "drag". Combined with the
+      // pre-existing handler below into a single binding to
+      // avoid duplicate listeners.
+      const prev = canvasDragInFlightRef.current
+      if (prev.nodeId) {
+        canvasLog('dragEnd', {
+          nodeId: prev.nodeId,
+          dragDurationMs: Math.round(performance.now() - prev.lastTickAt),
+        })
+        canvasDragInFlightRef.current = { nodeId: null, lastTickAt: 0 }
+      }
       selectionMouseDownRef.current = null
       scheduleConnectionSync()
     })
@@ -4067,7 +4262,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         }
 
         const reader = new FileReader()
-        reader.onload = async () => {
+        reader.onload = () => {
           const imageData = typeof reader.result === 'string' ? reader.result : ''
           if (!imageData) {
             cleanup()
@@ -4075,90 +4270,35 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
           }
 
           const finishUpload = (width?: number, height?: number, poster?: string) => {
-            void (async () => {
-              try {
-                // [AssetResolution] Heavy blob lives in IndexedDB. We
-                // save the raw file via saveAssetFromBlob when we can
-                // (preferred — avoids an extra base64 round-trip); we
-                // fall back to saveAssetFromDataUrl if the File has
-                // already been consumed.
-                let assetMeta: StoredAssetMeta | null = null
-                try {
-                  assetMeta = await (file && file.size > 0
-                    ? saveAssetFromBlob(file, {
-                        kind: fileMediaType,
-                        mimeType: file.type,
-                        fileName: file.name,
-                        width,
-                        height
-                      })
-                    : saveAssetFromDataUrl(imageData, {
-                        kind: fileMediaType,
-                        mimeType: file.type,
-                        fileName: file.name,
-                        width,
-                        height
-                      }))
-                } catch (err) {
-                  console.warn('[AssetStore][save.failed]', fileMediaType, file.name, (err as Error).message)
-                  return
-                }
-                if (!assetMeta) return
-                // Drop any previously-stored Media asset for this node
-                // (single-asset-per-node policy).
-                const existingAssetId = (workflowRef.current.nodes.find((n) => n.id === nodeId)?.data as Record<string, unknown> | undefined)?.assetId
-                if (typeof existingAssetId === 'string' && existingAssetId && existingAssetId !== assetMeta.assetId) {
-                  try { await deleteAsset(existingAssetId) } catch { /* best effort */ }
-                }
-                // [AssetStore] Patch only the metadata. The blob is in
-                // IndexedDB; runtime readers (Drawflow preview, lightbox,
-                // runner) pull it via useResolvedAssets() / getAssetBlob().
-                //
-                // We intentionally DO NOT write `mediaData / imageData /
-                // videoData` (legacy base64) or `mediaPoster / videoPoster`
-                // (legacy base64 poster) into node.data. Reasons:
-                //   1. chrome.storage.local cannot hold them — that is
-                //      the whole reason this migration exists.
-                //   2. The downstream template heuristics
-                //      (getMediaNodeType / getMediaNodeSource) used
-                //      `typeof data.videoData === 'string'` which is
-                //      `true` for empty strings, mis-classifying image
-                //      assets as video. Leaving the keys absent keeps
-                //      the heuristic honest.
-                // If the user replaces the asset, useResolvedAssets +
-                // mergeResolvedAsset fills in `imageData / videoData`
-                // for the template at render-time, so the user-facing
-                // preview still works.
-                const aspectRatio = width && height ? closestImageAspectRatio(width, height) : fileMediaType === 'video' ? '16:9' : '1:1'
-                const patch: Record<string, unknown> = {
-                  assetId: assetMeta.assetId,
-                  mimeType: assetMeta.mimeType,
-                  mediaMimeType: assetMeta.mimeType,
-                  mediaType: fileMediaType,
-                  mediaName: file.name,
-                  mediaWidth: width,
-                  mediaHeight: height,
-                  size: assetMeta.size,
-                  aspectRatio
-                }
-                if (fileMediaType === 'image') {
-                  patch.imageName = file.name
-                  patch.imageWidth = width
-                  patch.imageHeight = height
-                } else {
-                  patch.videoName = file.name
-                  patch.videoWidth = width
-                  patch.videoHeight = height
-                  if (poster) patch.videoPoster = poster
-                }
-                updateNode(nodeId, patch as Partial<FlowNodeData>)
-                scheduleDrawflowConnectionRefresh(nodeId)
-              } catch (err) {
-                console.warn('[AssetStore][upload.flow.failed]', (err as Error).message)
-              } finally {
-                cleanup()
-              }
-            })()
+            const aspectRatio = width && height ? closestImageAspectRatio(width, height) : fileMediaType === 'video' ? '16:9' : '1:1'
+            const basePatch: Record<string, unknown> = {
+              mediaType: fileMediaType,
+              mediaData: imageData,
+              mediaUrl: '',
+              mediaName: file.name,
+              mediaMimeType: file.type,
+              mediaWidth: width,
+              mediaHeight: height,
+              mediaPoster: fileMediaType === 'video' ? poster || '' : '',
+              aspectRatio
+            }
+
+            updateNode(nodeId, {
+              ...basePatch,
+              imageData: fileMediaType === 'image' ? imageData : '',
+              imageUrl: '',
+              imageName: fileMediaType === 'image' ? file.name : '',
+              imageWidth: fileMediaType === 'image' ? width : undefined,
+              imageHeight: fileMediaType === 'image' ? height : undefined,
+              videoData: fileMediaType === 'video' ? imageData : '',
+              videoUrl: '',
+              videoName: fileMediaType === 'video' ? file.name : '',
+              videoWidth: fileMediaType === 'video' ? width : undefined,
+              videoHeight: fileMediaType === 'video' ? height : undefined,
+              videoPoster: fileMediaType === 'video' ? poster || '' : ''
+            } as Partial<FlowNodeData>)
+            scheduleDrawflowConnectionRefresh(nodeId)
+            cleanup()
           }
 
           if (fileMediaType === 'video') {
@@ -4271,18 +4411,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       let name = String(data.mediaName || data.videoName || data.imageName || data.label || 'Media')
 
       if (node?.type === 'image') {
-        // [AssetResolution] Prefer the resolved blob from IndexedDB
-        // over the empty inline data fields.
-        const resolved = resolvedAssets.get(nodeId)
-        if (resolved && resolved.status === 'resolved' && resolved.dataUrl) {
-          mediaSrc = resolved.dataUrl
-        } else {
-          mediaSrc = getMediaNodeSource(data)
-        }
+        mediaSrc = getMediaNodeSource(data)
         mediaType = getMediaNodeType(data)
-        if (resolved?.status === 'missing') {
-          name = `${name} (missing local asset — please re-upload)`
-        }
       } else if (node?.type === 'generate') {
         const output = data._output as Record<string, unknown> | undefined
         const outputUrls = getGenerateOutputImageUrls(output)
@@ -4291,8 +4421,6 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         // the carousel since the last render.
         const liveIndex = Math.max(0, Math.min(outputUrls.length - 1, Number(data.selectedOutputIndex) || 0))
         mediaSrc = outputUrls[liveIndex] || outputUrls[0] || ''
-        mediaType = 'image'
-        name = String(data.label || 'Generated output')
         // Build rich per-output items so the lightbox can flip URLs
         // AND keep the correct filename for each one. We do NOT
         // mutate `data.selectedOutputIndex` here — that only changes
@@ -4301,13 +4429,21 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         const outputItems = buildGenerateOutputItems(output, outputUrls)
         const initialItem = outputItems[liveIndex] || outputItems[0]
         const initialDownloadFilename = resolveGenerateOutputFilename(initialItem, liveIndex)
+        // Pick the media type from the rich output item. Without
+        // this branch the lightbox would always render `<img>` and
+        // silently fail for video outputs (Generate-node produces a
+        // valid video URL but `mediaType` was hard-coded to 'image').
+        const initialMediaType: MediaNodeType =
+          initialItem?.mediaType === 'video' ? 'video' : 'image'
+        mediaType = initialMediaType
+        name = String(data.label || 'Generated output')
         if (outputUrls.length > 0 && mediaSrc) {
           closeNodePillMenu()
           setSelectedNode(nodeId)
           setImagePreview({
             src: mediaSrc,
             name,
-            mediaType,
+            mediaType: initialMediaType,
             outputItems,
             selectedIndex: liveIndex,
             outputName: initialItem?.name,
@@ -4385,7 +4521,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         }
         const content = domNode.closest('.drawflow_content_node') || domNode.parentElement
         if (content) {
-          content.innerHTML = renderDrawflowNode(updatedNode, resolvedAssets)
+          content.innerHTML = renderDrawflowNode(updatedNode)
           applyPortAttributesForNode(updatedNode)
         }
       })
@@ -4604,76 +4740,27 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     hydrateDrawflow()
   }, [structureSignature])
 
-  // [AssetResolution] Re-render Drawflow nodes when their resolved
-  // asset transitions between pending / resolved / missing / error.
-  //
-  // Without this, the initial `hydrateDrawflow()` call would import
-  // a Drawflow with empty `mediaData/imageData` (because the asset
-  // hadn't loaded yet) and the node would stay on the placeholder
-  // until the user did something that triggered a store update.
-  //
-  // We track each entry's status with a ref so a re-render fires
-  // ONLY when a status actually changes, not on every React commit.
-  const lastResolvedStatusRef = useRef<Map<string, ResolvedAssetEntry['status']>>(new Map())
-  useEffect(() => {
-    if (!resolvedAssets || resolvedAssets.size === 0) return
-    const last = lastResolvedStatusRef.current
-    let changed = false
-    const dirtyNodeIds: string[] = []
-    for (const [nodeId, entry] of resolvedAssets.entries()) {
-      const prev = last.get(nodeId)
-      if (prev !== entry.status) {
-        last.set(nodeId, entry.status)
-        // Only re-render when the entry is leaving the initial
-        // pending state. We don't need to re-render every time
-        // `meta` updates with the same status.
-        if (prev !== undefined) {
-          changed = true
-          dirtyNodeIds.push(nodeId)
-        } else if (entry.status !== 'pending') {
-          changed = true
-          dirtyNodeIds.push(nodeId)
-        }
-      }
-    }
-    if (!changed) return
-    for (const nodeId of dirtyNodeIds) {
-      const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
-      if (!node) continue
-      const entry = resolvedAssets.get(nodeId)
-      if (entry?.status === 'resolved') {
-        debugLog('AI_FLOW_DEBUG', '[AssetResolution][node.ready]', JSON.stringify({
-          nodeId,
-          assetId: String((node.data as Record<string, unknown>)?.assetId || ''),
-          kind: entry.meta?.kind || '',
-          mimeType: entry.meta?.mimeType || '',
-          objectUrlPrefix: entry.objectUrl ? entry.objectUrl.slice(0, 12) : null,
-          dataUrlLength: entry.dataUrl ? entry.dataUrl.length : 0,
-        }))
-      } else if (entry?.status === 'missing') {
-        debugLog('AI_FLOW_DEBUG', '[AssetResolution][node.missing]', JSON.stringify({
-          nodeId,
-          assetId: String((node.data as Record<string, unknown>)?.assetId || '')
-        }))
-      }
-      const content = canvasRef.current?.querySelector(`#node-${CSS.escape(nodeId)} .drawflow_content_node`)
-      if (content) {
-        content.innerHTML = renderDrawflowNode(node, resolvedAssets)
-        attachNodeResizeObserver(nodeId)
-        scheduleDrawflowConnectionRefresh(nodeId)
-      }
-    }
-  }, [resolvedAssets])
-
   useEffect(() => {
     const editor = editorRef.current
     if (!editor) return
+
+    // [CanvasInvestigate] probe — fires every time the data
+    // signature effect re-renders all node HTML. Pair with
+    // [hydrateDrawflow] and the per-frame [nodeMoved] count. If
+    // this fires during a drag, it means the data signature
+    // changed during the drag — which it shouldn't, because
+    // position alone should not change data.
+    canvasLog('dataSignatureEffect', {
+      canvasDragInFlight: !!canvasDragInFlightRef.current.nodeId,
+      dragNodeId: canvasDragInFlightRef.current.nodeId,
+      nodeCount: workflow.nodes.length,
+    })
 
     for (const node of workflow.nodes) {
       try {
         editor.updateNodeDataFromId(node.id, cloneDeep(node.data))
         const content = canvasRef.current?.querySelector(`#node-${CSS.escape(node.id)} .drawflow_content_node`)
-        if (content) content.innerHTML = renderDrawflowNode(node, resolvedAssets)
+        if (content) content.innerHTML = renderDrawflowNode(node)
         applyPortAttributesForNode(node)
         attachNodeResizeObserver(node.id)
         scheduleDrawflowConnectionRefresh(node.id)
@@ -4686,6 +4773,61 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       syncActiveEdges()
     })
   }, [dataSignature, workflow.nodes])
+
+  // [CanvasFix] Hotfix for canvas drag flicker (round 2 — undo/redo).
+  //
+  // Mirrors position changes from the workflow store into
+  // Drawflow DOM via `applyDrawflowNodePosition`. Replaces the
+  // round-1 behavior where adding `position` to the structural
+  // signature caused full canvas re-import mid-drag.
+  //
+  // During an in-flight drag, `pendingDragPositionsRef` already
+  // matches the live DOM (Drawflow moves the element directly),
+  // and the eventual `mouseUp` commit updates `lastAppliedPositionsRef`
+  // for each committed node. We therefore skip the effect while
+  // a drag is in flight — if we didn't, the round-1 flicker
+  // bug would re-emerge every time the user crossed a Math.round
+  // boundary during a drawflow tick.
+  useEffect(() => {
+    if (!editorRef.current) return
+    if (canvasDragInFlightRef.current.nodeId) {
+      canvasLog('positionUndoRedoSyncSkippedDuringDrag', {
+        positionSignature,
+        activeNodeId: canvasDragInFlightRef.current.nodeId,
+      })
+      return
+    }
+
+    const changed: WorkflowNode[] = []
+    for (const node of workflow.nodes) {
+      const prev = lastAppliedPositionsRef.current.get(node.id)
+      const next = node.position
+      if (!prev ||
+          Math.round(prev.x) !== Math.round(next.x) ||
+          Math.round(prev.y) !== Math.round(next.y)) {
+        changed.push(node)
+      }
+    }
+
+    if (changed.length === 0) return
+
+    canvasLog('positionSignatureChanged', {
+      changedCount: changed.length,
+      isDragging: false,
+      changedIds: changed.map((node) => node.id),
+    })
+
+    for (const node of changed) {
+      applyDrawflowNodePosition(node.id, node.position)
+      canvasLog('applyNodePosition', {
+        nodeId: node.id,
+        from: lastAppliedPositionsRef.current.get(node.id) ?? null,
+        to: node.position,
+        reason: 'undo-redo-or-store-sync',
+      })
+      lastAppliedPositionsRef.current.set(node.id, node.position)
+    }
+  }, [positionSignature, workflow.nodes])
 
   useEffect(() => {
     syncSelectedNodeDom(selectedNodeId)
@@ -4817,12 +4959,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     setActiveEdges({})
     setNodeOutputs({})
 
-    // [AssetResolution] Re-inflate Media-node blobs from IndexedDB
-    // before handing the workflow to the runner. The runner still
-    // reads `data.mediaData / imageData / videoData` off each node,
-    // and we never persist those fields anymore.
-    const hydrated = await hydrateWorkflowAssetsForRunner(workflow, resolvedAssets)
-    await runPipeline(hydrated, pipelineCallbacks)
+    await runPipeline(workflow, pipelineCallbacks)
   }
 
   const handleStop = () => {
@@ -5380,7 +5517,16 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
               lightboxHasCarousel && imagePreview.outputItems
                 ? imagePreview.outputItems[lightboxSelectedIndex]?.name || imagePreview.name
                 : imagePreview.name
-            const lightboxCanDownload = imagePreview.mediaType === 'image' && Boolean(imagePreview.src)
+            // [Workflow] Lightbox download — enabled when there's a usable src.
+// Previously gated to `mediaType === 'image'`, which silently
+// disabled download for video outputs even though
+// `handleDownloadPreview` already handles both via the SW
+// download route + chrome.downloads fallback chain. The
+// filename is derived per-asset (`resolveGenerateOutputFilename`)
+// so a video download naturally gets `.mp4`.
+const lightboxCanDownload = Boolean(imagePreview.src) && (
+  imagePreview.mediaType === 'image' || imagePreview.mediaType === 'video'
+)
             return (
               <div
                 className="absolute inset-0 z-[70] flex flex-col bg-black/85 backdrop-blur-sm"
@@ -5845,13 +5991,7 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
     setActiveWorkflow(workflow.id)
     try {
       await openWorkflowEditorWindow(workflow)
-      // [AssetResolution] Re-inflate Media-node blobs from IndexedDB
-      // before the runner sees the workflow. The dashboard route
-      // doesn't pre-load `resolvedAssets` because the canvas isn't
-      // mounted, so hydrateWorkflowAssetsForRunner does the IDB
-      // lookup inline.
-      const hydrated = await hydrateWorkflowAssetsForRunner(workflow)
-      await runPipeline(hydrated)
+      await runPipeline(workflow)
     } catch (error) {
       window.alert(error instanceof Error ? error.message : 'Unable to run workflow.')
     }

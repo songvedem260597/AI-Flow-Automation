@@ -1291,7 +1291,27 @@ instruction is the most common way ChatGPT regressions slip in.
 - `RUN_FLOW_PROMPT` from the ChatGPT path.
 - `uploadImage(...)` legacy P1/P2/A/B/C ladder re-enabled for multi-image.
 - Visual counter swapped for the broad composer counter (it leaks chat
-  history and breaks the duplicate guard for legitimate uploads).
+ history and breaks the duplicate guard for legitimate uploads).
+
+## Canvas Drag Investigation Flag (temporary)
+
+Investigation-only flag store at `src/lib/canvasInvestigate.ts`. NOT
+part of the master `AI_FLOW_DEBUG` fan-out. Used to diagnose the
+canvas flicker / line jitter symptom during node drag.
+
+Enable / disable:
+
+```js
+localStorage.setItem('AI_FLOW_DEBUG_CANVAS_INVESTIGATE', '1') // enable
+localStorage.removeItem('AI_FLOW_DEBUG_CANVAS_INVESTIGATE')    // disable
+```
+
+When enabled, probes emit `[CanvasInvestigate][<event>]` lines
+covering `hydrateDrawflow`, `nodeMoved`, `dragEnd`,
+`updateNodePosition`, `updateNodePositions`, `dataSignatureEffect`,
+`rerenderDrawflowNode`, and `connectionRefresh-schedule/execute`.
+All probes are observation-only — no production behavior is changed.
+Remove the flag store once the flicker investigation is closed.
 
 ## Debug Flags
 

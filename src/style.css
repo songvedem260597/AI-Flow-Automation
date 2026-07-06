@@ -1718,6 +1718,101 @@ svg.ai-edge-completed path,
   display: block;
 }
 
+/* [Workflow] Generate-node video preview — fills the same area as
+   the <img> above and uses `object-fit: cover` so a portrait video
+   fills a landscape preview tile without letterboxing. The
+   `controls` attribute is intentionally NOT set in the inline node
+   template (renderDrawflowNode) — that decision lives in JSX so the
+   markup matches user intent. The CSS rules below are a safety net
+   that hide any leftover browser-native controls if a stray
+   `controls` attribute ever sneaks through (e.g. a hand-edited HTML
+   payload). `pointer-events: none` keeps the inline `<video>` from
+   intercepting clicks — the preview button + carousel bar handle
+   all interaction, and the lightbox owns full-screen playback. */
+.df-node-output-preview video.df-node-preview-media,
+.df-node-output-preview .df-node-preview-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  background: #0a0a0c;
+  pointer-events: none;
+}
+
+/* Belt-and-suspenders: hide the Chrome/Safari overlay controls if a
+   previous build or hand-edited HTML still has `controls`. The
+   inline preview never sets the attribute (renderDrawflowNode
+   branch above), so this rule is purely defensive. The lightbox
+   markup is rendered separately (see setImagePreview → <video
+   controls ...>) and is not affected because it does NOT carry the
+   `.df-node-output-preview` wrapper. */
+.df-node-output-preview .df-node-preview-video::-webkit-media-controls {
+  display: none !important;
+}
+.df-node-output-preview .df-node-preview-video::-webkit-media-controls-overlay-enclosure {
+  display: none !important;
+}
+.df-node-output-preview .df-node-preview-video::-webkit-media-controls-panel {
+  display: none !important;
+}
+.df-node-output-preview .df-node-preview-video::-webkit-media-controls-playback-rate-button {
+  display: none !important;
+}
+.df-node-output-preview .df-node-preview-video::-webkit-media-controls-volume-control {
+  display: none !important;
+}
+
+/* [Workflow] Play badge for inline video previews — signals
+   "this is a video, click to play" without relying on browser
+   controls. Sits centered in the preview tile, fades in on hover
+   for affordance, and never covers the settings bar (it lives
+   inside `.df-node-output-preview`, above the gradient overlay
+   only). The badge is purely decorative — it has `aria-hidden="true"`
+   and the actual click target is the existing
+   `.df-node-image-preview-button` (preview action) which is a
+   sibling inside the same wrapper. */
+.df-node-output-preview-video {
+  overflow: hidden;
+}
+.df-node-video-play-badge {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 44px;
+  height: 44px;
+  border-radius: 9999px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #ffffff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+  opacity: 0.85;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  z-index: 5;
+}
+.df-node-output-preview:hover .df-node-video-play-badge {
+  opacity: 1;
+  transform: translate(-50%, -50%) scale(1.06);
+}
+
+/* [Workflow] Skeleton suppression — safety net for the case where
+   the inline HTML still renders `.df-node-output-skeleton`
+   alongside a finished output (e.g. mid-refresh transition, legacy
+   serialized HTML, or a hot module that swapped renderDrawflowNode
+   in flight). When the node is `completed` OR the preview has
+   `data-preview-media-type="video"` (video metadata resolves later
+   than image decode, so we can't rely on an adjacent-sibling class
+   the way image-onLoad does), hide the skeleton overlay so it
+   doesn't paint stripes on top of the finished content. */
+.df-node.ai-node-completed .df-node-output-skeleton,
+.df-node.ai-node-failed .df-node-output-skeleton,
+.df-node-output-preview[data-preview-media-type="video"] .df-node-output-skeleton {
+  display: none !important;
+}
+
 /* Skeleton shown while the generated image is in flight. Sits behind
    the <img> tag. The image gets a `df-node-preview-media-loaded`
    class on load (added by WorkflowEditor via an inline onLoad

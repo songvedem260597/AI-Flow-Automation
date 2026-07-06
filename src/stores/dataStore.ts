@@ -3,6 +3,68 @@ import { persist, createJSONStorage } from 'zustand/middleware'
 import type { HistoryEntry, SavedPrompt, PresetTemplate } from '@/types'
 import { v4 as uuid } from 'uuid'
 
+const DATA_HEAVY_KEYS = new Set([
+  'nodeResults',
+  'thumbnail',
+  'mediaData',
+  'imageData',
+  'videoData',
+  'base64',
+  'dataUrl',
+  'thumbnailData',
+  'rawFile',
+  'file',
+  'blob',
+  'outputs',
+  'images',
+  'result',
+  'runResult',
+  'logs',
+  '_output',
+  'mediaPoster',
+  'videoPoster'
+])
+
+const DATA_STRING_LENGTH_LIMIT = 100_000
+
+const isDataQuotaError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error || '')
+  return /quota|kQuotaBytes|QUOTA_BYTES|exceeded/i.test(message)
+}
+
+const isHeavyDataString = (value: unknown): boolean => {
+  if (typeof value !== 'string') return false
+  if (value.startsWith('data:') || value.startsWith('blob:')) return true
+  return value.length > DATA_STRING_LENGTH_LIMIT
+}
+
+const sanitizeDataPersistValue = (value: unknown): unknown => {
+  if (value === null || value === undefined) return value
+  if (isHeavyDataString(value)) return undefined
+  if (Array.isArray(value)) {
+    return value
+      .map(sanitizeDataPersistValue)
+      .filter((item) => item !== undefined)
+  }
+  if (typeof value !== 'object') return value
+
+  const out: Record<string, unknown> = {}
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (DATA_HEAVY_KEYS.has(key)) continue
+    const sanitized = sanitizeDataPersistValue(child)
+    if (sanitized !== undefined) out[key] = sanitized
+  }
+  return out
+}
+
+const sanitizeJsonStorageValue = (value: string): string => {
+  try {
+    return JSON.stringify(sanitizeDataPersistValue(JSON.parse(value)))
+  } catch {
+    return value
+  }
+}
+
 const chromeStorage = () => ({
   getItem: (key: string): Promise<string | null> =>
     new Promise((resolve) => {
@@ -14,7 +76,23 @@ const chromeStorage = () => ({
             resolve(null)
             return
           }
-          resolve(result[key] ?? null)
+          const raw = result[key] ?? null
+          if (typeof raw !== 'string') {
+            resolve(raw == null ? null : JSON.stringify(raw))
+            return
+          }
+          const sanitized = sanitizeJsonStorageValue(raw)
+          if (sanitized !== raw && sanitized.length < raw.length) {
+            chrome.storage.local.set({ [key]: sanitized }, () => {
+              const writeBackError = chrome.runtime.lastError
+              if (writeBackError) {
+                console.warn(`[dataStore] Failed to compact ${key}:`, writeBackError.message)
+              }
+            })
+            resolve(sanitized)
+            return
+          }
+          resolve(raw)
         })
       } catch (error) {
         console.warn(`[dataStore] Failed to read ${key}:`, error)
@@ -28,6 +106,19 @@ const chromeStorage = () => ({
         chrome.storage.local.set({ [key]: value }, () => {
           const error = chrome.runtime.lastError
           if (error) {
+            if (isDataQuotaError(error)) {
+              const sanitizedValue = sanitizeJsonStorageValue(value)
+              if (sanitizedValue !== value) {
+                chrome.storage.local.set({ [key]: sanitizedValue }, () => {
+                  const retryError = chrome.runtime.lastError
+                  if (retryError) {
+                    console.warn(`[dataStore] Failed to write sanitized ${key}:`, retryError.message)
+                  }
+                  resolve()
+                })
+                return
+              }
+            }
             console.warn(`[dataStore] Failed to write ${key}:`, error.message)
           }
           resolve()
@@ -107,7 +198,13 @@ export const useHistoryStore = create<HistoryState>()(
         return get().entries.slice(0, limit)
       }
     }),
-    { name: 'ai-flow-history', storage: createJSONStorage(() => chromeStorage()) }
+    {
+      name: 'ai-flow-history',
+      storage: createJSONStorage(() => chromeStorage()),
+      partialize: (state) => ({
+        entries: sanitizeDataPersistValue(state.entries) as HistoryEntry[]
+      })
+    }
   )
 )
 
@@ -184,6 +281,12 @@ export const usePresetStore = create<PresetStore>()(
         return get().presets.filter((p) => p.category === category)
       }
     }),
-    { name: 'ai-flow-presets', storage: createJSONStorage(() => chromeStorage()) }
+    {
+      name: 'ai-flow-presets',
+      storage: createJSONStorage(() => chromeStorage()),
+      partialize: (state) => ({
+        presets: sanitizeDataPersistValue(state.presets) as PresetTemplate[]
+      })
+    }
   )
 )

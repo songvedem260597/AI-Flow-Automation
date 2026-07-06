@@ -2,10 +2,7 @@ import { create } from 'zustand'
 import { persist, createJSONStorage, type StateStorage } from 'zustand/middleware'
 import type { Workflow, WorkflowNode, WorkflowEdge, FlowNodeType } from '@/types'
 import { v4 as uuid } from 'uuid'
-import {
-  saveAssetFromDataUrl,
-  type StoredAssetMeta
-} from '@/lib/assetStore'
+import { canvasLog } from '@/lib/canvasInvestigate'
 
 type WorkflowHistory = {
   past: Workflow[]
@@ -77,6 +74,11 @@ const DEBUG_PERSIST = (): boolean => {
   }
 }
 
+let workflowStorageHydrated = false
+let isManualHydratingWorkflowStorage = false
+let allowNextEmptyWorkflowPersist = false
+const lastPersistedWorkflowValues = new Map<string, string | null>()
+
 const countWorkflows = (raw: string | null): number => {
   if (!raw) return 0
   try {
@@ -92,6 +94,16 @@ const activeWorkflowIdFromRaw = (raw: string | null): string | null => {
   try {
     const parsed = JSON.parse(raw) as { state?: { activeWorkflowId?: string | null } }
     return parsed?.state?.activeWorkflowId ?? null
+  } catch {
+    return null
+  }
+}
+
+const stringifyStoredValue = (raw: unknown): string | null => {
+  if (typeof raw === 'string') return raw
+  if (raw == null) return null
+  try {
+    return JSON.stringify(raw)
   } catch {
     return null
   }
@@ -135,14 +147,8 @@ const chromeStorage: StateStorage = {
     return new Promise((resolve) => {
       chrome.storage.local.get(name, (result) => {
         const raw = result[name]
-        let value: string | null = null
-        if (typeof raw === 'string') {
-          value = raw
-        } else if (raw == null) {
-          value = null
-        } else {
-          value = JSON.stringify(raw)
-        }
+        const value = stringifyStoredValue(raw)
+        lastPersistedWorkflowValues.set(name, value)
         if (DEBUG_PERSIST()) {
           console.log('[WorkflowPersist][storage.getItem:resolved]', JSON.stringify({
             name,
@@ -157,6 +163,7 @@ const chromeStorage: StateStorage = {
     })
   },
   setItem: (name: string, value: string): Promise<void> => {
+    const nextWorkflowCount = countWorkflows(value)
     if (DEBUG_PERSIST()) {
       const diag = parseValueForDiag(value)
       console.log('[WorkflowPersist][storage.setItem]', JSON.stringify({
@@ -173,10 +180,76 @@ const chromeStorage: StateStorage = {
       }
     }
     return new Promise((resolve, reject) => {
-      chrome.storage.local.set({ [name]: value }, () => {
-        const err = chrome.runtime.lastError
-        if (err) reject(err)
-        else resolve()
+      if (isManualHydratingWorkflowStorage) {
+        if (DEBUG_PERSIST()) {
+          console.log('[WorkflowPersist][storage.setItem:skip-manual-hydrate]', JSON.stringify({ name, nextWorkflowCount }))
+        }
+        resolve()
+        return
+      }
+      if (!workflowStorageHydrated && nextWorkflowCount === 0) {
+        if (DEBUG_PERSIST()) {
+          console.log('[WorkflowPersist][storage.setItem:skip-prehydrate-empty]', JSON.stringify({ name }))
+        }
+        resolve()
+        return
+      }
+      if (lastPersistedWorkflowValues.get(name) === value) {
+        resolve()
+        return
+      }
+
+      const writeValue = (nextValue: string, allowQuotaRetry: boolean) => {
+        chrome.storage.local.set({ [name]: nextValue }, () => {
+          const err = chrome.runtime.lastError
+          if (!err) {
+            lastPersistedWorkflowValues.set(name, nextValue)
+            allowNextEmptyWorkflowPersist = false
+            resolve()
+            return
+          }
+          if (!allowQuotaRetry || !isQuotaError(err)) {
+            allowNextEmptyWorkflowPersist = false
+            reject(err)
+            return
+          }
+
+          const sanitizedValue = sanitizeWorkflowPayloadString(nextValue)
+          if (sanitizedValue === nextValue) {
+            allowNextEmptyWorkflowPersist = false
+            reject(err)
+            return
+          }
+          console.warn('[WorkflowPersist][storage.setItem:quota.retry]', JSON.stringify({
+            name,
+            beforeKb: Math.round(nextValue.length / 1024 * 10) / 10,
+            afterKb: Math.round(sanitizedValue.length / 1024 * 10) / 10
+          }))
+          writeValue(sanitizedValue, false)
+        })
+      }
+
+      chrome.storage.local.get(name, (result) => {
+        const currentValue = stringifyStoredValue(result[name])
+        const currentWorkflowCount = countWorkflows(currentValue)
+        lastPersistedWorkflowValues.set(name, currentValue)
+
+        if (currentValue === value) {
+          resolve()
+          return
+        }
+        if (nextWorkflowCount === 0 && currentWorkflowCount > 0 && !allowNextEmptyWorkflowPersist) {
+          if (DEBUG_PERSIST()) {
+            console.warn('[WorkflowPersist][storage.setItem:skip-stale-empty-overwrite]', JSON.stringify({
+              name,
+              currentWorkflowCount,
+              nextWorkflowCount
+            }))
+          }
+          resolve()
+          return
+        }
+        writeValue(value, true)
       })
     })
   },
@@ -281,26 +354,7 @@ const createDefaultNodeData = (type: FlowNodeType): Record<string, unknown> => {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// ASSET MIGRATION + PERSIST SANITIZATION
-// ═══════════════════════════════════════════════════════════════
-//
-// Heavy media (base64 dataUrls) used to live inline in `node.data` and
-// were persisted to `chrome.storage.local` together with the rest of
-// the workflow. That blew past the ~10 MB MV3 quota as soon as a user
-// uploaded a few high-res images. We now keep only metadata
-// (`assetId`, `mimeType`, `width`, `height`, `size`, `fileName`) in
-// the workflow store and store the actual bytes in IndexedDB
-// (see `src/lib/assetStore.ts`).
-//
-// This block owns two responsibilities:
-//   1. sanitizeWorkflowForPersist — strip anything heavy BEFORE the
-//      zustand `persist` middleware writes to chrome.storage.local.
-//   2. migrateWorkflowAssets — one-shot upgrade that reads existing
-//      workflows, saves any inline `data:` blob to IndexedDB, and
-//      rewrites the workflow with `assetId` metadata instead.
-
-const HEAVY_KEYS = [
+const HEAVY_PERSIST_KEYS = new Set([
   'mediaData',
   'imageData',
   'videoData',
@@ -315,61 +369,67 @@ const HEAVY_KEYS = [
   'result',
   'runResult',
   'logs',
+  '_output',
   'mediaPoster',
   'videoPoster'
-] as const
+])
 
-const INLINE_BLOB_KEYS = ['mediaData', 'imageData', 'videoData'] as const
-
-const PERSIST_BUDGET_WARN_KB = 5000
 const PERSIST_STRING_LENGTH_LIMIT = 100_000
+const PERSIST_BUDGET_WARN_KB = 5000
 
-const stripHeavyKeysDeep = (value: unknown): unknown => {
-  if (value === null || value === undefined) return value
-  if (Array.isArray(value)) return value.map(stripHeavyKeysDeep)
-  if (typeof value !== 'object') return value
-  const obj = value as Record<string, unknown>
-  const out: Record<string, unknown> = {}
-  for (const key of Object.keys(obj)) {
-    if ((HEAVY_KEYS as readonly string[]).includes(key)) continue
-    out[key] = stripHeavyKeysDeep(obj[key])
-  }
-  return out
+const isQuotaError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error || '')
+  return /quota|kQuotaBytes|QUOTA_BYTES|exceeded/i.test(message)
 }
 
-const isHeavyString = (value: unknown): boolean => {
+const isHeavyPersistString = (value: unknown): boolean => {
   if (typeof value !== 'string') return false
   if (value.startsWith('data:') || value.startsWith('blob:')) return true
   return value.length > PERSIST_STRING_LENGTH_LIMIT
 }
 
-const stripHeavyStringFieldsDeep = (value: unknown): unknown => {
+const sanitizePersistValue = (value: unknown): unknown => {
   if (value === null || value === undefined) return value
-  if (Array.isArray(value)) return value.map(stripHeavyStringFieldsDeep)
+  if (isHeavyPersistString(value)) return undefined
+  if (Array.isArray(value)) {
+    return value
+      .map(sanitizePersistValue)
+      .filter((item) => item !== undefined)
+  }
   if (typeof value !== 'object') return value
-  const obj = value as Record<string, unknown>
+
   const out: Record<string, unknown> = {}
-  for (const key of Object.keys(obj)) {
-    const v = obj[key]
-    if (isHeavyString(v)) continue
-    out[key] = stripHeavyStringFieldsDeep(v)
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (HEAVY_PERSIST_KEYS.has(key)) continue
+    const sanitized = sanitizePersistValue(child)
+    if (sanitized !== undefined) out[key] = sanitized
   }
   return out
 }
 
-/**
- * sanitizeWorkflowForPersist — strip heavy Media-node blobs (and any
- * `data:`/`blob:` strings or oversized strings) from a workflow before
- * it is written to chrome.storage.local.
- *
- * This is intentionally conservative: when in doubt, drop the field.
- * Heavy state lives in IndexedDB; the workflow store only carries
- * pointers + metadata.
- */
-const sanitizeWorkflowForPersist = (workflow: Workflow): Workflow => {
-  let sanitized = stripHeavyKeysDeep(workflow) as Workflow
-  sanitized = stripHeavyStringFieldsDeep(sanitized) as Workflow
-  return sanitized
+const sanitizeWorkflowForPersist = (workflow: Workflow): Workflow =>
+  sanitizePersistValue(workflow) as Workflow
+
+const sanitizeWorkflowsForPersist = (workflows: Workflow[] = []): Workflow[] =>
+  workflows.map(sanitizeWorkflowForPersist)
+
+const sanitizeWorkflowPayloadString = (value: string): string => {
+  try {
+    const parsed = JSON.parse(value) as { state?: Partial<WorkflowState>; version?: number }
+    if (!parsed?.state) return value
+    const workflows = Array.isArray(parsed.state.workflows)
+      ? sanitizeWorkflowsForPersist(parsed.state.workflows as Workflow[])
+      : []
+    return JSON.stringify({
+      ...parsed,
+      state: {
+        workflows,
+        activeWorkflowId: parsed.state.activeWorkflowId ?? workflows[0]?.id ?? null
+      }
+    })
+  } catch {
+    return value
+  }
 }
 
 const approxKb = (value: unknown): number => {
@@ -380,160 +440,29 @@ const approxKb = (value: unknown): number => {
   }
 }
 
-const sanitizeWorkflowForSizeReport = (workflow: Workflow): Workflow =>
-  stripHeavyStringFieldsDeep(stripHeavyKeysDeep(workflow)) as Workflow
-
-const storageSizeGuard = (workflows: Workflow[]): void => {
+const warnIfPersistPayloadLooksHeavy = (workflows: Workflow[]): void => {
   if (!DEBUG_PERSIST()) return
-  const sanitized = workflows.map(sanitizeWorkflowForSizeReport)
-  const kb = approxKb(sanitized)
-  let heavyBlobCount = 0
+  const kb = approxKb(workflows)
+  let heavyStringCount = 0
   const stack: unknown[] = [workflows]
   while (stack.length) {
-    const v = stack.pop()
-    if (!v) continue
-    if (typeof v === 'string') {
-      if (v.startsWith('data:image/') || v.startsWith('data:video/') || v.startsWith('data:application/')) {
-        heavyBlobCount++
-      }
+    const current = stack.pop()
+    if (typeof current === 'string') {
+      if (isHeavyPersistString(current)) heavyStringCount += 1
       continue
     }
-    if (typeof v !== 'object') continue
-    if (Array.isArray(v)) {
-      for (const x of v) stack.push(x)
-    } else {
-      for (const k of Object.keys(v as Record<string, unknown>)) stack.push((v as Record<string, unknown>)[k])
-    }
+    if (!current || typeof current !== 'object') continue
+    if (Array.isArray(current)) stack.push(...current)
+    else stack.push(...Object.values(current as Record<string, unknown>))
   }
-  if (kb > PERSIST_BUDGET_WARN_KB || heavyBlobCount > 0) {
+  if (kb > PERSIST_BUDGET_WARN_KB || heavyStringCount > 0) {
     console.warn('[WorkflowPersist][storage.size.warning]', JSON.stringify({
       sanitizedKb: kb,
       workflowCount: workflows.length,
-      survivingDataUrls: heavyBlobCount,
-      budgetKb: PERSIST_BUDGET_WARN_KB,
-      hint: 'dataUrl/blob: strings slipped past sanitizeWorkflowForPersist; quota likely exceeded'
+      heavyStringCount,
+      budgetKb: PERSIST_BUDGET_WARN_KB
     }))
   }
-}
-
-interface MigrationEntry {
-  workflowId: string
-  nodeId: string
-  movedFields: string[]
-  assetId: string
-  beforeKb: number
-  afterKb: number
-}
-
-/**
- * migrateWorkflowAssets — one-shot upgrade. Reads each workflow, finds
- * any inline `data:` blob fields, persists them to IndexedDB, and
- * replaces them with `{ assetId, ...metadata }`. Idempotent: if the
- * node already has `assetId` and no inline blob, it's a no-op.
- *
- * Migration reports are written to the console under
- * `[AssetMigration]` so we can audit how much storage we freed.
- */
-const migrateWorkflowAssets = async (
-  workflows: Workflow[]
-): Promise<{ workflows: Workflow[]; entries: MigrationEntry[] }> => {
-  const entries: MigrationEntry[] = []
-  const out: Workflow[] = []
-  for (const workflow of workflows) {
-    let mutated = false
-    const nodes: WorkflowNode[] = []
-    // De-dupe identical inline blobs across nodes so we only store
-    // one copy in IndexedDB (the user reported `mediaData` AND
-    // `imageData` being byte-identical for the same node).
-    const seenBlobs = new Map<string, string>()
-    for (const node of workflow.nodes) {
-      const data = { ...(node.data as Record<string, unknown> || {}) }
-      const inlineValues: Array<{ key: string; value: string }> = []
-      for (const key of INLINE_BLOB_KEYS) {
-        const v = data[key]
-        if (typeof v === 'string' && v.startsWith('data:')) {
-          inlineValues.push({ key, value: v })
-        }
-      }
-      if (inlineValues.length === 0 && !data.assetId) {
-        nodes.push(node)
-        continue
-      }
-      const beforeKb = approxKb(data)
-      let assetId = typeof data.assetId === 'string' ? data.assetId : ''
-      let assetMeta: StoredAssetMeta | null = null
-      const movedFields: string[] = []
-      if (inlineValues.length > 0) {
-        const primary = inlineValues[0]
-        const cachedId = seenBlobs.get(primary.value)
-        if (cachedId) {
-          assetId = cachedId
-        } else {
-          try {
-            const mime = (primary.value.match(/^data:([^;]+);/) || [, ''])[1] || 'application/octet-stream'
-            const kind = mime.startsWith('image/') ? 'image' : mime.startsWith('video/') ? 'video' : 'file'
-            assetMeta = await saveAssetFromDataUrl(primary.value, {
-              kind: kind as 'image' | 'video' | 'file',
-              mimeType: mime,
-              fileName: typeof data.mediaName === 'string' ? data.mediaName : undefined
-            })
-            assetId = assetMeta.assetId
-            seenBlobs.set(primary.value, assetId)
-          } catch (err) {
-            console.warn('[AssetMigration][save.failed]', JSON.stringify({
-              workflowId: workflow.id,
-              nodeId: node.id,
-              error: (err as Error).message
-            }))
-            nodes.push(node)
-            continue
-          }
-        }
-        for (const { key } of inlineValues) {
-          delete data[key]
-          movedFields.push(key)
-        }
-      }
-      // Drop poster fields that may carry base64.
-      if (typeof data.mediaPoster === 'string' && data.mediaPoster.startsWith('data:')) {
-        delete data.mediaPoster
-        movedFields.push('mediaPoster')
-      }
-      if (typeof data.videoPoster === 'string' && data.videoPoster.startsWith('data:')) {
-        delete data.videoPoster
-        movedFields.push('videoPoster')
-      }
-      data.assetId = assetId
-      if (assetMeta) {
-        if (!data.mimeType && assetMeta.mimeType) data.mimeType = assetMeta.mimeType
-        if (!data.mediaMimeType && assetMeta.mimeType) data.mediaMimeType = assetMeta.mimeType
-        if (data.mediaWidth === undefined && assetMeta.width !== undefined) data.mediaWidth = assetMeta.width
-        if (data.mediaHeight === undefined && assetMeta.height !== undefined) data.mediaHeight = assetMeta.height
-        if (data.size === undefined && assetMeta.size !== undefined) data.size = assetMeta.size
-      }
-      const afterKb = approxKb(data)
-      entries.push({
-        workflowId: workflow.id,
-        nodeId: node.id,
-        movedFields,
-        assetId,
-        beforeKb,
-        afterKb
-      })
-      console.log('[AssetMigration]', JSON.stringify({
-        workflowId: workflow.id,
-        nodeId: node.id,
-        movedFields,
-        assetId,
-        beforeKb,
-        afterKb
-      }))
-      nodes.push({ ...node, data: data as WorkflowNode['data'] })
-      mutated = true
-    }
-    out.push(mutated ? { ...workflow, nodes } : workflow)
-  }
-  return { workflows: out, entries }
 }
 
 export const useWorkflowStore = create<WorkflowState>()(
@@ -551,6 +480,8 @@ export const useWorkflowStore = create<WorkflowState>()(
         const result = await chrome.storage.local.get('ai-flow-workflows')
         const saved = result['ai-flow-workflows']
         if (!saved) {
+          workflowStorageHydrated = true
+          lastPersistedWorkflowValues.set('ai-flow-workflows', null)
           if (DEBUG_PERSIST()) {
             console.log('[WorkflowPersist][hydrateFromStorage:read]', JSON.stringify({
               hasValue: false,
@@ -561,17 +492,25 @@ export const useWorkflowStore = create<WorkflowState>()(
           }
           return
         }
+        const savedRaw = stringifyStoredValue(saved)
+        if (!savedRaw) {
+          workflowStorageHydrated = true
+          lastPersistedWorkflowValues.set('ai-flow-workflows', null)
+          return
+        }
+        lastPersistedWorkflowValues.set('ai-flow-workflows', savedRaw)
 
         let parsed: { state?: Partial<WorkflowState> } | null = null
         try {
-          parsed = JSON.parse(saved) as { state?: Partial<WorkflowState> }
+          parsed = JSON.parse(savedRaw) as { state?: Partial<WorkflowState> }
         } catch {
+          workflowStorageHydrated = true
           if (DEBUG_PERSIST()) {
             console.log('[WorkflowPersist][hydrateFromStorage:read]', JSON.stringify({
               hasValue: true,
               workflowCount: 0,
               activeWorkflowId: null,
-              rawLength: saved.length,
+              rawLength: savedRaw.length,
               parseError: true
             }))
           }
@@ -586,64 +525,50 @@ export const useWorkflowStore = create<WorkflowState>()(
             hasValue: true,
             workflowCount: wc,
             activeWorkflowId: aw,
-            rawLength: saved.length
+            rawLength: savedRaw.length
           }))
         }
 
-        if (!state?.workflows) return
-
-        // [AssetMigration] One-shot upgrade: any workflow node still
-        // carrying inline `data:image/...` blobs gets migrated to
-        // IndexedDB and replaced with an `assetId`. The migration is
-        // idempotent — re-running on already-migrated workflows is a
-        // no-op (inline blob count is 0 and `assetId` is already set).
-        const { workflows: migratedWorkflows, entries } = await migrateWorkflowAssets(state.workflows as Workflow[])
-        if (DEBUG_PERSIST() && entries.length > 0) {
-          const beforeKb = entries.reduce((acc, e) => acc + e.beforeKb, 0)
-          const afterKb = entries.reduce((acc, e) => acc + e.afterKb, 0)
-          console.log('[WorkflowPersist][hydrateFromStorage:migration]', JSON.stringify({
-            migratedNodes: entries.length,
-            beforeKb: Math.round(beforeKb * 10) / 10,
-            afterKb: Math.round(afterKb * 10) / 10,
-            savedKb: Math.round((beforeKb - afterKb) * 10) / 10
-          }))
+        if (!state?.workflows) {
+          workflowStorageHydrated = true
+          return
         }
+        const sanitizedWorkflows = sanitizeWorkflowsForPersist(state.workflows as Workflow[])
+        const activeWorkflowId = state.activeWorkflowId ?? sanitizedWorkflows[0]?.id ?? null
 
         if (DEBUG_PERSIST()) {
           console.log('[WorkflowPersist][hydrateFromStorage:set]', JSON.stringify({
-            workflowCount: migratedWorkflows.length,
+            workflowCount: sanitizedWorkflows.length,
             activeWorkflowId: aw,
-            migratedCount: entries.length
+            sanitizedKb: approxKb(sanitizedWorkflows)
           }))
-          if (migratedWorkflows.length === 0) {
+          if (sanitizedWorkflows.length === 0) {
             console.trace('[WorkflowPersist][hydrateFromStorage:set:zero-workflows]')
           }
         }
-        set({
-          workflows: migratedWorkflows,
-          activeWorkflowId: state.activeWorkflowId ?? migratedWorkflows[0]?.id ?? null,
-          selectedNodeId: state.selectedNodeId ?? null,
-          selectedEdgeId: state.selectedEdgeId ?? null
-        })
+        isManualHydratingWorkflowStorage = true
+        try {
+          set({
+            workflows: sanitizedWorkflows,
+            activeWorkflowId,
+            selectedNodeId: state.selectedNodeId ?? null,
+            selectedEdgeId: state.selectedEdgeId ?? null
+          })
+        } finally {
+          isManualHydratingWorkflowStorage = false
+          workflowStorageHydrated = true
+        }
 
-        // If migration produced a smaller workflow, persist it back so
-        // chrome.storage.local no longer carries the bytes. We bypass
-        // partialize here because the migrated workflows are already
-        // sanitized — writing them straight avoids an unnecessary
-        // re-sanitization round-trip.
-        if (entries.length > 0) {
+        const sanitizedPayload = sanitizeWorkflowPayloadString(savedRaw)
+        if (sanitizedPayload !== savedRaw && sanitizedPayload.length < savedRaw.length) {
           try {
-            const sanitizedPayload = JSON.stringify({
-              state: {
-                workflows: migratedWorkflows,
-                activeWorkflowId: state.activeWorkflowId ?? migratedWorkflows[0]?.id ?? null
-              }
-            })
             await chrome.storage.local.set({ 'ai-flow-workflows': sanitizedPayload })
+            lastPersistedWorkflowValues.set('ai-flow-workflows', sanitizedPayload)
             if (DEBUG_PERSIST()) {
               console.log('[WorkflowPersist][hydrateFromStorage:persist-back]', JSON.stringify({
-                kb: Math.round(sanitizedPayload.length / 1024 * 10) / 10,
-                workflowCount: migratedWorkflows.length
+                beforeKb: Math.round(savedRaw.length / 1024 * 10) / 10,
+                afterKb: Math.round(sanitizedPayload.length / 1024 * 10) / 10,
+                workflowCount: sanitizedWorkflows.length
               }))
             }
           } catch (err) {
@@ -716,6 +641,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         set((state) => {
           const workflows = state.workflows.filter((w) => w.id !== id)
           const { [id]: _deletedHistory, ...history } = state.history
+          if (workflows.length === 0) allowNextEmptyWorkflowPersist = true
           return {
             workflows,
             history,
@@ -824,6 +750,26 @@ export const useWorkflowStore = create<WorkflowState>()(
           if (!workflow || !node) return state
           if (node.position.x === position.x && node.position.y === position.y) return state
 
+          // [CanvasInvestigate] probe — fires for every distinct
+          // (x,y) the runner-side drag crosses. The key signals:
+          //   - "positionOnly: true"            — pure drag mutation
+          //   - "updatedAtChanged: true"        — workflow list ordering shifts
+          //   - "triggersHistoryPush: true"     — undo/redo churn
+          // Counterpart: WorkflowEditor [nodeMoved] emits the
+          // upstream Drawflow-side draw ticks. If the ratio is
+          // 1:1 (one store update per draw tick), every tick is
+          // triggering a full state-machine round-trip.
+          const beforeUpdatedAt = workflow.updatedAt ?? null
+          const nextUpdatedAt = Date.now()
+          canvasLog('updateNodePosition', {
+            nodeId,
+            x: position.x,
+            y: position.y,
+            updatedAtChanged: beforeUpdatedAt !== nextUpdatedAt,
+            triggersHistoryPush: true,
+            positionOnly: true,
+          })
+
           return {
             history: pushWorkflowHistory(state),
             workflows: state.workflows.map((w) =>
@@ -833,7 +779,7 @@ export const useWorkflowStore = create<WorkflowState>()(
                     nodes: w.nodes.map((n) =>
                       n.id === nodeId ? { ...n, position } : n
                     ),
-                    updatedAt: Date.now()
+                    updatedAt: nextUpdatedAt
                   }
                 : w
             ),
@@ -859,6 +805,19 @@ export const useWorkflowStore = create<WorkflowState>()(
 
           if (!changed) return state
 
+          // [CanvasInvestigate] probe — bulk per-frame position
+          // commit (used at drag-end, not per draw tick). Pair
+          // with [updateNodePosition] to confirm whether the
+          // per-tick store churn is one or many round-trips.
+          const beforeUpdatedAt = workflow.updatedAt ?? null
+          const nextUpdatedAt = Date.now()
+          canvasLog('updateNodePositions', {
+            positionsCount: Object.keys(positions).length,
+            updatedAtChanged: beforeUpdatedAt !== nextUpdatedAt,
+            triggersHistoryPush: true,
+            positionOnly: true,
+          })
+
           return {
             history: pushWorkflowHistory(state, id),
             workflows: state.workflows.map((w) =>
@@ -866,7 +825,7 @@ export const useWorkflowStore = create<WorkflowState>()(
                 ? {
                     ...w,
                     nodes: nextNodes,
-                    updatedAt: Date.now()
+                    updatedAt: nextUpdatedAt
                   }
                 : w
             ),
@@ -977,6 +936,7 @@ export const useWorkflowStore = create<WorkflowState>()(
       },
 
       clearAllWorkflows: () => {
+        allowNextEmptyWorkflowPersist = true
         set({ workflows: [], activeWorkflowId: null, selectedNodeId: null, selectedEdgeId: null, history: {}, isDirty: true })
       },
 
@@ -1067,27 +1027,24 @@ export const useWorkflowStore = create<WorkflowState>()(
       name: 'ai-flow-workflows',
       storage: createJSONStorage(() => chromeStorage),
       partialize: (state) => {
-        const sanitized = (state.workflows || []).map(sanitizeWorkflowForPersist)
+        const sanitized = sanitizeWorkflowsForPersist(state.workflows || [])
+        warnIfPersistPayloadLooksHeavy(sanitized)
         const partialized: Partial<WorkflowState> = {
           workflows: sanitized,
           activeWorkflowId: state.activeWorkflowId
         }
-        // [WorkflowPersist][storage.size.warning] — sanity check the
-        // sanitized payload before it crosses the chrome.storage.local
-        // boundary. Anything > 5 MB or with surviving `data:image` /
-        // `data:video` strings indicates the sanitizer missed a path
-        // and we are about to hit the quota again.
-        storageSizeGuard(sanitized)
         if (DEBUG_PERSIST()) {
           console.log('[WorkflowPersist][partialize]', JSON.stringify({
             workflowCount: state.workflows?.length,
             activeWorkflowId: state.activeWorkflowId,
+            sanitizedKb: approxKb(sanitized),
             keys: Object.keys(partialized)
           }))
         }
         return partialized
       },
       onRehydrateStorage: () => (state, error) => {
+        workflowStorageHydrated = true
         const wc = Array.isArray(state?.workflows) ? state.workflows.length : 0
         const aw = state?.activeWorkflowId ?? null
         if (DEBUG_PERSIST()) {
