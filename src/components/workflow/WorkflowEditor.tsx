@@ -1729,7 +1729,7 @@ function getNodePortSignature(node: WorkflowNode) {
 
 function getWorkflowStructureSignature(workflow: Workflow) {
   const nodes = workflow.nodes
-    .map((node) => `${node.id}:${node.type}:${getNodePortSignature(node)}`)
+    .map((node) => `${node.id}:${node.type}:${Math.round(node.position.x)}:${Math.round(node.position.y)}:${getNodePortSignature(node)}`)
     .join('|')
   const edges = workflow.edges
     .map((edge) => `${edge.source}:${edge.target}:${edge.sourceHandle || ''}:${edge.targetHandle || ''}`)
@@ -2126,11 +2126,16 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const addNode = useWorkflowStore((s) => s.addNode)
   const updateNode = useWorkflowStore((s) => s.updateNode)
   const updateNodePosition = useWorkflowStore((s) => s.updateNodePosition)
+  const updateNodePositions = useWorkflowStore((s) => s.updateNodePositions)
   const addEdgeToStore = useWorkflowStore((s) => s.addEdge)
   const deleteNode = useWorkflowStore((s) => s.deleteNode)
   const deleteEdge = useWorkflowStore((s) => s.deleteEdge)
   const setSelectedNode = useWorkflowStore((s) => s.setSelectedNode)
   const selectedNodeId = useWorkflowStore((s) => s.selectedNodeId)
+  const undoWorkflow = useWorkflowStore((s) => s.undoWorkflow)
+  const redoWorkflow = useWorkflowStore((s) => s.redoWorkflow)
+  const canUndo = useWorkflowStore((s) => Boolean(s.history[workflow.id]?.past.length))
+  const canRedo = useWorkflowStore((s) => Boolean(s.history[workflow.id]?.future.length))
   const isRunning = usePipelineStore((s) => s.isRunning)
   const isPaused = usePipelineStore((s) => s.isPaused)
   const activeTaskId = usePipelineStore((s) => s.activeTaskId)
@@ -2148,6 +2153,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const nodeResizeObserversRef = useRef<Map<string, ResizeObserver>>(new Map())
   const overlayObserversRef = useRef<WeakMap<SVGPathElement, MutationObserver>>(new WeakMap())
   const nodePickerSpawnRef = useRef<{ x: number; y: number } | null>(null)
+  const copiedNodeRef = useRef<WorkflowNode | null>(null)
+  const lastCanvasPointerRef = useRef<{ x: number; y: number } | null>(null)
   const nodePickerRef = useRef<HTMLDivElement | null>(null)
   const nodePillMenuRef = useRef<HTMLDivElement | null>(null)
   const selectionMouseDownRef = useRef<{ nodeId: string | null; clearOnUnselect: boolean } | null>(null)
@@ -2775,6 +2782,34 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     }
   }
 
+  const getCanvasCenterPoint = () => {
+    const editor = editorRef.current
+    const canvas = canvasRef.current
+    const rect = canvas?.getBoundingClientRect()
+    const zoom = editor?.zoom || 1
+    const panX = editor?.canvas_x || 0
+    const panY = editor?.canvas_y || 0
+    if (!rect) return { x: 220, y: 160 }
+
+    return {
+      x: Math.round((rect.width / 2 - panX) / zoom),
+      y: Math.round((rect.height / 2 - panY) / zoom)
+    }
+  }
+
+  const rememberCanvasPointer = (event: Event) => {
+    if ('touches' in event) {
+      const touch = event.touches[0] || event.changedTouches[0]
+      if (!touch) return
+      lastCanvasPointerRef.current = clientPointToCanvasPoint(touch.clientX, touch.clientY)
+      return
+    }
+
+    const pointerEvent = event as MouseEvent | PointerEvent
+    if (typeof pointerEvent.clientX !== 'number' || typeof pointerEvent.clientY !== 'number') return
+    lastCanvasPointerRef.current = clientPointToCanvasPoint(pointerEvent.clientX, pointerEvent.clientY)
+  }
+
   const openNodePicker = (position: { x: number; y: number } | null = null, spawnPosition: { x: number; y: number } | null = null) => {
     setNodePickerSearch('')
     setSelectedPickerIndex(0)
@@ -3386,6 +3421,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     })
 
     editor.on('nodeMoved', (id: string | number) => {
+      if (suppressEdgeEventRef.current) return
       const node = editor.getNodeFromId(id)
       updateNodePosition(String(id), { x: node.pos_x, y: node.pos_y })
       refreshDrawflowConnectionsNow([String(id)])
@@ -3393,6 +3429,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     })
 
     editor.on('nodeRemoved', (id: string | number) => {
+      if (suppressEdgeEventRef.current) return
       deleteNode(String(id))
     })
 
@@ -3454,7 +3491,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     editor.on('addReroute', scheduleConnectionSync)
     editor.on('removeReroute', scheduleConnectionSync)
 
-    const syncOnPointerMove = () => {
+    const syncOnPointerMove = (event: MouseEvent | PointerEvent | TouchEvent) => {
+      rememberCanvasPointer(event)
       const activeNodeId = editor.drag
         ? editor.ele_selected?.id || editor.node_selected?.id
         : editor.node_selected?.id
@@ -4153,6 +4191,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     canvasEl.addEventListener('mousemove', syncOnPointerMove)
     canvasEl.addEventListener('pointermove', syncOnPointerMove)
     canvasEl.addEventListener('touchmove', syncOnPointerMove)
+    canvasEl.addEventListener('mousedown', rememberCanvasPointer)
+    canvasEl.addEventListener('touchstart', rememberCanvasPointer)
     canvasEl.addEventListener('mousedown', handleBidirectionalPortMouseDown, true)
     canvasEl.addEventListener('mousedown', handleSelectionMouseDown, true)
     canvasEl.addEventListener('mousedown', stopNodePillDragStart, true)
@@ -4185,6 +4225,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       canvasEl.removeEventListener('mousemove', syncOnPointerMove)
       canvasEl.removeEventListener('pointermove', syncOnPointerMove)
       canvasEl.removeEventListener('touchmove', syncOnPointerMove)
+      canvasEl.removeEventListener('mousedown', rememberCanvasPointer)
+      canvasEl.removeEventListener('touchstart', rememberCanvasPointer)
       canvasEl.removeEventListener('mousedown', handleBidirectionalPortMouseDown, true)
       canvasEl.removeEventListener('mousedown', handleSelectionMouseDown, true)
       canvasEl.removeEventListener('mousedown', stopNodePillDragStart, true)
@@ -4233,6 +4275,86 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   useEffect(() => {
     syncSelectedNodeDom(selectedNodeId)
   }, [selectedNodeId])
+
+  const copySelectedNode = () => {
+    const nodeId = useWorkflowStore.getState().selectedNodeId
+    if (!nodeId) return false
+
+    const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
+    if (!node) return false
+
+    copiedNodeRef.current = cloneDeep(node)
+    return true
+  }
+
+  const pasteCopiedNode = () => {
+    const copiedNode = copiedNodeRef.current
+    const currentWorkflow = workflowRef.current
+    if (!copiedNode || !currentWorkflow) return false
+
+    const pointer = lastCanvasPointerRef.current || getCanvasCenterPoint()
+    const pastedNode: WorkflowNode = {
+      ...cloneDeep(copiedNode),
+      id: createId('node'),
+      position: {
+        x: Math.max(0, Math.round(pointer.x)),
+        y: Math.max(0, Math.round(pointer.y))
+      }
+    }
+
+    updateWorkflow(currentWorkflow.id, {
+      nodes: [...currentWorkflow.nodes, pastedNode]
+    })
+    setSelectedNode(pastedNode.id)
+
+    requestAnimationFrame(() => {
+      attachNodeResizeObserver(pastedNode.id)
+      scheduleDrawflowConnectionRefresh(pastedNode.id)
+      syncSelectedNodeDom(pastedNode.id)
+    })
+
+    return true
+  }
+
+  useEffect(() => {
+    const handleUndoRedoShortcut = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey)) return
+
+      const target = event.target as HTMLElement | null
+      if (target?.closest('input, textarea, select, [contenteditable="true"]')) return
+
+      const key = event.key.toLowerCase()
+      if (key === 'c') {
+        if (copySelectedNode()) event.preventDefault()
+        return
+      }
+
+      if (key === 'v') {
+        if (pasteCopiedNode()) event.preventDefault()
+        return
+      }
+
+      if (key === 'z' && event.shiftKey) {
+        event.preventDefault()
+        if (useWorkflowStore.getState().canRedoWorkflow(workflow.id)) redoWorkflow(workflow.id)
+        return
+      }
+
+      if (key === 'z') {
+        event.preventDefault()
+        if (useWorkflowStore.getState().canUndoWorkflow(workflow.id)) undoWorkflow(workflow.id)
+        return
+      }
+
+      if (key === 'y') {
+        event.preventDefault()
+        if (useWorkflowStore.getState().canRedoWorkflow(workflow.id)) redoWorkflow(workflow.id)
+      }
+    }
+
+    window.addEventListener('keydown', handleUndoRedoShortcut)
+    return () => window.removeEventListener('keydown', handleUndoRedoShortcut)
+  }, [redoWorkflow, undoWorkflow, updateWorkflow, workflow.id])
 
   const handleAddNode = (type: FlowNodeType) => {
     const editor = editorRef.current
@@ -4343,6 +4465,205 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     editor.precanvas.style.transform = `translate(${editor.canvas_x}px, ${editor.canvas_y}px) scale(${zoom})`
     refreshZoom()
     scheduleConnectionSync()
+  }
+
+  const autoLayoutCanvas = () => {
+    const currentWorkflow = workflowRef.current
+    const nodes = currentWorkflow.nodes
+    if (nodes.length === 0) return
+
+    const nodeIds = new Set(nodes.map((node) => node.id))
+    const nodeById = new Map(nodes.map((node) => [node.id, node]))
+    const nodeOrder = new Map(nodes.map((node, index) => [node.id, index]))
+    const parents = new Map<string, Set<string>>()
+    const children = new Map<string, Set<string>>()
+
+    for (const node of nodes) {
+      parents.set(node.id, new Set())
+      children.set(node.id, new Set())
+    }
+
+    for (const edge of currentWorkflow.edges) {
+      if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target) || edge.source === edge.target) continue
+      parents.get(edge.target)?.add(edge.source)
+      children.get(edge.source)?.add(edge.target)
+    }
+
+    const getNodeElement = (nodeId: string) =>
+      canvasRef.current?.querySelector<HTMLElement>(`#node-${CSS.escape(nodeId)}`) || null
+    const getNodeHeight = (nodeId: string) => {
+      const node = nodeById.get(nodeId)
+      const measured = getNodeElement(nodeId)?.offsetHeight
+      if (measured && measured > 0) return measured
+      if (node?.type === 'generate' || node?.type === 'image') return 360
+      if (node?.type === 'prompt') return 140
+      return 180
+    }
+    const getNodeWidth = (nodeId: string) => {
+      const node = nodeById.get(nodeId)
+      const measured = getNodeElement(nodeId)?.offsetWidth
+      if (measured && measured > 0) return measured
+      if (node?.type === 'generate' || node?.type === 'image') return 360
+      return 320
+    }
+
+    const roots = nodes.filter((node) => (parents.get(node.id)?.size || 0) === 0).map((node) => node.id)
+    const depth = new Map<string, number>()
+
+    if (roots.length > 0) {
+      const remainingParents = new Map(nodes.map((node) => [node.id, parents.get(node.id)?.size || 0]))
+      const queue = [...roots]
+      for (const root of roots) depth.set(root, 0)
+
+      while (queue.length > 0) {
+        const id = queue.shift()
+        if (!id) continue
+        const currentDepth = depth.get(id) || 0
+
+        for (const childId of children.get(id) || []) {
+          depth.set(childId, Math.max(depth.get(childId) ?? 0, currentDepth + 1))
+          remainingParents.set(childId, Math.max(0, (remainingParents.get(childId) || 0) - 1))
+          if ((remainingParents.get(childId) || 0) === 0) queue.push(childId)
+        }
+      }
+    } else {
+      const fallbackRoot = nodes[0]?.id
+      const queue = fallbackRoot ? [fallbackRoot] : []
+      if (fallbackRoot) depth.set(fallbackRoot, 0)
+
+      while (queue.length > 0) {
+        const id = queue.shift()
+        if (!id) continue
+        const currentDepth = depth.get(id) || 0
+        for (const childId of children.get(id) || []) {
+          if (depth.has(childId)) continue
+          depth.set(childId, currentDepth + 1)
+          queue.push(childId)
+        }
+      }
+    }
+
+    for (const node of nodes) {
+      if (!depth.has(node.id)) depth.set(node.id, 0)
+    }
+
+    const levels = new Map<number, string[]>()
+    for (const node of nodes) {
+      const level = depth.get(node.id) || 0
+      levels.set(level, [...(levels.get(level) || []), node.id])
+    }
+
+    const sortedLevels = [...levels.keys()].sort((a, b) => a - b)
+    const nodeHeights = new Map(nodes.map((node) => [node.id, getNodeHeight(node.id)]))
+    const nodeWidths = new Map(nodes.map((node) => [node.id, getNodeWidth(node.id)]))
+    const levelX = new Map<number, number>()
+    const START_X = 80
+    const START_Y = 80
+    const HORIZONTAL_GAP = 170
+    const VERTICAL_GAP = 100
+    let cursorX = START_X
+
+    for (const level of sortedLevels) {
+      const ids = levels.get(level) || []
+      levelX.set(level, cursorX)
+      const maxWidth = Math.max(...ids.map((id) => nodeWidths.get(id) || 320), 320)
+      cursorX += maxWidth + HORIZONTAL_GAP
+    }
+
+    const positions: Record<string, { x: number; y: number }> = {}
+    const nodeCenterY = (nodeId: string) => {
+      const position = positions[nodeId]
+      const height = nodeHeights.get(nodeId) || 180
+      if (position) return position.y + height / 2
+      const node = nodeById.get(nodeId)
+      return (node?.position.y || 0) + height / 2
+    }
+
+    for (const level of sortedLevels) {
+      const ids = levels.get(level) || []
+      ids.sort((a, b) => {
+        const weightedY = (nodeId: string) => {
+          const parentIds = [...(parents.get(nodeId) || [])]
+          const childIds = [...(children.get(nodeId) || [])]
+          let totalWeight = 0
+          let weightedSum = 0
+
+          for (const parentId of parentIds) {
+            weightedSum += nodeCenterY(parentId) * 2
+            totalWeight += 2
+          }
+          for (const childId of childIds) {
+            weightedSum += nodeCenterY(childId)
+            totalWeight += 1
+          }
+
+          return totalWeight > 0 ? weightedSum / totalWeight : (nodeById.get(nodeId)?.position.y || 0)
+        }
+
+        return weightedY(a) - weightedY(b) || (nodeOrder.get(a) || 0) - (nodeOrder.get(b) || 0)
+      })
+
+      let cursorY = START_Y
+      for (const id of ids) {
+        positions[id] = { x: levelX.get(level) || START_X, y: cursorY }
+        cursorY += (nodeHeights.get(id) || 180) + VERTICAL_GAP
+      }
+    }
+
+    for (const level of sortedLevels) {
+      if (level === 0) continue
+      const ids = levels.get(level) || []
+      for (const id of ids) {
+        const parentIds = [...(parents.get(id) || [])]
+        if (parentIds.length === 0) continue
+
+        const avgParentCenterY = parentIds.reduce((sum, parentId) => sum + nodeCenterY(parentId), 0) / parentIds.length
+        const height = nodeHeights.get(id) || 180
+        const currentY = positions[id].y
+        const targetY = avgParentCenterY - height / 2
+        const maxShift = VERTICAL_GAP * 0.6
+        const shift = Math.max(-maxShift, Math.min(maxShift, targetY - currentY))
+        positions[id] = { ...positions[id], y: Math.max(START_Y / 2, currentY + shift) }
+      }
+    }
+
+    for (const level of sortedLevels) {
+      const ids = [...(levels.get(level) || [])].sort((a, b) => positions[a].y - positions[b].y)
+      const minGap = VERTICAL_GAP * 0.55
+
+      for (let index = 1; index < ids.length; index += 1) {
+        const previousId = ids[index - 1]
+        const currentId = ids[index]
+        const previousBottom = positions[previousId].y + (nodeHeights.get(previousId) || 180)
+        if (positions[currentId].y < previousBottom + minGap) {
+          positions[currentId] = { ...positions[currentId], y: previousBottom + minGap }
+        }
+      }
+    }
+
+    const minX = Math.min(...Object.values(positions).map((position) => position.x))
+    const minY = Math.min(...Object.values(positions).map((position) => position.y))
+    const offsetX = minX < START_X ? START_X - minX : 0
+    const offsetY = minY < START_Y ? START_Y - minY : 0
+    const nextPositions = Object.fromEntries(
+      Object.entries(positions).map(([id, position]) => [
+        id,
+        {
+          x: Math.round(position.x + offsetX),
+          y: Math.round(position.y + offsetY)
+        }
+      ])
+    )
+
+    updateNodePositions(nextPositions, currentWorkflow.id)
+    window.setTimeout(() => {
+      scheduleDrawflowConnectionRefresh(null, { all: true })
+      fitCanvas()
+    }, 80)
+    window.setTimeout(() => {
+      scheduleDrawflowConnectionRefresh(null, { all: true })
+      fitCanvas()
+    }, 240)
   }
 
   const resetCanvas = () => {
@@ -4482,10 +4803,22 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
               <Square className="h-4 w-4" />
             </button>
             <div className="aiflow-wf-tool-divider" />
-            <button type="button" title="Undo" disabled className="aiflow-wf-tool-btn">
+            <button
+              type="button"
+              title="Undo"
+              onClick={() => undoWorkflow(workflow.id)}
+              disabled={!canUndo}
+              className="aiflow-wf-tool-btn"
+            >
               <Undo2 className="h-4 w-4" />
             </button>
-            <button type="button" title="Redo" disabled className="aiflow-wf-tool-btn">
+            <button
+              type="button"
+              title="Redo"
+              onClick={() => redoWorkflow(workflow.id)}
+              disabled={!canRedo}
+              className="aiflow-wf-tool-btn"
+            >
               <Redo2 className="h-4 w-4" />
             </button>
             <div className="aiflow-wf-tool-divider" />
@@ -4498,7 +4831,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
             <button type="button" title="Reset zoom" onClick={resetCanvas} className="aiflow-wf-tool-btn">
               <span className="text-[10px] font-medium">{zoomLevel}%</span>
             </button>
-            <button type="button" title="Auto layout" onClick={fitCanvas} className="aiflow-wf-tool-btn">
+            <button type="button" title="Auto layout" onClick={autoLayoutCanvas} disabled={workflow.nodes.length === 0} className="aiflow-wf-tool-btn">
               <LayoutTemplate className="h-4 w-4" />
             </button>
             <button type="button" title="Settings" className="aiflow-wf-tool-btn">

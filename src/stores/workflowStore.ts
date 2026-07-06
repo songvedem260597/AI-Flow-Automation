@@ -3,6 +3,49 @@ import { persist, createJSONStorage, type StateStorage } from 'zustand/middlewar
 import type { Workflow, WorkflowNode, WorkflowEdge, FlowNodeType } from '@/types'
 import { v4 as uuid } from 'uuid'
 
+type WorkflowHistory = {
+  past: Workflow[]
+  future: Workflow[]
+}
+
+const HISTORY_LIMIT = 80
+
+const cloneWorkflow = (workflow: Workflow): Workflow => JSON.parse(JSON.stringify(workflow)) as Workflow
+
+const workflowSnapshotKey = (workflow: Workflow): string =>
+  JSON.stringify({
+    id: workflow.id,
+    name: workflow.name,
+    nodes: workflow.nodes,
+    edges: workflow.edges
+  })
+
+const emptyHistory = (): WorkflowHistory => ({ past: [], future: [] })
+
+const pushWorkflowHistory = (
+  state: Pick<WorkflowState, 'workflows' | 'activeWorkflowId' | 'history'>,
+  workflowId = state.activeWorkflowId
+): Record<string, WorkflowHistory> => {
+  if (!workflowId) return state.history
+  const workflow = state.workflows.find((item) => item.id === workflowId)
+  if (!workflow) return state.history
+
+  const currentHistory = state.history[workflowId] || emptyHistory()
+  const snapshot = cloneWorkflow(workflow)
+  const lastSnapshot = currentHistory.past[currentHistory.past.length - 1]
+  if (lastSnapshot && workflowSnapshotKey(lastSnapshot) === workflowSnapshotKey(snapshot)) {
+    return state.history
+  }
+
+  return {
+    ...state.history,
+    [workflowId]: {
+      past: [...currentHistory.past, snapshot].slice(-HISTORY_LIMIT),
+      future: []
+    }
+  }
+}
+
 /**
  * Promise-based adapter around `chrome.storage.local` implementing the
  * Zustand `StateStorage` contract (signature: getItem/setItem/removeItem
@@ -153,6 +196,7 @@ interface WorkflowState {
   selectedNodeId: string | null
   selectedEdgeId: string | null
   isDirty: boolean
+  history: Record<string, WorkflowHistory>
   hydrateFromStorage: () => Promise<void>
 
   createWorkflow: (name?: string) => Workflow
@@ -165,6 +209,7 @@ interface WorkflowState {
   addNode: (type: FlowNodeType, position: { x: number; y: number }) => WorkflowNode | null
   updateNode: (nodeId: string, data: Partial<WorkflowNode['data']>) => void
   updateNodePosition: (nodeId: string, position: { x: number; y: number }) => void
+  updateNodePositions: (positions: Record<string, { x: number; y: number }>, workflowId?: string) => void
   deleteNode: (nodeId: string) => void
   setSelectedNode: (nodeId: string | null) => void
 
@@ -176,6 +221,10 @@ interface WorkflowState {
   importWorkflow: (workflow: Workflow) => void
   exportWorkflow: (id: string) => Workflow | null
   clearAllWorkflows: () => void
+  undoWorkflow: (workflowId?: string) => void
+  redoWorkflow: (workflowId?: string) => void
+  canUndoWorkflow: (workflowId?: string) => boolean
+  canRedoWorkflow: (workflowId?: string) => boolean
   markDirty: () => void
   markClean: () => void
 }
@@ -236,6 +285,7 @@ export const useWorkflowStore = create<WorkflowState>()(
       selectedNodeId: null,
       selectedEdgeId: null,
       isDirty: false,
+      history: {},
 
       hydrateFromStorage: async () => {
         if (DEBUG_PERSIST()) console.log('[WorkflowPersist][hydrateFromStorage:start]')
@@ -314,7 +364,12 @@ export const useWorkflowStore = create<WorkflowState>()(
             currentCount: get().workflows.length
           }))
         }
-        set((state) => ({ workflows: [...state.workflows, workflow], activeWorkflowId: workflow.id, isDirty: true }))
+        set((state) => ({
+          workflows: [...state.workflows, workflow],
+          activeWorkflowId: workflow.id,
+          history: { ...state.history, [workflow.id]: emptyHistory() },
+          isDirty: true
+        }))
         if (DEBUG_PERSIST()) {
           console.log('[WorkflowPersist][createWorkflow:after]', JSON.stringify({
             nextCount: get().workflows.length,
@@ -327,6 +382,7 @@ export const useWorkflowStore = create<WorkflowState>()(
 
       updateWorkflow: (id, updates) => {
         set((state) => ({
+          history: pushWorkflowHistory(state, id),
           workflows: state.workflows.map((w) =>
             w.id === id ? { ...w, ...updates, updatedAt: Date.now() } : w
           ),
@@ -337,8 +393,10 @@ export const useWorkflowStore = create<WorkflowState>()(
       deleteWorkflow: (id) => {
         set((state) => {
           const workflows = state.workflows.filter((w) => w.id !== id)
+          const { [id]: _deletedHistory, ...history } = state.history
           return {
             workflows,
+            history,
             activeWorkflowId: state.activeWorkflowId === id ? (workflows[0]?.id || null) : state.activeWorkflowId,
             isDirty: true
           }
@@ -355,7 +413,12 @@ export const useWorkflowStore = create<WorkflowState>()(
           createdAt: Date.now(),
           updatedAt: Date.now()
         }
-        set((state) => ({ workflows: [...state.workflows, duplicate], activeWorkflowId: duplicate.id, isDirty: true }))
+        set((state) => ({
+          workflows: [...state.workflows, duplicate],
+          activeWorkflowId: duplicate.id,
+          history: { ...state.history, [duplicate.id]: emptyHistory() },
+          isDirty: true
+        }))
         return duplicate
       },
 
@@ -390,6 +453,7 @@ export const useWorkflowStore = create<WorkflowState>()(
           data: createDefaultNodeData(type) as WorkflowNode['data']
         }
         set((state) => ({
+          history: pushWorkflowHistory(state),
           workflows: state.workflows.map((w) =>
             w.id === state.activeWorkflowId
               ? { ...w, nodes: [...w.nodes, node], updatedAt: Date.now() }
@@ -402,6 +466,7 @@ export const useWorkflowStore = create<WorkflowState>()(
 
       updateNode: (nodeId, data) => {
         set((state) => ({
+          history: pushWorkflowHistory(state),
           workflows: state.workflows.map((w) =>
             w.id === state.activeWorkflowId
               ? {
@@ -418,23 +483,66 @@ export const useWorkflowStore = create<WorkflowState>()(
       },
 
       updateNodePosition: (nodeId, position) => {
-        set((state) => ({
-          workflows: state.workflows.map((w) =>
-            w.id === state.activeWorkflowId
-              ? {
-                  ...w,
-                  nodes: w.nodes.map((n) =>
-                    n.id === nodeId ? { ...n, position } : n
-                  ),
-                  updatedAt: Date.now()
-                }
-              : w
-          )
-        }))
+        set((state) => {
+          const workflow = state.workflows.find((w) => w.id === state.activeWorkflowId)
+          const node = workflow?.nodes.find((n) => n.id === nodeId)
+          if (!workflow || !node) return state
+          if (node.position.x === position.x && node.position.y === position.y) return state
+
+          return {
+            history: pushWorkflowHistory(state),
+            workflows: state.workflows.map((w) =>
+              w.id === state.activeWorkflowId
+                ? {
+                    ...w,
+                    nodes: w.nodes.map((n) =>
+                      n.id === nodeId ? { ...n, position } : n
+                    ),
+                    updatedAt: Date.now()
+                  }
+                : w
+            ),
+            isDirty: true
+          }
+        })
+      },
+
+      updateNodePositions: (positions, workflowId) => {
+        set((state) => {
+          const id = workflowId || state.activeWorkflowId
+          const workflow = state.workflows.find((w) => w.id === id)
+          if (!workflow) return state
+
+          let changed = false
+          const nextNodes = workflow.nodes.map((node) => {
+            const position = positions[node.id]
+            if (!position) return node
+            if (node.position.x === position.x && node.position.y === position.y) return node
+            changed = true
+            return { ...node, position }
+          })
+
+          if (!changed) return state
+
+          return {
+            history: pushWorkflowHistory(state, id),
+            workflows: state.workflows.map((w) =>
+              w.id === id
+                ? {
+                    ...w,
+                    nodes: nextNodes,
+                    updatedAt: Date.now()
+                  }
+                : w
+            ),
+            isDirty: true
+          }
+        })
       },
 
       deleteNode: (nodeId) => {
         set((state) => ({
+          history: pushWorkflowHistory(state),
           workflows: state.workflows.map((w) =>
             w.id === state.activeWorkflowId
               ? {
@@ -455,29 +563,35 @@ export const useWorkflowStore = create<WorkflowState>()(
       },
 
       addEdge: (edge) => {
-        set((state) => ({
-          workflows: state.workflows.map((w) =>
-            w.id === state.activeWorkflowId
-              ? {
-                  ...w,
-                  edges: w.edges.some((existing) =>
-                    existing.source === edge.source &&
-                    existing.target === edge.target &&
-                    existing.sourceHandle === edge.sourceHandle &&
-                    existing.targetHandle === edge.targetHandle
-                  )
-                    ? w.edges
-                    : [...w.edges, { ...edge, id: uuid() }],
-                  updatedAt: Date.now()
-                }
-              : w
-          ),
-          isDirty: true
-        }))
+        set((state) => {
+          const workflow = state.workflows.find((item) => item.id === state.activeWorkflowId)
+          const exists = workflow?.edges.some((existing) =>
+            existing.source === edge.source &&
+            existing.target === edge.target &&
+            existing.sourceHandle === edge.sourceHandle &&
+            existing.targetHandle === edge.targetHandle
+          )
+          if (!workflow || exists) return state
+
+          return {
+            history: pushWorkflowHistory(state),
+            workflows: state.workflows.map((w) =>
+              w.id === state.activeWorkflowId
+                ? {
+                    ...w,
+                    edges: [...w.edges, { ...edge, id: uuid() }],
+                    updatedAt: Date.now()
+                  }
+                : w
+            ),
+            isDirty: true
+          }
+        })
       },
 
       updateEdge: (edgeId, updates) => {
         set((state) => ({
+          history: pushWorkflowHistory(state),
           workflows: state.workflows.map((w) =>
             w.id === state.activeWorkflowId
               ? {
@@ -493,6 +607,7 @@ export const useWorkflowStore = create<WorkflowState>()(
 
       deleteEdge: (edgeId) => {
         set((state) => ({
+          history: pushWorkflowHistory(state),
           workflows: state.workflows.map((w) =>
             w.id === state.activeWorkflowId
               ? { ...w, edges: w.edges.filter((e) => e.id !== edgeId), updatedAt: Date.now() }
@@ -516,6 +631,7 @@ export const useWorkflowStore = create<WorkflowState>()(
               ? state.workflows.map((w, i) => (i === idx ? updated : w))
               : [...state.workflows, updated],
             activeWorkflowId: updated.id,
+            history: { ...state.history, [updated.id]: emptyHistory() },
             isDirty: true
           }
         })
@@ -526,7 +642,87 @@ export const useWorkflowStore = create<WorkflowState>()(
       },
 
       clearAllWorkflows: () => {
-        set({ workflows: [], activeWorkflowId: null, selectedNodeId: null, selectedEdgeId: null, isDirty: true })
+        set({ workflows: [], activeWorkflowId: null, selectedNodeId: null, selectedEdgeId: null, history: {}, isDirty: true })
+      },
+
+      undoWorkflow: (workflowId) => {
+        set((state) => {
+          const id = workflowId || state.activeWorkflowId
+          if (!id) return state
+          const workflow = state.workflows.find((item) => item.id === id)
+          const currentHistory = state.history[id] || emptyHistory()
+          const previous = currentHistory.past[currentHistory.past.length - 1]
+          if (!workflow || !previous) return state
+
+          const nextPast = currentHistory.past.slice(0, -1)
+          const nextFuture = [cloneWorkflow(workflow), ...currentHistory.future].slice(0, HISTORY_LIMIT)
+          const restored = cloneWorkflow(previous)
+          const selectedNodeId = state.selectedNodeId && restored.nodes.some((node) => node.id === state.selectedNodeId)
+            ? state.selectedNodeId
+            : null
+          const selectedEdgeId = state.selectedEdgeId && restored.edges.some((edge) => edge.id === state.selectedEdgeId)
+            ? state.selectedEdgeId
+            : null
+
+          return {
+            workflows: state.workflows.map((item) => item.id === id ? { ...restored, updatedAt: Date.now() } : item),
+            selectedNodeId,
+            selectedEdgeId,
+            history: {
+              ...state.history,
+              [id]: {
+                past: nextPast,
+                future: nextFuture
+              }
+            },
+            isDirty: true
+          }
+        })
+      },
+
+      redoWorkflow: (workflowId) => {
+        set((state) => {
+          const id = workflowId || state.activeWorkflowId
+          if (!id) return state
+          const workflow = state.workflows.find((item) => item.id === id)
+          const currentHistory = state.history[id] || emptyHistory()
+          const next = currentHistory.future[0]
+          if (!workflow || !next) return state
+
+          const nextPast = [...currentHistory.past, cloneWorkflow(workflow)].slice(-HISTORY_LIMIT)
+          const nextFuture = currentHistory.future.slice(1)
+          const restored = cloneWorkflow(next)
+          const selectedNodeId = state.selectedNodeId && restored.nodes.some((node) => node.id === state.selectedNodeId)
+            ? state.selectedNodeId
+            : null
+          const selectedEdgeId = state.selectedEdgeId && restored.edges.some((edge) => edge.id === state.selectedEdgeId)
+            ? state.selectedEdgeId
+            : null
+
+          return {
+            workflows: state.workflows.map((item) => item.id === id ? { ...restored, updatedAt: Date.now() } : item),
+            selectedNodeId,
+            selectedEdgeId,
+            history: {
+              ...state.history,
+              [id]: {
+                past: nextPast,
+                future: nextFuture
+              }
+            },
+            isDirty: true
+          }
+        })
+      },
+
+      canUndoWorkflow: (workflowId) => {
+        const id = workflowId || get().activeWorkflowId
+        return Boolean(id && get().history[id]?.past.length)
+      },
+
+      canRedoWorkflow: (workflowId) => {
+        const id = workflowId || get().activeWorkflowId
+        return Boolean(id && get().history[id]?.future.length)
       },
 
       markDirty: () => set({ isDirty: true }),

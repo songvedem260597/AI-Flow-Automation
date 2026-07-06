@@ -1846,7 +1846,7 @@ const handleGenerate = useCallback(async () => {
           onMouseDown={closePromptSearch}
         >
           <div
-            className="w-full max-w-[920px] overflow-hidden rounded-xl border border-white/10 bg-[#1A1A1A] shadow-2xl"
+            className="w-full max-w-[680px] overflow-hidden rounded-xl border border-white/10 bg-[#1A1A1A] shadow-2xl"
             onMouseDown={(event) => event.stopPropagation()}
           >
             <div className="flex items-center justify-between border-b border-white/[0.06] px-3">
