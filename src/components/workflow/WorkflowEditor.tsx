@@ -5929,9 +5929,8 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
     await openWorkflowEditorWindow(workflow)
   }
 
-  const handleDuplicateWorkflow = async (workflow: Workflow) => {
-    const duplicate = duplicateWorkflow(workflow.id)
-    if (duplicate) await openWorkflowEditorWindow(duplicate)
+  const handleDuplicateWorkflow = (workflow: Workflow) => {
+    duplicateWorkflow(workflow.id)
   }
 
   const handleRenameWorkflow = (workflow: Workflow) => {
@@ -6340,7 +6339,6 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
           role="dialog"
           aria-modal="true"
           aria-labelledby="workflow-rename-title"
-          aria-describedby="workflow-rename-desc"
           className="workflow-confirm-overlay"
           onClick={handleCancelRenameWorkflow}
         >
@@ -6355,9 +6353,6 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
               <h2 id="workflow-rename-title" className="workflow-confirm-title">
                 Rename workflow
               </h2>
-              <p id="workflow-rename-desc" className="workflow-confirm-desc">
-                Choose a new name for this workflow.
-              </p>
               <input
                 ref={renameInputRef}
                 type="text"

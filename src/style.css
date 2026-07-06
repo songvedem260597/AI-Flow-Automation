@@ -2438,22 +2438,32 @@ button.df-node-tag {
 }
 
 .workflow-confirm-modal {
-  width: min(420px, calc(100vw - 32px));
+  width: min(380px, calc(100vw - 32px));
   background: var(--bg-card);
   border: 1px solid rgba(124, 92, 255, 0.35);
-  border-radius: 14px;
+  border-radius: 12px;
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
-  padding: 20px;
+  padding: 14px 16px;
   display: flex;
-  flex-direction: column;
-  gap: 16px;
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
   color: var(--text-primary);
   animation: workflow-confirm-pop 0.18s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
+.workflow-confirm-modal > .workflow-confirm-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.workflow-confirm-modal > .workflow-confirm-actions {
+  flex-shrink: 0;
+}
+
 .workflow-confirm-icon {
-  width: 36px;
-  height: 36px;
+  width: 28px;
+  height: 28px;
   border-radius: 999px;
   background: rgba(239, 68, 68, 0.12);
   border: 1px solid rgba(239, 68, 68, 0.35);
@@ -2465,8 +2475,8 @@ button.df-node-tag {
 }
 
 .workflow-rename-icon {
-  width: 36px;
-  height: 36px;
+  width: 28px;
+  height: 28px;
   border-radius: 999px;
   background: rgba(124, 92, 255, 0.12);
   border: 1px solid rgba(124, 92, 255, 0.35);
@@ -2478,8 +2488,8 @@ button.df-node-tag {
 }
 
 .workflow-rename-input {
-  margin-top: 8px;
-  height: 32px;
+  margin-top: 6px;
+  height: 28px;
   padding: 0 10px;
   border-radius: 8px;
   background: #141414;
@@ -2514,7 +2524,8 @@ button.df-node-tag {
 .workflow-confirm-body {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
+  min-width: 0;
 }
 
 .workflow-confirm-title {
@@ -2529,19 +2540,19 @@ button.df-node-tag {
   font-size: 11px;
   color: var(--text-secondary);
   margin: 0;
-  line-height: 1.45;
+  line-height: 1.4;
 }
 
 .workflow-confirm-actions {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 8px;
+  gap: 6px;
 }
 
 .workflow-confirm-cancel {
-  height: 32px;
-  padding: 0 12px;
+  height: 28px;
+  padding: 0 10px;
   border-radius: 8px;
   background: transparent;
   border: 1px solid var(--border-color);
@@ -2570,8 +2581,8 @@ button.df-node-tag {
 }
 
 .workflow-confirm-delete {
-  height: 32px;
-  padding: 0 14px;
+  height: 28px;
+  padding: 0 12px;
   border-radius: 8px;
   background: var(--accent);
   border: 1px solid var(--accent);
