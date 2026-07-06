@@ -343,19 +343,16 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
     p.name.toLowerCase().includes(projectSearch.toLowerCase())
   )
   const mustOpenFlowHomeForProjectSelection =
-    activeTab === 'gen' &&
     activeGenProvider === 'flow' &&
     !showFlowOverlay &&
     !selectedProject &&
     !isFlowHomeUrl(currentUrl)
   const mustSelectFlowProject =
-    activeTab === 'gen' &&
     activeGenProvider === 'flow' &&
     !showFlowOverlay &&
     !selectedProject &&
     isFlowHomeUrl(currentUrl)
   const shouldShowFlowOpenOverlay =
-    activeTab === 'gen' &&
     activeGenProvider === 'flow' &&
     (showFlowOverlay || mustOpenFlowHomeForProjectSelection)
   const shouldShowProjectPicker =
@@ -397,8 +394,7 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
         onReloadFlowProjects={loadFlowProjects}
       />
       <main className="flex-1 flex flex-col h-full overflow-hidden border-l border-white/5">
-        {activeTab === 'gen' && (
-          <div className="relative h-full">
+        <div className={activeTab === 'gen' ? 'relative h-full' : 'contents'}>
             {shouldShowFlowOpenOverlay && (
               <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 backdrop-blur-sm">
                 <div
@@ -543,13 +539,14 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
               </div>
             )}
 
-            <GenPanel
-              activeGenProvider={activeGenProvider}
-              onProviderChange={setActiveGenProvider}
-              onHideFlowOverlay={() => { setHasFlowTab(true); setShowFlowOverlay(false) }}
-            />
-          </div>
-        )}
+            {activeTab === 'gen' && (
+              <GenPanel
+                activeGenProvider={activeGenProvider}
+                onProviderChange={setActiveGenProvider}
+                onHideFlowOverlay={() => { setHasFlowTab(true); setShowFlowOverlay(false) }}
+              />
+            )}
+        </div>
         {activeTab === 'workflow' && (
           <WorkflowEditor isSidebarOpen={isSidebarOpen} onToggleSidebar={onToggleSidebar} />
         )}
