@@ -1661,7 +1661,7 @@ async function handleChatGPTJobDone(jobId: string, msg: Record<string, unknown>)
 
   let downloaded = 0
   if (job.autoDownload && imageUrls.length > 0) {
-    const folder = job.outputFolder || 'tobyflow-01'
+    const folder = job.outputFolder || 'aiflow-01'
     const timestamp = Date.now()
     for (let i = 0; i < imageUrls.length; i++) {
       try {
@@ -3176,8 +3176,8 @@ async function handlePrepareDownloadRename(entry: RenameQueueEntry): Promise<{ s
   // Collapse multiple underscores
   rawFolder = rawFolder.replace(/_+/g, '_')
 
-  // Default to tobyflow-01 only when folder is empty after sanitization
-  var folderUsed = rawFolder || 'tobyflow-01'
+  // Default to aiflow-01 only when folder is empty after sanitization
+  var folderUsed = rawFolder || 'aiflow-01'
 
   _pendingRenameQueue.push({
     folder: folderUsed,

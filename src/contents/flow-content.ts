@@ -2360,14 +2360,14 @@ async function runFlowPrompt(payload: {
           await safeSendAwait({
             action: 'PREPARE_DOWNLOAD_RENAME',
             payload: {
-              folder: normOutputFolder || 'tobyflow-01',
+              folder: normOutputFolder || 'aiflow-01',
               filename: fileName,
               identifier: tileId,
               resolution: filenameResolution,
               mediaKind: normMode,
             }
           })
-          console.log('[Background][DOWNLOAD_RENAME_PREPARED]', JSON.stringify({ folder: normOutputFolder || 'tobyflow-01', filename: fileName, identifier: tileId, resolution: filenameResolution, mode: normMode, mediaKind: normMode }))
+          console.log('[Background][DOWNLOAD_RENAME_PREPARED]', JSON.stringify({ folder: normOutputFolder || 'aiflow-01', filename: fileName, identifier: tileId, resolution: filenameResolution, mode: normMode, mediaKind: normMode }))
         } catch (_) {}
 
         // Call bridge to download via native menu
@@ -2437,7 +2437,7 @@ async function runFlowPrompt(payload: {
           // chrome-extension://... UI cannot read arbitrary local
           // file paths. UI / downstream always use the absolute URL.
           savedFilename: fileName,
-          outputFolder: normOutputFolder || 'tobyflow-01',
+          outputFolder: normOutputFolder || 'aiflow-01',
           resolution: filenameResolution,
           mode: normMode,
           mediaKind: normMode,
@@ -2517,7 +2517,7 @@ async function runFlowPrompt(payload: {
           index: tileIndex,
           tileId: tileId,
           fileNameFromFlow: tileFileName,
-          outputFolder: normOutputFolder || 'tobyflow-01',
+          outputFolder: normOutputFolder || 'aiflow-01',
           resolution: filenameResolution,
           mode: normMode,
           mediaKind: normMode,

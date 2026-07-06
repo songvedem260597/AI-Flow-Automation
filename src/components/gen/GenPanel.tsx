@@ -5,6 +5,7 @@ import {
   Search, X, FileText, GripVertical
 } from 'lucide-react'
 import { cn, usePersistedState } from '@/lib/utils'
+import { usePromptStore } from '@/stores/dataStore'
 
 // ─── Flow Model Constants ───────────────────────────────────────────────────────
 
@@ -282,7 +283,9 @@ export const GenPanel: React.FC<{
   onProviderChange: (p: string) => void
   onHideFlowOverlay?: () => void
 }> = ({ activeGenProvider, onProviderChange, onHideFlowOverlay }) => {
-  const [prompt, setPrompt] = useState('')
+  const [prompt, setPrompt] = usePersistedState<string>('genpanel.prompt', '')
+  const addPrompt = usePromptStore((s) => s.addPrompt)
+  const savedPrompts = usePromptStore((s) => s.prompts)
   const activeProvider = activeGenProvider as Provider
   const [mode, setMode] = usePersistedState<GenMode>('genpanel.mode', 'image')
   const [imageModel, setImageModel] = usePersistedState<string>('genpanel.imageModel', DEFAULT_FLOW_IMAGE_MODEL)
@@ -358,7 +361,7 @@ export const GenPanel: React.FC<{
   const [quantity, setQuantity] = usePersistedState<number>('genpanel.quantity', 1)
   const [styleId, setStyleId] = usePersistedState<string>('genpanel.styleId', '')
   const [autoDownload, setAutoDownload] = usePersistedState<boolean>('genpanel.autoDownload', true)
-  const [subFolder, setSubFolder] = usePersistedState<string>('genpanel.subFolder', 'tobyflow-01')
+  const [subFolder, setSubFolder] = usePersistedState<string>('genpanel.subFolder', 'aiflow-01')
   const [downloadRes, setDownloadRes] = usePersistedState<string>('genpanel.downloadRes', '2k')
   const [videoDownloadRes, setVideoDownloadRes] = usePersistedState<string>('genpanel.videoDownloadRes', '720p')
   const [refImages, setRefImages] = useState<RefImage[]>([])
@@ -368,6 +371,12 @@ export const GenPanel: React.FC<{
   // Pending upload store: maps upload_xxx key → real File object
   const [pendingUploads, setPendingUploads] = useState<Record<string, File>>({})
   const [isDragging, setIsDragging] = useState(false)
+
+  useEffect(() => {
+    if (/toby[_-]?flow/i.test(subFolder)) {
+      setSubFolder(subFolder.replace(/toby[_-]?flow/gi, 'aiflow'))
+    }
+  }, [subFolder, setSubFolder])
 
   useEffect(() => {
     if (!activeVideoDurationOptions.includes(videoDuration)) {
@@ -387,6 +396,9 @@ export const GenPanel: React.FC<{
   const [failedPrompts, setFailedPrompts] = useState<string[]>([])
   const [promptQueue, setPromptQueue] = useState<PromptRun[]>([])
   const [runAbortController, setRunAbortController] = useState<AbortController | null>(null)
+  const [promptSaveStatus, setPromptSaveStatus] = useState<'idle' | 'saved'>('idle')
+  const [promptSearchQuery, setPromptSearchQuery] = useState('')
+  const [promptSearchTab, setPromptSearchTab] = useState<'my' | 'template'>('my')
 
   // ── Multi-Prompt Types ────────────────────────────────────────────────────────
   type PromptRunStatus = 'pending' | 'running' | 'success' | 'partial' | 'failed'
@@ -430,8 +442,71 @@ export const GenPanel: React.FC<{
     }
   }, [mode, imageModel, videoModel, aspectRatio, quantity, videoDuration])
 
-  const prompts = prompt.split(/\n\n+/).filter((p) => p.trim())
+  const prompts = prompt.split(/\n\n+/).map((p) => p.trim()).filter(Boolean)
   const promptWordCount = prompt.trim().split(/\s+/).filter(Boolean).length
+  const canSaveCurrentPrompt = prompts.length === 1
+  const normalizedPromptSearch = promptSearchQuery.trim().toLowerCase()
+  const filteredSavedPrompts = savedPrompts.filter((savedPrompt) => {
+    if (!normalizedPromptSearch) return true
+    return (
+      savedPrompt.name.toLowerCase().includes(normalizedPromptSearch) ||
+      savedPrompt.content.toLowerCase().includes(normalizedPromptSearch)
+    )
+  })
+  const saveCurrentPromptTitle =
+    prompts.length === 0
+      ? 'Enter one prompt to save'
+      : prompts.length > 1
+        ? 'Only one prompt can be saved'
+        : promptSaveStatus === 'saved'
+          ? 'Prompt saved'
+          : 'Save current prompt'
+
+  // ── Auto-detect multi-prompt ──────────────────────────────────────────────────
+  // Keep the toggle aligned with the actual non-empty prompt blocks, so it
+  // turns back off after the user deletes a block.
+  useEffect(() => {
+    const shouldUseMultiPrompt = activeProvider === 'flow' && prompts.length >= 2
+    if (multiPrompt !== shouldUseMultiPrompt) {
+      setMultiPrompt(shouldUseMultiPrompt)
+    }
+  }, [prompts.length, multiPrompt, activeProvider, setMultiPrompt])
+
+  const handleSaveCurrentPrompt = useCallback(() => {
+    const blocks = prompt.split(/\n\n+/).map((p) => p.trim()).filter(Boolean)
+    if (blocks.length !== 1) return
+
+    const content = blocks[0]
+    const firstLine = content.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || content
+    const name = firstLine.length > 48 ? `${firstLine.slice(0, 45).trim()}...` : firstLine
+    const provider = activeProvider === 'flow' ? 'google-flow' : 'chatgpt'
+
+    addPrompt({
+      name,
+      content,
+      provider,
+      tags: ['gen']
+    })
+
+    setPromptSaveStatus('saved')
+    window.setTimeout(() => setPromptSaveStatus('idle'), 1200)
+  }, [activeProvider, addPrompt, prompt])
+
+  const openPromptSearch = useCallback(() => {
+    setPromptSearchTab('my')
+    setPromptSearchQuery('')
+    setShowSearch(true)
+  }, [])
+
+  const closePromptSearch = useCallback(() => {
+    setShowSearch(false)
+    setPromptSearchQuery('')
+  }, [])
+
+  const applySavedPrompt = useCallback((content: string) => {
+    setPrompt(content)
+    closePromptSearch()
+  }, [closePromptSearch, setPrompt])
 
   // ── Reference image data model ────────────────────────────────────────────────
   interface RefImage {
@@ -929,7 +1004,7 @@ const handleGenerate = useCallback(async () => {
   const promptTexts = prompt.split(/\n\n+/).map(p => p.trim()).filter(Boolean)
 
   // ── Multi-prompt path: flow + 2+ blocks ────────────────────────────────────
-  if (multiPrompt && activeProvider === 'flow' && promptTexts.length >= 2) {
+  if (activeProvider === 'flow' && promptTexts.length >= 2) {
     await runPromptQueue(promptTexts)
     return
   }
@@ -1204,7 +1279,7 @@ const handleGenerate = useCallback(async () => {
 }, [prompt, multiPrompt, activeProvider, isGenerating, runPromptQueue, mode, aspectRatio, quantity, videoDuration, imageModel, videoModel, refImages, pendingUploads, frameFileIds, styleId, subFolder, autoDownload, downloadRes, videoDownloadRes])
 
   return (
-    <div className="flex flex-col h-full bg-[#0A0A0A]">
+    <div className="relative flex flex-col h-full bg-[#0A0A0A]">
       {/* Scrollable content */}
       <div className="flex-1 overflow-y-auto">
 
@@ -1243,7 +1318,8 @@ const handleGenerate = useCallback(async () => {
             {/* Prompt toolbar */}
             <div className="flex items-center gap-1 px-2 py-1.5 bg-[#1A1A1A] border-t border-white/5">
               <button
-                onClick={() => setShowSearch(!showSearch)}
+                type="button"
+                onClick={openPromptSearch}
                 className="p-1.5 rounded-lg text-white/30 hover:text-white hover:bg-white/5 transition-colors"
                 title="Search prompt"
               >
@@ -1275,8 +1351,17 @@ const handleGenerate = useCallback(async () => {
                 }
               }} />
               <button
-                className="ml-auto p-1.5 rounded-lg text-white/30 hover:text-white hover:bg-white/5 transition-colors"
-                title="Save current prompt"
+                type="button"
+                onClick={handleSaveCurrentPrompt}
+                disabled={!canSaveCurrentPrompt}
+                className={cn(
+                  'ml-auto p-1.5 rounded-lg transition-colors',
+                  canSaveCurrentPrompt
+                    ? 'text-white/30 hover:text-white hover:bg-white/5'
+                    : 'cursor-not-allowed text-white/15',
+                  promptSaveStatus === 'saved' && 'bg-[#7C5CFF]/10 text-[#9B82FF]'
+                )}
+                title={saveCurrentPromptTitle}
               >
                 <Bookmark className="w-4 h-4" />
               </button>
@@ -1447,17 +1532,11 @@ const handleGenerate = useCallback(async () => {
                 </svg>
                 <label className="text-[11px] font-medium text-white/50">Reference Images</label>
               </div>
-            <button
-              onClick={() => setShowSearch(!showSearch)}
-              className="p-1 rounded-lg text-white/30 hover:text-white hover:bg-white/5 transition-colors ml-auto"
-              title="Search..."
-            >
-              <Search className="w-3.5 h-3.5" />
-            </button>
             {activeProvider === 'flow' && (
               <CompactDropdown
                 value={refMode}
                 onChange={setRefMode}
+                className="ml-auto"
                 options={[
                   { value: 'all', label: 'All' },
                   { value: 'mention', label: '@Mention' },
@@ -1466,6 +1545,13 @@ const handleGenerate = useCallback(async () => {
                 ]}
               />
             )}
+            <button
+              onClick={() => setShowSearch(!showSearch)}
+              className="p-1 rounded-lg text-white/30 hover:text-white hover:bg-white/5 transition-colors"
+              title="Search..."
+            >
+              <Search className="w-3.5 h-3.5" />
+            </button>
           </div>
 
           {/* Upload bar */}
@@ -1753,6 +1839,105 @@ const handleGenerate = useCallback(async () => {
           )}
         </button>
       </div>
+
+      {showSearch && (
+        <div
+          className="absolute inset-0 z-50 flex items-center justify-center bg-black/55 p-6 backdrop-blur-[2px]"
+          onMouseDown={closePromptSearch}
+        >
+          <div
+            className="w-full max-w-[920px] overflow-hidden rounded-xl border border-white/10 bg-[#1A1A1A] shadow-2xl"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-white/[0.06] px-3">
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => setPromptSearchTab('my')}
+                  className={cn(
+                    'h-10 px-3 text-xs font-semibold transition-colors',
+                    promptSearchTab === 'my'
+                      ? 'border-b-2 border-white text-white/85'
+                      : 'border-b-2 border-transparent text-white/35 hover:text-white/65'
+                  )}
+                >
+                  My Prompts
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPromptSearchTab('template')}
+                  className={cn(
+                    'h-10 px-3 text-xs font-semibold transition-colors',
+                    promptSearchTab === 'template'
+                      ? 'border-b-2 border-white text-white/85'
+                      : 'border-b-2 border-transparent text-white/35 hover:text-white/65'
+                  )}
+                >
+                  Template
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={closePromptSearch}
+                className="flex h-9 w-9 items-center justify-center rounded-lg text-white/35 transition-colors hover:bg-white/[0.06] hover:text-white"
+                title="Close"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="p-3">
+              <div className="relative">
+                <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-white/25" />
+                <input
+                  autoFocus
+                  value={promptSearchQuery}
+                  onChange={(event) => setPromptSearchQuery(event.target.value)}
+                  placeholder="Search my prompts..."
+                  className="h-9 w-full rounded-lg border border-white/[0.08] bg-[#141414] pl-9 pr-3 text-xs text-white/70 outline-none placeholder:text-white/25 focus:border-[#7C5CFF]/60"
+                />
+              </div>
+
+              <div className="mt-3 max-h-[360px] min-h-[150px] overflow-y-auto rounded-lg border border-white/[0.06] bg-[#161616]">
+                {promptSearchTab === 'template' ? (
+                  <div className="flex min-h-[150px] flex-col items-center justify-center text-white/30">
+                    <FileText className="mb-2 h-7 w-7" />
+                    <p className="text-xs">No templates yet.</p>
+                  </div>
+                ) : filteredSavedPrompts.length === 0 ? (
+                  <div className="flex min-h-[150px] flex-col items-center justify-center text-white/30">
+                    <FileText className="mb-2 h-7 w-7" />
+                    <p className="text-xs">
+                      {savedPrompts.length === 0
+                        ? 'No prompts yet. Click "Save current prompt" to get started.'
+                        : 'No prompts matched your search.'}
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-1 p-2">
+                    {filteredSavedPrompts.map((savedPrompt) => (
+                      <button
+                        key={savedPrompt.id}
+                        type="button"
+                        onClick={() => applySavedPrompt(savedPrompt.content)}
+                        className="w-full rounded-lg border border-transparent px-3 py-2 text-left transition-colors hover:border-white/[0.08] hover:bg-white/[0.04]"
+                      >
+                        <div className="flex items-center gap-2">
+                          <p className="min-w-0 flex-1 truncate text-xs font-semibold text-white/75">{savedPrompt.name}</p>
+                          <span className="shrink-0 rounded-md bg-white/[0.05] px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-white/30">
+                            {savedPrompt.provider}
+                          </span>
+                        </div>
+                        <p className="mt-1 line-clamp-2 text-[10px] leading-relaxed text-white/35">{savedPrompt.content}</p>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

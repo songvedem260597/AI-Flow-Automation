@@ -2967,7 +2967,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
 
   const handleCanvasContextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement | null
-    if (target?.closest('.tobyflow-node-picker, .tobyflow-wf-toolbar, button, input, textarea, select')) return
+    if (target?.closest('.aiflow-node-picker, .aiflow-wf-toolbar, button, input, textarea, select')) return
 
     event.preventDefault()
     event.stopPropagation()
@@ -3575,7 +3575,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       if (el.closest('.drawflow-node')) return true
       if (el.closest('.input, .output, .main-path, svg.connection')) return true
       if (el.closest('button, [role="button"], input, textarea, select, [contenteditable="true"]')) return true
-      if (el.closest('.tobyflow-node-picker, .df-node-prompt-editor, .df-node-resize-handle, .df-port-icon')) return true
+      if (el.closest('.aiflow-node-picker, .df-node-prompt-editor, .df-node-resize-handle, .df-port-icon')) return true
       return false
     }
 
@@ -4132,7 +4132,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     }
     const zoomOnWheel = (event: WheelEvent) => {
       const target = event.target as HTMLElement | null
-      if (target?.closest('.tobyflow-node-picker, input, textarea, select')) return
+      if (target?.closest('.aiflow-node-picker, input, textarea, select')) return
       if (event.ctrlKey) {
         refreshZoom()
         scheduleConnectionSync()
@@ -4452,7 +4452,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
           <div className="pointer-events-none absolute inset-0 opacity-[0.32] [background-image:radial-gradient(circle,rgba(255,255,255,0.12)_1px,transparent_1px)] [background-size:22px_22px]" />
           <div ref={canvasRef} className="ai-drawflow-canvas absolute inset-0" />
 
-          <div className="tobyflow-wf-toolbar">
+          <div className="aiflow-wf-toolbar">
             <button
               type="button"
               title="Add node"
@@ -4460,7 +4460,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
                 if (isPaletteOpen) closeNodePicker()
                 else openNodePicker()
               }}
-              className={cn('tobyflow-wf-tool-btn', isPaletteOpen && 'active')}
+              className={cn('aiflow-wf-tool-btn', isPaletteOpen && 'active')}
             >
               <Plus className="h-4 w-4" />
             </button>
@@ -4469,7 +4469,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
               title={isRunning ? (isPaused ? 'Resume workflow' : 'Pause workflow') : 'Run workflow'}
               onClick={handleRun}
               disabled={workflow.nodes.length === 0}
-              className="tobyflow-wf-tool-btn"
+              className="aiflow-wf-tool-btn"
             >
               {isRunning && !isPaused ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
             </button>
@@ -4477,34 +4477,34 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
               type="button"
               title="Stop workflow"
               onClick={handleStop}
-              className={cn('tobyflow-wf-tool-btn', !isRunning && 'hidden')}
+              className={cn('aiflow-wf-tool-btn', !isRunning && 'hidden')}
             >
               <Square className="h-4 w-4" />
             </button>
-            <div className="tobyflow-wf-tool-divider" />
-            <button type="button" title="Undo" disabled className="tobyflow-wf-tool-btn">
+            <div className="aiflow-wf-tool-divider" />
+            <button type="button" title="Undo" disabled className="aiflow-wf-tool-btn">
               <Undo2 className="h-4 w-4" />
             </button>
-            <button type="button" title="Redo" disabled className="tobyflow-wf-tool-btn">
+            <button type="button" title="Redo" disabled className="aiflow-wf-tool-btn">
               <Redo2 className="h-4 w-4" />
             </button>
-            <div className="tobyflow-wf-tool-divider" />
-            <button type="button" title="Console" onClick={() => setShowLogs(!showLogs)} className={cn('tobyflow-wf-tool-btn', showLogs && 'active')}>
+            <div className="aiflow-wf-tool-divider" />
+            <button type="button" title="Console" onClick={() => setShowLogs(!showLogs)} className={cn('aiflow-wf-tool-btn', showLogs && 'active')}>
               <List className="h-4 w-4" />
             </button>
-            <button type="button" title="Fit view" onClick={fitCanvas} className="tobyflow-wf-tool-btn">
+            <button type="button" title="Fit view" onClick={fitCanvas} className="aiflow-wf-tool-btn">
               <Maximize2 className="h-4 w-4" />
             </button>
-            <button type="button" title="Reset zoom" onClick={resetCanvas} className="tobyflow-wf-tool-btn">
+            <button type="button" title="Reset zoom" onClick={resetCanvas} className="aiflow-wf-tool-btn">
               <span className="text-[10px] font-medium">{zoomLevel}%</span>
             </button>
-            <button type="button" title="Auto layout" onClick={fitCanvas} className="tobyflow-wf-tool-btn">
+            <button type="button" title="Auto layout" onClick={fitCanvas} className="aiflow-wf-tool-btn">
               <LayoutTemplate className="h-4 w-4" />
             </button>
-            <button type="button" title="Settings" className="tobyflow-wf-tool-btn">
+            <button type="button" title="Settings" className="aiflow-wf-tool-btn">
               <Settings2 className="h-4 w-4" />
             </button>
-            <button type="button" title="Export workflow" onClick={() => downloadWorkflowJson(workflow)} className="tobyflow-wf-tool-btn">
+            <button type="button" title="Export workflow" onClick={() => downloadWorkflowJson(workflow)} className="aiflow-wf-tool-btn">
               <FileDown className="h-4 w-4" />
             </button>
           </div>
@@ -4512,20 +4512,20 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
           {isPaletteOpen && (
             <div
               ref={nodePickerRef}
-              className={cn('tobyflow-node-picker', nodePickerPosition ? '' : 'left-[64px] top-1/2 -translate-y-1/2')}
+              className={cn('aiflow-node-picker', nodePickerPosition ? '' : 'left-[64px] top-1/2 -translate-y-1/2')}
               style={nodePickerPosition ? { left: nodePickerPosition.x, top: nodePickerPosition.y } : undefined}
             >
-              <div className="tobyflow-node-picker-context-hint tobyflow-node-picker-context-hint--no-text">
+              <div className="aiflow-node-picker-context-hint aiflow-node-picker-context-hint--no-text">
                 <button
                   type="button"
                   title="Close"
                   onClick={closeNodePicker}
-                  className="tobyflow-node-picker-close"
+                  className="aiflow-node-picker-close"
                 >
                   <X className="h-3.5 w-3.5" />
                 </button>
               </div>
-              <div className="tobyflow-node-picker-search">
+              <div className="aiflow-node-picker-search">
                 <input
                   value={nodePickerSearch}
                   onChange={(event) => setNodePickerSearch(event.target.value)}
@@ -4550,10 +4550,10 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
                   }}
                   autoFocus
                   placeholder="Search nodes..."
-                  className="tobyflow-node-picker-input nodrag"
+                  className="aiflow-node-picker-input nodrag"
                 />
               </div>
-              <div className="tobyflow-node-picker-list">
+              <div className="aiflow-node-picker-list">
                 {pickerItems.map((node, index) => (
                   <button
                     type="button"
@@ -4562,14 +4562,14 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
                       handleAddNode(node.type)
                       closeNodePicker()
                     }}
-                    className={cn('tobyflow-node-picker-item', index === selectedPickerIndex && 'selected')}
+                    className={cn('aiflow-node-picker-item', index === selectedPickerIndex && 'selected')}
                   >
                     <span className={cn('node-palette-item-icon df-node-icon', nodeMeta(node.type).color)}>
                       {node.icon}
                     </span>
-                    <span className="tobyflow-node-picker-info">
-                      <span className="tobyflow-node-picker-name">{node.label}</span>
-                      <span className="tobyflow-node-picker-desc">{node.description}</span>
+                    <span className="aiflow-node-picker-info">
+                      <span className="aiflow-node-picker-name">{node.label}</span>
+                      <span className="aiflow-node-picker-desc">{node.description}</span>
                     </span>
                   </button>
                 ))}
@@ -4577,7 +4577,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
                   <div className="px-3 py-8 text-center text-[11px] text-white/35">No matching nodes</div>
                 )}
               </div>
-              <div className="tobyflow-node-picker-footer">
+              <div className="aiflow-node-picker-footer">
                 <kbd>↑↓</kbd> Move &nbsp; <kbd>Enter</kbd> Select &nbsp; <kbd>Esc</kbd> Close
               </div>
             </div>
@@ -5135,15 +5135,15 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
 
       {view === 'templates' && (
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-hidden p-4">
-          <div className="flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2 overflow-x-auto">
+          <div className="flex items-center gap-3">
+            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
               {templateCategories.map((category) => (
                 <button
                   type="button"
                   key={category}
                   onClick={() => setTemplateCategory(category)}
                   className={cn(
-                    'h-8 rounded-lg px-3 text-[11px] font-medium transition-colors',
+                    'h-8 shrink-0 rounded-lg px-3 text-[11px] font-medium transition-colors',
                     templateCategory === category
                       ? 'bg-[#7C5CFF]/15 text-[#B8A8FF]'
                       : 'bg-white/[0.04] text-white/45 hover:bg-white/[0.07] hover:text-white/75'

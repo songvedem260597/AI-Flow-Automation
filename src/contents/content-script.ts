@@ -2153,7 +2153,7 @@ const AIFlowContentScript = {
     log,
   }) {
 
-    // 1. Image-mode + ratio. TobyFlow sends the raw prompt when ChatGPT image
+    // 1. Image-mode + ratio. AIFlow sends the raw prompt when ChatGPT image
     //    mode can be activated; only fallback to prefixing the prompt if the
     //    Create image tool cannot be toggled on.
     let promptToSubmit = prompt
@@ -4118,7 +4118,7 @@ const AIFlowContentScript = {
   },
 
   async chatgptEnableImageMode() {
-    // TobyFlow behavior: if ratio control is visible, image mode is already
+    // AIFlow behavior: if ratio control is visible, image mode is already
     // active. Do not click "Create image" again, because that can toggle it off.
     if (this.chatgptFindRatioButton()) return true
 

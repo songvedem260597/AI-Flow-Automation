@@ -312,8 +312,8 @@ input::placeholder, textarea::placeholder {
   font-weight: 600;
 }
 
-/* TobyFlow-style workflow editor */
-.tobyflow-wf-toolbar {
+/* AIFlow-style workflow editor */
+.aiflow-wf-toolbar {
   position: absolute;
   left: 8px;
   top: 50%;
@@ -329,7 +329,7 @@ input::placeholder, textarea::placeholder {
   box-shadow: 0 6px 22px rgba(0, 0, 0, 0.35);
 }
 
-.tobyflow-wf-tool-btn {
+.aiflow-wf-tool-btn {
   width: 36px;
   height: 36px;
   display: flex;
@@ -343,26 +343,26 @@ input::placeholder, textarea::placeholder {
   transition: background 0.15s ease, color 0.15s ease, opacity 0.15s ease;
 }
 
-.tobyflow-wf-tool-btn:hover,
-.tobyflow-wf-tool-btn.active {
+.aiflow-wf-tool-btn:hover,
+.aiflow-wf-tool-btn.active {
   background: #2e2e33;
   color: #e8e8ea;
 }
 
-.tobyflow-wf-tool-btn:disabled {
+.aiflow-wf-tool-btn:disabled {
   opacity: 0.35;
   cursor: not-allowed;
   pointer-events: none;
 }
 
-.tobyflow-wf-tool-divider {
+.aiflow-wf-tool-divider {
   width: 24px;
   height: 1px;
   background: rgba(255, 255, 255, 0.08);
   margin: 2px auto;
 }
 
-.tobyflow-node-picker {
+.aiflow-node-picker {
   position: absolute;
   width: 320px;
   max-height: min(520px, calc(100% - 96px));
@@ -374,7 +374,7 @@ input::placeholder, textarea::placeholder {
   overflow: hidden;
 }
 
-.tobyflow-node-picker-context-hint {
+.aiflow-node-picker-context-hint {
   padding: 8px 12px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   font-size: 11px;
@@ -385,12 +385,12 @@ input::placeholder, textarea::placeholder {
   gap: 6px;
 }
 
-.tobyflow-node-picker-context-hint--no-text {
+.aiflow-node-picker-context-hint--no-text {
   padding: 4px 6px 4px 12px;
   justify-content: flex-end;
 }
 
-.tobyflow-node-picker-close {
+.aiflow-node-picker-close {
   flex-shrink: 0;
   width: 22px;
   height: 22px;
@@ -407,17 +407,17 @@ input::placeholder, textarea::placeholder {
   transition: background 0.15s ease, color 0.15s ease;
 }
 
-.tobyflow-node-picker-close:hover {
+.aiflow-node-picker-close:hover {
   background: rgba(255, 255, 255, 0.08);
   color: #e8e8ea;
 }
 
-.tobyflow-node-picker-search {
+.aiflow-node-picker-search {
   padding: 8px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
-.tobyflow-node-picker-input {
+.aiflow-node-picker-input {
   width: 100%;
   background: #1c1c1f;
   color: #e8e8ea;
@@ -429,17 +429,17 @@ input::placeholder, textarea::placeholder {
   box-sizing: border-box;
 }
 
-.tobyflow-node-picker-input:focus {
+.aiflow-node-picker-input:focus {
   border-color: rgba(255, 255, 255, 0.14);
 }
 
-.tobyflow-node-picker-list {
+.aiflow-node-picker-list {
   max-height: 280px;
   overflow-y: auto;
   padding: 4px;
 }
 
-.tobyflow-node-picker-item {
+.aiflow-node-picker-item {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -455,12 +455,12 @@ input::placeholder, textarea::placeholder {
   font-family: inherit;
 }
 
-.tobyflow-node-picker-item:hover,
-.tobyflow-node-picker-item.selected {
+.aiflow-node-picker-item:hover,
+.aiflow-node-picker-item.selected {
   background: #252529;
 }
 
-.tobyflow-node-picker-info {
+.aiflow-node-picker-info {
   flex: 1;
   min-width: 0;
   display: flex;
@@ -468,13 +468,13 @@ input::placeholder, textarea::placeholder {
   gap: 2px;
 }
 
-.tobyflow-node-picker-name {
+.aiflow-node-picker-name {
   font-size: 12px;
   font-weight: 500;
   color: #e8e8ea;
 }
 
-.tobyflow-node-picker-desc {
+.aiflow-node-picker-desc {
   font-size: 10px;
   color: #8b8b92;
   white-space: nowrap;
@@ -482,14 +482,14 @@ input::placeholder, textarea::placeholder {
   text-overflow: ellipsis;
 }
 
-.tobyflow-node-picker-footer {
+.aiflow-node-picker-footer {
   padding: 6px 10px;
   border-top: 1px solid rgba(255, 255, 255, 0.08);
   font-size: 10px;
   color: #6b6b73;
 }
 
-.tobyflow-node-picker-footer kbd {
+.aiflow-node-picker-footer kbd {
   background: #1c1c1f;
   padding: 1px 4px;
   border-radius: 3px;
@@ -497,7 +497,7 @@ input::placeholder, textarea::placeholder {
   color: #a1a1aa;
 }
 
-.tobyflow-node-picker-port-tag {
+.aiflow-node-picker-port-tag {
   display: inline-flex;
   align-items: center;
   padding: 2px 8px;
@@ -509,9 +509,9 @@ input::placeholder, textarea::placeholder {
   text-transform: capitalize;
 }
 
-.tobyflow-node-picker-port-tag[data-port-type="text"] { background: #6f8bf7; }
-.tobyflow-node-picker-port-tag[data-port-type="image"] { background: #3b82f6; }
-.tobyflow-node-picker-port-tag[data-port-type="any"] { background: #71717a; }
+.aiflow-node-picker-port-tag[data-port-type="text"] { background: #6f8bf7; }
+.aiflow-node-picker-port-tag[data-port-type="image"] { background: #3b82f6; }
+.aiflow-node-picker-port-tag[data-port-type="any"] { background: #71717a; }
 
 .node-palette-item-icon {
   width: 24px;
@@ -1876,13 +1876,13 @@ svg.ai-edge-completed path,
   to { stroke-dashoffset: -14; }
 }
 
-/* Workflow canvas typography: sync with Gen tab, keep only workflow layout from TobyFlow. */
+/* Workflow canvas typography: sync with Gen tab, keep only workflow layout from AIFlow. */
 .ai-drawflow-canvas,
 .ai-drawflow-canvas *,
-.tobyflow-node-picker,
-.tobyflow-node-picker *,
-.tobyflow-wf-toolbar,
-.tobyflow-wf-toolbar * {
+.aiflow-node-picker,
+.aiflow-node-picker *,
+.aiflow-wf-toolbar,
+.aiflow-wf-toolbar * {
   font-family: inherit;
   letter-spacing: 0;
 }
@@ -1993,47 +1993,47 @@ button.df-node-tag {
   letter-spacing: 0;
 }
 
-.tobyflow-node-picker-input {
+.aiflow-node-picker-input {
   font-size: 11px;
   color: rgba(255, 255, 255, 0.6);
 }
 
-.tobyflow-node-picker-name {
+.aiflow-node-picker-name {
   font-size: 11px;
   font-weight: 500;
   color: rgba(255, 255, 255, 0.72);
 }
 
-.tobyflow-node-picker-desc {
+.aiflow-node-picker-desc {
   font-size: 10px;
   font-weight: 400;
   color: rgba(255, 255, 255, 0.3);
 }
 
-.tobyflow-node-picker-footer,
-.tobyflow-node-picker-footer kbd {
+.aiflow-node-picker-footer,
+.aiflow-node-picker-footer kbd {
   font-size: 10px;
   font-weight: 400;
 }
 
-.tobyflow-node-picker-port-tag {
+.aiflow-node-picker-port-tag {
   font-size: 10px;
   font-weight: 500;
 }
 
-/* Workflow app palette: keep TobyFlow mechanics, replace its bright colors with the app theme. */
-.tobyflow-wf-toolbar {
+/* Workflow app palette: keep AIFlow mechanics, replace its bright colors with the app theme. */
+.aiflow-wf-toolbar {
   background: rgba(20, 20, 20, 0.96);
   border-color: rgba(255, 255, 255, 0.07);
   box-shadow: 0 12px 30px rgba(0, 0, 0, 0.38);
 }
 
-.tobyflow-wf-tool-btn {
+.aiflow-wf-tool-btn {
   color: rgba(255, 255, 255, 0.42);
 }
 
-.tobyflow-wf-tool-btn:hover,
-.tobyflow-wf-tool-btn.active {
+.aiflow-wf-tool-btn:hover,
+.aiflow-wf-tool-btn.active {
   background: rgba(124, 92, 255, 0.12);
   color: #B8A8FF;
 }
@@ -2042,80 +2042,80 @@ button.df-node-tag {
    filled purple tile so it reads as the workflow editor's main action,
    mirroring how the Play button stands out on the other side of the
    toolbar. Stays subtle enough not to compete with the canvas. */
-.tobyflow-wf-toolbar > .tobyflow-wf-tool-btn:first-child {
+.aiflow-wf-toolbar > .aiflow-wf-tool-btn:first-child {
   background: rgba(124, 92, 255, 0.18);
   border: 1px solid rgba(124, 92, 255, 0.45);
   color: #C8BAFF;
 }
 
-.tobyflow-wf-toolbar > .tobyflow-wf-tool-btn:first-child:hover,
-.tobyflow-wf-toolbar > .tobyflow-wf-tool-btn:first-child.active {
+.aiflow-wf-toolbar > .aiflow-wf-tool-btn:first-child:hover,
+.aiflow-wf-toolbar > .aiflow-wf-tool-btn:first-child.active {
   background: rgba(124, 92, 255, 0.32);
   border-color: rgba(124, 92, 255, 0.65);
   color: #FFFFFF;
 }
 
-.tobyflow-node-picker {
+.aiflow-node-picker {
   background: rgba(22, 22, 22, 0.98);
   border-color: rgba(255, 255, 255, 0.08);
   box-shadow: 0 18px 45px rgba(0, 0, 0, 0.46);
 }
 
-.tobyflow-node-picker-context-hint,
-.tobyflow-node-picker-search,
-.tobyflow-node-picker-footer {
+.aiflow-node-picker-context-hint,
+.aiflow-node-picker-search,
+.aiflow-node-picker-footer {
   background: transparent;
   border-color: rgba(255, 255, 255, 0.06);
 }
 
-.tobyflow-node-picker-close {
+.aiflow-node-picker-close {
   color: rgba(255, 255, 255, 0.38);
 }
 
-.tobyflow-node-picker-close:hover {
+.aiflow-node-picker-close:hover {
   background: rgba(124, 92, 255, 0.1);
   color: #B8A8FF;
 }
 
-.tobyflow-node-picker-input {
+.aiflow-node-picker-input {
   background: #101010;
   border-color: rgba(255, 255, 255, 0.06);
   color: rgba(255, 255, 255, 0.68);
 }
 
-.tobyflow-node-picker-input:focus {
+.aiflow-node-picker-input:focus {
   border-color: rgba(124, 92, 255, 0.55);
   box-shadow: 0 0 0 1px rgba(124, 92, 255, 0.18);
 }
 
-.tobyflow-node-picker-item {
+.aiflow-node-picker-item {
   color: rgba(255, 255, 255, 0.76);
 }
 
-.tobyflow-node-picker-item:hover,
-.tobyflow-node-picker-item.selected {
+.aiflow-node-picker-item:hover,
+.aiflow-node-picker-item.selected {
   background: rgba(124, 92, 255, 0.1);
   box-shadow: inset 0 0 0 1px rgba(124, 92, 255, 0.12);
 }
 
-.tobyflow-node-picker-name {
+.aiflow-node-picker-name {
   color: rgba(255, 255, 255, 0.78);
 }
 
-.tobyflow-node-picker-desc,
-.tobyflow-node-picker-footer {
+.aiflow-node-picker-desc,
+.aiflow-node-picker-footer {
   color: rgba(255, 255, 255, 0.34);
 }
 
-.tobyflow-node-picker-footer kbd {
+.aiflow-node-picker-footer kbd {
   background: rgba(255, 255, 255, 0.06);
   color: rgba(255, 255, 255, 0.5);
 }
 
-.tobyflow-node-picker-port-tag,
-.tobyflow-node-picker-port-tag[data-port-type="text"],
-.tobyflow-node-picker-port-tag[data-port-type="image"],
-.tobyflow-node-picker-port-tag[data-port-type="any"] {
+.aiflow-node-picker-port-tag,
+.aiflow-node-picker-port-tag[data-port-type="text"],
+.aiflow-node-picker-port-tag[data-port-type="image"],
+.aiflow-node-picker-port-tag[data-port-type="any"] {
   background: rgba(124, 92, 255, 0.14);
   border-color: rgba(124, 92, 255, 0.28);
   color: #C7BBFF;
