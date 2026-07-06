@@ -133,24 +133,26 @@ async function readFlowProjectsFromActiveTab(): Promise<FlowProject[]> {
   }
 }
 
-async function clickFlowProject(project: FlowProject) {
+async function navigateToFlowProject(project: FlowProject) {
   try {
     const activeTabs = await chrome.tabs.query({ active: true, currentWindow: true })
     const activeTab = activeTabs[0]
+    const allTabs = await chrome.tabs.query({})
+    const targetTab = activeTab?.id && isAnyFlowUrl(activeTab.url)
+      ? activeTab
+      : allTabs.find(t => t.id && isAnyFlowUrl(t.url))
 
-    if (!activeTab?.id || !isFlowHomeUrl(activeTab.url)) return
+    const relativeHref = project.href || `/fx/vi/tools/flow/project/${project.id}`
+    const targetUrl = targetTab?.url
+      ? new URL(relativeHref, targetTab.url).href
+      : new URL(relativeHref, 'https://labs.google').href
 
-    await chrome.scripting.executeScript({
-      target: { tabId: activeTab.id },
-      args: [project],
-      func: (p: FlowProject) => {
-        if (p.href) {
-          window.location.href = p.href
-        } else {
-          window.location.href = `/fx/vi/tools/flow/project/${p.id}`
-        }
-      }
-    })
+    if (targetTab?.id) {
+      await chrome.tabs.update(targetTab.id, { url: targetUrl, active: true })
+      return
+    }
+
+    await chrome.tabs.create({ url: targetUrl, active: true })
   } catch {}
 }
 
@@ -316,7 +318,7 @@ export const SidePanel: React.FC<SidePanelProps> = ({ isSidebarOpen, onToggleSid
   const handleSelectFlowProject = async (project: FlowProject) => {
     pendingProjectNavigationRef.current = { projectId: project.id, startedAt: Date.now() }
     setSelectedProject(project)
-    await clickFlowProject(project)
+    await navigateToFlowProject(project)
     setShowProjectPicker(false)
   }
 
