@@ -1172,12 +1172,27 @@ duplicate attachments). The heartbeat-stale gate eventually takes over.
 ### Non-retryable Generate Nodes (chatgpt + google-flow)
 
 `runner.isNonRetryableGenerateNode(node)` short-circuits the catch block's
-node-level retry loop for any Generate Node that has uploadable media inputs
-across the current providers. The runner logs the cause and breaks the
-pipeline with `recoverable: false`. Per-step recovery (tab complete, content
-ping, find composer, find send button) still happens inside the provider
-path — the gate only closes the cross-node retry loop, where duplicate
-attachments are the failure mode.
+node-level retry loop for **ANY** Generate Node (both ChatGPT and Google
+Flow, regardless of whether it has reference-image uploads). The runner
+logs the cause, marks the workflow failed with `recoverable: false`, and
+breaks the pipeline. The user must explicitly click Run again on the
+workflow to retry — the runner never silently re-dispatches
+`RUN_FLOW_PROMPT` / `RUN_CHATGPT_PROMPT`.
+
+Why ALL Generate Nodes (not just media-bearing ones):
+
+- Google Flow: every `RUN_FLOW_PROMPT` creates new tiles in the Flow
+ tab. Re-running the node produces ANOTHER set of tiles.
+ `AUTO_DOWNLOAD_NO_SUCCESSFUL_RESULTS` on a bare Generate node
+ (no refs, `quantity=1`) used to retry via `i--; continue`, each
+ retry stamping a new tile. `baselineIds=4→5→6` was that symptom.
+- ChatGPT: a retried Generate re-uploads any refs (N×attempts
+ duplicates) AND submits the composer again, producing a second
+ turn of images. Same hazard, different surface.
+
+Per-step recovery (tab complete, content-script ping, find composer,
+find send button) still happens INSIDE the provider path; the gate
+here only closes the cross-node retry loop.
 
 ### Workflow runner execution order (lazy dependency plan)
 

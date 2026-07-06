@@ -218,6 +218,86 @@ function dataUrlToUploadPayload(media: MediaInput, key: string) {
   }
 }
 
+// [Workflow][OutputNormalize] Per-output normalization for the Generate-node
+// result bundle (`outputs[]` and `images[]`).
+//
+// Why this exists:
+//   flow-content.ts produces a per-asset descriptor with `url`, `mediaUrl`,
+//   `imageUrl`, `videoUrl`, `thumbnailUrl`, `poster`, etc. When the asset is
+//   a video the bridge only guarantees `videoUrl` (and sometimes `mediaUrl`)
+//   while `imageUrl` / `thumbnail` may be the FIRST tile thumbnail (an
+//   image, not the video) or empty. Without normalization the Workflow UI
+//   reads `imageUrl` for the preview, fails on `<img src="video url">`, and
+//   the Generate node renders blank even though `outputsCount=1`.
+//
+// Behavior:
+//   - Detect video via `mediaType === 'video'` || `type === 'video'`
+//     (covers both the rich outputs[] shape and the MediaItem images[]
+//     shape, where `mediaType` is the canonical key).
+//   - For video: resolvedUrl = videoUrl || mediaUrl || url. Set
+//     `videoUrl`, `mediaUrl`, `url` to resolvedUrl. CLEAR `imageUrl` so
+//     downstream image consumers don't accidentally render a `<video>` URL
+//     as an image. Preserve `thumbnailUrl` / `thumbnail` / `poster` as the
+//     first-frame poster (the bridge already normalizes that).
+//   - For image: resolvedUrl = imageUrl || mediaUrl || url. Set
+//     `imageUrl`, `mediaUrl`, `url` to resolvedUrl. Leave `videoUrl`
+//     untouched (it should already be empty for image).
+//   - Pass-through for items we can't classify — don't mutate unknown
+//     shapes, the Workflow UI's existing getGenerateOutputImageUrls walk
+//     still works.
+//
+// Owner: shared (workflow runner). Does NOT touch Flow bridge or ChatGPT
+// contracts; it only re-shapes the runner's own output bundle so the
+// downstream Workflow UI sees the right field per media type.
+function normalizeWorkflowOutput(output: Record<string, unknown>): Record<string, unknown> {
+  if (!output || typeof output !== 'object') return output
+  const rawMediaType = String(output.mediaType || output.type || '').toLowerCase()
+  const videoUrl = asString(output.videoUrl)
+  const mediaUrl = asString(output.mediaUrl)
+  const imageUrl = asString(output.imageUrl)
+  const url = asString(output.url)
+  const thumbnailUrl = asString(output.thumbnailUrl) || asString(output.thumbnail)
+  const poster = asString(output.poster) || thumbnailUrl
+
+  if (rawMediaType === 'video') {
+    const resolved = videoUrl || mediaUrl || url
+    if (!resolved) return output
+    return {
+      ...output,
+      type: 'video',
+      mediaType: 'video',
+      url: resolved,
+      mediaUrl: resolved,
+      videoUrl: resolved,
+      // Critical: do NOT put the video URL into imageUrl. Downstream
+      // consumers that default to `<img src={imageUrl}>` would otherwise
+      // try to load the video URL as an image and fail.
+      imageUrl: '',
+      thumbnailUrl,
+      thumbnail: thumbnailUrl,
+      poster,
+    }
+  }
+
+  if (rawMediaType === 'image') {
+    const resolved = imageUrl || mediaUrl || url
+    if (!resolved) return output
+    return {
+      ...output,
+      type: 'image',
+      mediaType: 'image',
+      url: resolved,
+      mediaUrl: resolved,
+      imageUrl: resolved,
+      // Don't carry a stale videoUrl forward — image-only outputs should
+      // have an empty videoUrl so video-aware consumers don't misroute.
+      videoUrl: '',
+    }
+  }
+
+  return output
+}
+
 export class PipelineRunner {
   private workflow: Workflow
   private adapter: ProviderAdapter
@@ -650,6 +730,21 @@ export class PipelineRunner {
     const settings = useSettingsStore.getState()
 
     console.log(`[Runner] start workflow: ${this.workflow.name} (${this.workflow.nodes?.length || 0} nodes)`)
+    // [WorkflowRun][start] — single source of truth for "did this
+    // run actually start". Default verbosity. The `source` field
+    // disambiguates which UI / API entry fired it (button, the
+    // dashboard quick-run, hotkey, etc.) so duplicate entries can
+    // be traced back to the originating call site. If you see two
+    // `[WorkflowRun][start]` for the same workflowRunId without an
+    // intervening `[ignoredDuplicate]`, you have a non-handler
+    // dispatch path that needs the single-flight guard.
+    console.log(`[WorkflowRun][start] ` + JSON.stringify({
+      workflowRunId: this.taskId,
+      workflowId: this.workflow.id,
+      workflowName: this.workflow.name,
+      nodeCount: this.workflow.nodes?.length || 0,
+      source: 'pipeline',
+    }))
 
     try {
       await this.acquireWakeLock()
@@ -744,10 +839,11 @@ export class PipelineRunner {
             pipelineStore.addLog(
               this.taskId,
               'warn',
-              `Generate node has media uploads — skipping node-level retry to avoid duplicate attachments. ` +
-                `Cause: ${errorMessage}`,
+              `Generate node failed — terminal for this run (no auto-retry, would re-submit to the provider). ` +
+                `Cause: ${errorMessage}. Re-run the workflow to retry.`,
               node.id
             )
+            console.log(`[WorkflowRun][nodeResult] workflowRunId=${this.taskId} nodeId=${node.id} success=false status=TERMINAL_NO_RETRY error=${errorMessage}`)
             try { this.callbacks.onNodeFail?.(node.id, errorMessage) } catch {}
             debugLog('glow', '[GlowDebug][Runner] fail', { nodeId: node.id, error: errorMessage })
             this.emitInactive(node.id)
@@ -1168,38 +1264,45 @@ export class PipelineRunner {
     })
   }
 
-  // Returns true when a Generate Node has media inputs that would be
-  // side-effect-reuploaded by a node-level retry. Used by the runner's
-  // catch block to disable retries for Generate Nodes with media.
-  //
-  // Provider rules (mirrors resolveGenerateMediaInputs above):
-  //   - chatgpt: any image media in inputs
-  //   - google-flow: any media that would survive the per-provider filter
-  //
-  // Inputs are re-derived from the current context (this.context) which
-  // is set by the time the catch block runs, so the result is faithful
-  // to what executeGenerateNode would have computed.
-  private isNonRetryableGenerateNode(node: WorkflowNode): boolean {
-    if (!node || node.type !== 'generate') return false
-    const fallbackProvider = this.detectProvider()
-    const data = (node.data || {}) as Record<string, unknown>
-    const provider = normalizeProvider(data.provider, fallbackProvider)
-    if (provider !== 'chatgpt' && provider !== 'google-flow') return false
-
-    const mediaType = provider === 'google-flow' && normalizeMediaType(data.mediaType) === 'video'
-      ? 'video'
-      : 'image'
-
-    const inputs = this.getNodeInputs(node)
-    const mediaInputs = this.resolveGenerateMediaInputs(provider, mediaType, data, inputs)
-    if (mediaInputs.length === 0) return false
-
-    // Extra defensive filter: only count media that has actual upload
-    // payload. Media without `data` cannot be uploaded, so retrying
-    // would not re-trigger an upload (safe to retry).
-    const uploadable = mediaInputs.filter((m) => Boolean(m.data || m.url))
-    return uploadable.length > 0
-  }
+// Returns true when a Generate Node should NOT be retried by the
+// runner's catch block (`i--; continue` retry loop). Used by the
+// runner's catch block to disable retries for Generate Nodes.
+//
+// Provider rules:
+//   - chatgpt / google-flow: ANY Generate Node is non-retryable.
+//
+// Why ALL Generate Nodes (not just media-bearing ones):
+//   The previous gate only returned true when `mediaInputs.length
+//   > 0` AND there was an uploadable `data` / `url`. That gate was
+//   originally designed to prevent duplicate reference-image
+//   attachments on retry (re-uploading refs would N×attempts
+//   duplicate files). But the same hazard exists WITHOUT refs:
+//   - Google Flow: every `RUN_FLOW_PROMPT` creates new tiles in
+//     the Flow tab. Re-running the node produces ANOTHER set of
+//     tiles. The user's baselineIds=4→5→6 evidence came from this
+//     path — `AUTO_DOWNLOAD_NO_SUCCESSFUL_RESULTS` on a bare
+//     Generate node (no refs) was being retried, each retry
+//     stamping a new tile in Flow.
+//   - ChatGPT: a retried Generate re-uploads any refs (N×attempts
+//     duplicates) AND submits the composer again, producing a
+//     second turn of images. Same hazard, different surface.
+//
+// So the safe policy is: Generate Nodes are ALWAYS terminal on
+// failure. If the user wants to retry, they explicitly click Run
+// again on the workflow. The runner must not silently re-dispatch
+// RUN_FLOW_PROMPT / RUN_CHATGPT_PROMPT.
+//
+// Per-step recovery (tab complete, content-script ping, find
+// composer, find send button) still happens INSIDE the provider
+// path; the gate here only closes the cross-node retry loop.
+private isNonRetryableGenerateNode(node: WorkflowNode): boolean {
+  if (!node || node.type !== 'generate') return false
+  const fallbackProvider = this.detectProvider()
+  const data = (node.data || {}) as Record<string, unknown>
+  const provider = normalizeProvider(data.provider, fallbackProvider)
+  if (provider !== 'chatgpt' && provider !== 'google-flow') return false
+  return true
+}
 
   private async runWithForegroundFallback<T>(
     provider: 'chatgpt' | 'google-flow',
@@ -1608,6 +1711,26 @@ export class PipelineRunner {
       }
     }
 
+    // [WorkflowRun][nodeDispatch] — single source of truth that the
+    // runner actually fired the provider action. Default verbosity.
+    // Pairs with [WorkflowRun][nodeResult] (logged below on response
+    // and via the catch block on failure) so an operator can confirm
+    // a single user click → single dispatch → single result. If you
+    // see multiple `[nodeDispatch]` for the same workflowRunId +
+    // nodeId without `[ignoredDuplicate]`, the runner's catch block
+    // is retrying the same node — fix is to mark the Generate node
+    // terminal (see isNonRetryableGenerateNode).
+    console.log(`[WorkflowRun][nodeDispatch] ` + JSON.stringify({
+      workflowRunId: this.taskId,
+      nodeId: node.id,
+      nodeType: node.type,
+      provider: 'google-flow',
+      action: 'RUN_FLOW_PROMPT',
+      mediaType,
+      quantity,
+      fileIdsCount: fileIds.length,
+    }))
+
     const response = await this.sendRuntimeMessage({
       action: 'RUN_FLOW_PROMPT',
       payload
@@ -1615,8 +1738,23 @@ export class PipelineRunner {
 
     const partialSuccess = response.status === 'AUTO_DOWNLOAD_PARTIAL_SUCCESS'
     if (!response.success && !partialSuccess) {
+      console.log(`[WorkflowRun][nodeResult] ` + JSON.stringify({
+        workflowRunId: this.taskId,
+        nodeId: node.id,
+        success: false,
+        status: response.status,
+        error: response.error,
+        outputsCount: Array.isArray(response.outputs) ? (response.outputs as unknown[]).length : 0,
+      }))
       throw new Error(response.error || response.status || 'Google Flow automation failed')
     }
+    console.log(`[WorkflowRun][nodeResult] ` + JSON.stringify({
+      workflowRunId: this.taskId,
+      nodeId: node.id,
+      success: true,
+      status: response.status,
+      outputsCount: Array.isArray(response.outputs) ? (response.outputs as unknown[]).length : 0,
+    }))
 
     // Output assets — pulled off the BG response (which forwards them
     // from flow-content.ts) and exposed at the top level so:
@@ -1645,6 +1783,25 @@ export class PipelineRunner {
     const responseImages = Array.isArray(response.images) ? response.images : []
     const responseImageUrls = Array.isArray(response.imageUrls) ? response.imageUrls : []
 
+    // [Workflow][OutputNormalize] Apply per-output normalization to BOTH
+    // `outputs[]` (rich descriptor) and `images[]` (MediaItem shape) so the
+    // video case has `videoUrl`/`mediaUrl`/`url` populated and `imageUrl`
+    // CLEARED. Without this, `getGenerateOutputImageUrls` walks
+    // `imageUrl` (which carries the video URL when the bridge fills it),
+    // and the Workflow UI tries to render a `<video>` URL as `<img>` —
+    // the Generate node preview shows blank even though the run
+    // succeeded with `outputsCount=1`. See normalizeWorkflowOutput for
+    // the exact contract.
+    const normalizedOutputs = responseOutputs
+      .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
+      .map((item) => normalizeWorkflowOutput(item))
+    const normalizedImages = responseImages
+      .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
+      .map((item) => normalizeWorkflowOutput(item))
+    // `imageUrls[]` is a flat string[]; normalization just keeps the
+    // existing entries (no field-by-field rewrite needed).
+    const normalizedImageUrls = responseImageUrls.filter((u): u is string => typeof u === 'string' && u.length > 0)
+
     // [Workflow][NodeOutput] google-flow outputs=N — emitted exactly once
     // per Generate node so operators can confirm the node received the
     // produced assets. Logged at default verbosity (no debug flag).
@@ -1652,7 +1809,7 @@ export class PipelineRunner {
     // usable URL (independent of whether they were saved to disk);
     // `outputsDownloadedCount` counts only the ones where the file
     // actually landed on disk via chrome.downloads.download.
-    console.log(`[Workflow][NodeOutput] google-flow outputs=${responseOutputs.length} (${responseOutputs.filter(function (o) { return (o as Record<string, unknown>).outputAvailable === true }).length} available / ${responseOutputs.filter(function (o) { return (o as Record<string, unknown>).downloadSuccess === true }).length} downloaded)`)
+    console.log(`[Workflow][NodeOutput] google-flow outputs=${normalizedOutputs.length} (${normalizedOutputs.filter(function (o) { return (o as Record<string, unknown>).outputAvailable === true }).length} available / ${normalizedOutputs.filter(function (o) { return (o as Record<string, unknown>).downloadSuccess === true }).length} downloaded)`)
 
     // Optional focus-restore policy (mirror of the ChatGPT branch).
     // The flow generation has already completed by this point, so
@@ -1689,21 +1846,28 @@ export class PipelineRunner {
       // Top-level output assets — these are what the Workflow UI walks
       // for the Generate-node preview and what downstream
       // Media/Download/Generate nodes see via coerceMediaList.
-      outputs: responseOutputs,
-      images: responseImages,
-      imageUrls: responseImageUrls,
+      //
+      // `normalizedOutputs` / `normalizedImages` are the per-asset
+      // descriptors re-shaped by `normalizeWorkflowOutput` so each
+      // item has the correct `videoUrl`/`imageUrl`/`mediaUrl`/`url`
+      // for its media type. The Workflow UI's renderDrawflowNode +
+      // getGenerateOutputImageUrls rely on this — see the comment
+      // above `normalizeWorkflowOutput` for the exact contract.
+      outputs: normalizedOutputs,
+      images: normalizedImages,
+      imageUrls: normalizedImageUrls,
       // Convenience: pre-filtered list of usable outputs (outputAvailable).
       // Use this instead of `outputs` filtering downstream — it
       // matches the semantic of "what can I render / forward".
       // `downloadSuccess === true` is narrower (only file-on-disk),
       // so we deliberately DO NOT use it here.
-      successfulOutputs: responseOutputs.filter(function (o) { return (o as Record<string, unknown>).outputAvailable === true }),
+      successfulOutputs: normalizedOutputs.filter(function (o) { return (o as Record<string, unknown>).outputAvailable === true }),
       // Default selectedOutputIndex = 0 on first run. The editor's
       // onNodeComplete persists it back into node data; this default
       // ensures downstream nodes reading the in-memory output before
       // the persistence flush still get index 0 instead of undefined.
       selectedOutputIndex: 0,
-      outputsCount: responseOutputs.length,
+      outputsCount: normalizedOutputs.length,
       downloadFailReason: response.downloadFailReason,
       lastError: response.lastError,
       tileErrors: response.tileErrors,
@@ -2464,13 +2628,43 @@ export async function runPipeline(
   workflow: Workflow,
   callbacks: PipelineCallbacks = {}
 ): Promise<void> {
+  // [WorkflowRun] Single-flight guard at the runner boundary.
+  //
+  // The runner is the only place a workflow execution starts in
+  // production. If a second `runPipeline` arrives while the first
+  // is still running (rapid double-click on the toolbar button, an
+  // effect re-firing after re-render, or the dashboard quick-run
+  // racing the editor Run button), we MUST NOT start a parallel
+  // execution. Two parallel runs would each dispatch their own
+  // `RUN_FLOW_PROMPT` / `RUN_CHATGPT_PROMPT`, producing duplicate
+  // tiles / duplicate ChatGPT turns — exactly the symptom the
+  // hotfix is closing.
+  //
+  // Returning silently (instead of throwing) lets the caller's
+  // `handleRun` finish without raising the "Unable to run workflow."
+  // alert that double-clicks would otherwise surface.
   if (currentRunner?.isRunning) {
-    throw new Error('A pipeline is already running')
+    console.warn(`[WorkflowRun][ignoredDuplicate] ` + JSON.stringify({
+      workflowRunId: currentRunner.taskId,
+      workflowId: workflow.id,
+      reason: 'currentRunner.isRunning',
+      note: 'A pipeline is already running for another workflow (or this one). Returning silently.',
+    }))
+    return
   }
   const pipelineStore = usePipelineStore.getState()
   const task = pipelineStore.createTask(workflow.id)
   currentRunner = new PipelineRunner(workflow, task.id, callbacks)
-  await currentRunner.run()
+  try {
+    await currentRunner.run()
+  } finally {
+    // Clear the singleton so a follow-up run can start. Only the
+    // runner that owns the slot may clear it — guards against
+    // a stale `currentRunner` surviving across workflow swaps.
+    if (currentRunner && currentRunner.taskId === task.id) {
+      currentRunner = null
+    }
+  }
 }
 
 export function pausePipeline(): void {
@@ -2483,5 +2677,9 @@ export function resumePipeline(): void {
 
 export function stopPipeline(): void {
   currentRunner?.stop()
+  // Clear the singleton on explicit stop so the next Run can start
+  // a fresh pipeline. The runner's own `run()` finally{} block
+  // covers the natural-completion case; this covers user-initiated
+  // cancellation which never reaches the finally{} block.
   currentRunner = null
 }
