@@ -214,20 +214,35 @@ const useResolvedAssets = (
 const mergeResolvedAsset = <T extends Record<string, unknown>>(data: T, resolved: ResolvedAssetEntry | undefined): T => {
   if (!resolved || resolved.status !== 'resolved' || !resolved.dataUrl) return data
   const out: Record<string, unknown> = { ...data }
-  const mediaType = String(out.mediaType || '').toLowerCase()
-  const isVideo = mediaType === 'video' || typeof out.videoData === 'string' || typeof out.videoUrl === 'string'
+  // [AssetResolution] Determine the asset's actual kind. We must NOT
+  // rely on `typeof out.videoData === 'string'` here: the upload
+  // handler initializes `data.videoData = ''` to clear legacy fields,
+  // and `typeof '' === 'string'` would falsely classify an image as
+  // a video. We use:
+  //   1. explicit `mediaType` if the user (or migration) set it,
+  //   2. the stored asset's `meta.kind` (authoritative for IDB-backed
+  //      uploads — derived from the File mime at save time),
+  //   3. mime prefix as a tie-breaker.
+  const explicitMediaType = String(out.mediaType || '').toLowerCase()
+  const metaKind = String(resolved.meta?.kind || '').toLowerCase()
+  const metaMime = String(resolved.meta?.mimeType || '').toLowerCase()
+  const isVideo =
+    explicitMediaType === 'video' ||
+    metaKind === 'video' ||
+    (!explicitMediaType && !metaKind && metaMime.startsWith('video/'))
   if (isVideo) {
     out.videoData = resolved.dataUrl
-    if (!out.videoUrl) out.videoUrl = resolved.dataUrl
+    out.videoUrl = resolved.objectUrl || resolved.dataUrl
   } else {
     out.imageData = resolved.dataUrl
-    if (!out.imageUrl) out.imageUrl = resolved.dataUrl
+    out.imageUrl = resolved.objectUrl || resolved.dataUrl
   }
+  out.mediaType = isVideo ? 'video' : 'image'
   out.mediaData = resolved.dataUrl
-  if (!out.mediaUrl) out.mediaUrl = resolved.dataUrl
+  out.mediaUrl = resolved.objectUrl || resolved.dataUrl
   if (resolved.meta?.mimeType) {
-    if (!out.mimeType) out.mimeType = resolved.meta.mimeType
-    if (!out.mediaMimeType) out.mediaMimeType = resolved.meta.mimeType
+    out.mimeType = resolved.meta.mimeType
+    out.mediaMimeType = resolved.meta.mimeType
   }
   if (resolved.meta?.width !== undefined && out.mediaWidth === undefined) out.mediaWidth = resolved.meta.width
   if (resolved.meta?.height !== undefined && out.mediaHeight === undefined) out.mediaHeight = resolved.meta.height
@@ -571,13 +586,27 @@ function closestImageAspectRatio(width: number, height: number): ImageAspectRati
 
 function getMediaNodeType(data: Record<string, unknown>): MediaNodeType {
   const raw = String(data.mediaType || '').toLowerCase()
-  const videoSource = String(data.videoData || data.videoUrl || '')
-  if (raw === 'video' || videoSource.length > 0) return 'video'
+  // [AssetResolution] Empty strings from the post-migration
+  // placeholder fields are NOT a video source — only count
+  // non-empty `videoData` / `videoUrl`. (Previously this used
+  // truthy coercion on `data.videoData` which is correct, but the
+  // surrounding callsite now writes `''` explicitly to clear legacy
+  // fields and we want to be defensive about that.)
+  const videoData = typeof data.videoData === 'string' ? data.videoData : ''
+  const videoUrl = typeof data.videoUrl === 'string' ? data.videoUrl : ''
+  const hasVideo = videoData.length > 0 || videoUrl.length > 0
+  if (raw === 'video' || hasVideo) return 'video'
   return 'image'
 }
 
 function getMediaNodeSource(data: Record<string, unknown>) {
   const mediaType = getMediaNodeType(data)
+  // [AssetResolution] Pick the first NON-EMPTY string. The migration
+  // writes `''` into legacy fields to drop inline base64, so a
+  // naive `||` chain still works here (empty string is falsy), but
+  // the chain below is the contract for templates: image assets
+  // resolve through `imageData / imageUrl / mediaData / mediaUrl`,
+  // video assets through `videoData / videoUrl / mediaData / mediaUrl`.
   if (mediaType === 'video') {
     return String(data.videoData || data.videoUrl || data.mediaData || data.mediaUrl || '')
   }
@@ -1777,6 +1806,22 @@ function renderDrawflowNode(node: WorkflowNode, resolvedAssets?: Map<string, Res
     const mediaType = getMediaNodeType(data)
     const mediaSrc = getMediaNodeSource(data)
     const mediaPoster = getMediaNodePoster(data)
+    // [MediaPreview] Debug log for the Media-node render path. Lets
+    // the user verify the kind detection, assetId resolution, and
+    // placeholder-vs-real-image decision. Gated by the master
+    // `AI_FLOW_DEBUG` flag — silent by default.
+    debugLog('AI_FLOW_DEBUG', '[MediaPreview][render]', JSON.stringify({
+      nodeId: node.id,
+      assetId: String((rawData as Record<string, unknown>).assetId || ''),
+      dataMediaType: String(rawData.mediaType || ''),
+      resolvedStatus: resolvedEntry?.status || 'none',
+      resolvedKind: resolvedEntry?.meta?.kind || '',
+      mimeType: String(data.mimeType || ''),
+      hasObjectUrl: Boolean(resolvedEntry?.objectUrl),
+      hasDataUrl: Boolean(resolvedEntry?.dataUrl),
+      sourceKind: mediaSrc ? (mediaType === 'video' ? 'video' : 'image') : 'none',
+      sourcePreview: mediaSrc ? mediaSrc.slice(0, 12) : null,
+    }))
     body = `
       <div class="df-node-preview df-node-image-upload-target ${mediaSrc ? 'has-image' : ''} ${ratioClass}" data-image-upload-target="true">
         ${
@@ -4068,8 +4113,24 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
                 // [AssetStore] Patch only the metadata. The blob is in
                 // IndexedDB; runtime readers (Drawflow preview, lightbox,
                 // runner) pull it via useResolvedAssets() / getAssetBlob().
+                //
+                // We intentionally DO NOT write `mediaData / imageData /
+                // videoData` (legacy base64) or `mediaPoster / videoPoster`
+                // (legacy base64 poster) into node.data. Reasons:
+                //   1. chrome.storage.local cannot hold them — that is
+                //      the whole reason this migration exists.
+                //   2. The downstream template heuristics
+                //      (getMediaNodeType / getMediaNodeSource) used
+                //      `typeof data.videoData === 'string'` which is
+                //      `true` for empty strings, mis-classifying image
+                //      assets as video. Leaving the keys absent keeps
+                //      the heuristic honest.
+                // If the user replaces the asset, useResolvedAssets +
+                // mergeResolvedAsset fills in `imageData / videoData`
+                // for the template at render-time, so the user-facing
+                // preview still works.
                 const aspectRatio = width && height ? closestImageAspectRatio(width, height) : fileMediaType === 'video' ? '16:9' : '1:1'
-                updateNode(nodeId, {
+                const patch: Record<string, unknown> = {
                   assetId: assetMeta.assetId,
                   mimeType: assetMeta.mimeType,
                   mediaMimeType: assetMeta.mimeType,
@@ -4078,22 +4139,19 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
                   mediaWidth: width,
                   mediaHeight: height,
                   size: assetMeta.size,
-                  mediaPoster: fileMediaType === 'video' ? poster || '' : '',
-                  mediaUrl: '',
-                  mediaData: '',
-                  imageUrl: '',
-                  imageName: fileMediaType === 'image' ? file.name : '',
-                  imageWidth: fileMediaType === 'image' ? width : undefined,
-                  imageHeight: fileMediaType === 'image' ? height : undefined,
-                  imageData: '',
-                  videoUrl: '',
-                  videoName: fileMediaType === 'video' ? file.name : '',
-                  videoWidth: fileMediaType === 'video' ? width : undefined,
-                  videoHeight: fileMediaType === 'video' ? height : undefined,
-                  videoData: '',
-                  videoPoster: fileMediaType === 'video' ? poster || '' : '',
                   aspectRatio
-                } as Partial<FlowNodeData>)
+                }
+                if (fileMediaType === 'image') {
+                  patch.imageName = file.name
+                  patch.imageWidth = width
+                  patch.imageHeight = height
+                } else {
+                  patch.videoName = file.name
+                  patch.videoWidth = width
+                  patch.videoHeight = height
+                  if (poster) patch.videoPoster = poster
+                }
+                updateNode(nodeId, patch as Partial<FlowNodeData>)
                 scheduleDrawflowConnectionRefresh(nodeId)
               } catch (err) {
                 console.warn('[AssetStore][upload.flow.failed]', (err as Error).message)
@@ -4545,6 +4603,67 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   useEffect(() => {
     hydrateDrawflow()
   }, [structureSignature])
+
+  // [AssetResolution] Re-render Drawflow nodes when their resolved
+  // asset transitions between pending / resolved / missing / error.
+  //
+  // Without this, the initial `hydrateDrawflow()` call would import
+  // a Drawflow with empty `mediaData/imageData` (because the asset
+  // hadn't loaded yet) and the node would stay on the placeholder
+  // until the user did something that triggered a store update.
+  //
+  // We track each entry's status with a ref so a re-render fires
+  // ONLY when a status actually changes, not on every React commit.
+  const lastResolvedStatusRef = useRef<Map<string, ResolvedAssetEntry['status']>>(new Map())
+  useEffect(() => {
+    if (!resolvedAssets || resolvedAssets.size === 0) return
+    const last = lastResolvedStatusRef.current
+    let changed = false
+    const dirtyNodeIds: string[] = []
+    for (const [nodeId, entry] of resolvedAssets.entries()) {
+      const prev = last.get(nodeId)
+      if (prev !== entry.status) {
+        last.set(nodeId, entry.status)
+        // Only re-render when the entry is leaving the initial
+        // pending state. We don't need to re-render every time
+        // `meta` updates with the same status.
+        if (prev !== undefined) {
+          changed = true
+          dirtyNodeIds.push(nodeId)
+        } else if (entry.status !== 'pending') {
+          changed = true
+          dirtyNodeIds.push(nodeId)
+        }
+      }
+    }
+    if (!changed) return
+    for (const nodeId of dirtyNodeIds) {
+      const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
+      if (!node) continue
+      const entry = resolvedAssets.get(nodeId)
+      if (entry?.status === 'resolved') {
+        debugLog('AI_FLOW_DEBUG', '[AssetResolution][node.ready]', JSON.stringify({
+          nodeId,
+          assetId: String((node.data as Record<string, unknown>)?.assetId || ''),
+          kind: entry.meta?.kind || '',
+          mimeType: entry.meta?.mimeType || '',
+          objectUrlPrefix: entry.objectUrl ? entry.objectUrl.slice(0, 12) : null,
+          dataUrlLength: entry.dataUrl ? entry.dataUrl.length : 0,
+        }))
+      } else if (entry?.status === 'missing') {
+        debugLog('AI_FLOW_DEBUG', '[AssetResolution][node.missing]', JSON.stringify({
+          nodeId,
+          assetId: String((node.data as Record<string, unknown>)?.assetId || '')
+        }))
+      }
+      const content = canvasRef.current?.querySelector(`#node-${CSS.escape(nodeId)} .drawflow_content_node`)
+      if (content) {
+        content.innerHTML = renderDrawflowNode(node, resolvedAssets)
+        attachNodeResizeObserver(nodeId)
+        scheduleDrawflowConnectionRefresh(nodeId)
+      }
+    }
+  }, [resolvedAssets])
 
   useEffect(() => {
     const editor = editorRef.current
