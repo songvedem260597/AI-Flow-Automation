@@ -1,0 +1,252 @@
+/**
+ * Cache Generate-node output URLs into the IndexedDB asset store.
+ *
+ * Strategy:
+ *   1. Walk every entry in `output.outputs[]` (rich descriptor) and
+ *      the flat `output.images[]` / `output.imageUrls[]` fallbacks.
+ *   2. Resolve a single source URL per item using the same priority
+ *      `getGenerateOutputImageUrls()` uses: videoUrl → url →
+ *      imageUrl → mediaUrl → thumbnailUrl.
+ *   3. `fetch(url) → blob → saveAssetFromBlob(...)`. Failure path
+ *      (CORS, expired signed URL, network) is non-fatal — the caller
+ *      keeps the original descriptor and the renderer falls back to
+ *      the URL it already had.
+ *   4. For video outputs with an explicit `thumbnailUrl` / `poster`
+ *      URL, attempt to cache the poster as a separate asset with
+ *      `kind: 'poster'`. Failure stays silent.
+ *
+ * Inputs/outputs are kept in lock-step with `runner.normalizeWorkflowOutput`:
+ *   - Original `url` / `videoUrl` / `imageUrl` / `mediaUrl` /
+ *     `thumbnailUrl` / `poster` strings are NEVER removed.
+ *   - The new `assetId` / `posterAssetId` / `thumbnailAssetId` fields
+ *     are added alongside, and the original descriptor is returned as
+ *     the source of truth so `WORKFLOW_DOWNLOAD_OUTPUT` keeps working
+ *     unchanged.
+ *   - Original `_output` itself is left untouched at the top level —
+ *     `cacheGenerateOutputs` returns a fresh object only when at
+ *     least one item successfully resolved an asset.
+ */
+
+import { saveAssetFromBlob, type AssetMeta } from './assetStore'
+
+interface OutputItemLike {
+  url?: unknown
+  videoUrl?: unknown
+  imageUrl?: unknown
+  mediaUrl?: unknown
+  thumbnailUrl?: unknown
+  poster?: unknown
+  mediaType?: unknown
+  type?: unknown
+  savedFilename?: unknown
+  name?: unknown
+  fileNameFromFlow?: unknown
+  outputAvailable?: unknown
+  mimeType?: unknown
+  size?: unknown
+}
+
+interface OutputLike {
+  outputs?: unknown
+  images?: unknown
+  imageUrls?: unknown
+  thumbnailUrl?: unknown
+  poster?: unknown
+}
+
+const asString = (value: unknown): string =>
+  typeof value === 'string' && value.length > 0 ? value : ''
+
+const resolveItemSourceUrl = (item: OutputItemLike): string =>
+  asString(item.videoUrl)
+  || asString(item.url)
+  || asString(item.mediaUrl)
+  || asString(item.imageUrl)
+  || asString(item.thumbnailUrl)
+  || asString(item.poster)
+  || ''
+
+const resolveItemKind = (item: OutputItemLike, blob: Blob | null): 'image' | 'video' => {
+  const declared = String(item.mediaType || item.type || '').toLowerCase()
+  if (declared === 'video') return 'video'
+  if (declared === 'image') return 'image'
+  const mime = (blob?.type || '').toLowerCase()
+  if (mime.startsWith('video/')) return 'video'
+  if (mime.startsWith('image/')) return 'image'
+  const url = resolveItemSourceUrl(item).toLowerCase()
+  if (/\.(mp4|mov|webm|m4v)(\?|$)/.test(url)) return 'video'
+  if (url.includes('video')) return 'video'
+  return 'image'
+}
+
+const fetchBlobFromUrl = async (url: string, timeoutMs = 8000): Promise<Blob | null> => {
+  if (!url) return null
+  // Skip blob: / data: — those already live in the same tab; caching
+  // them into IndexedDB is wasted work and `URL.createObjectURL` for
+  // a `blob:` URL is already free.
+  if (url.startsWith('blob:') || url.startsWith('data:')) return null
+  // Only attempt http(s); chrome-extension: / chrome: cannot be fetched
+  // safely from the side-panel page.
+  if (!/^https?:/i.test(url)) return null
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
+  const timer = controller
+    ? setTimeout(() => controller.abort(), timeoutMs)
+    : null
+  try {
+    const response = await fetch(url, controller ? { signal: controller.signal, credentials: 'omit' } : undefined)
+    if (!response.ok) return null
+    return await response.blob()
+  } catch {
+    return null
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+const enrichItemWithAsset = async (
+  item: OutputItemLike,
+  index: number
+): Promise<{ enriched: OutputItemLike; ok: boolean }> => {
+  const sourceUrl = resolveItemSourceUrl(item)
+  if (!sourceUrl) return { enriched: item, ok: false }
+
+  const blob = await fetchBlobFromUrl(sourceUrl)
+  if (!blob) return { enriched: item, ok: false }
+
+  const kind = resolveItemKind(item, blob)
+  const fileName = asString(item.savedFilename).split(/[\\/]/).pop()
+    || asString(item.name)
+    || asString(item.fileNameFromFlow)
+    || (kind === 'video' ? `generated-video-${index + 1}.${(blob.type.split('/')[1] || 'mp4')}` : `generated-image-${index + 1}.${(blob.type.split('/')[1] || 'png')}`)
+
+  const meta: AssetMeta = {
+    kind,
+    source: 'generated',
+    fileName,
+    mimeType: blob.type || undefined,
+    originalUrl: sourceUrl
+  }
+
+  try {
+    const record = await saveAssetFromBlob(blob, meta)
+    const enriched: OutputItemLike = {
+      ...item,
+      assetId: record.id,
+      mimeType: record.mimeType,
+      size: record.size
+    }
+
+    // Poster cache for video outputs that ship an explicit poster URL.
+    const posterUrl = asString(item.thumbnailUrl) || asString(item.poster)
+    if (kind === 'video' && posterUrl && posterUrl !== sourceUrl) {
+      try {
+        const posterBlob = await fetchBlobFromUrl(posterUrl)
+        if (posterBlob) {
+          const posterMeta: AssetMeta = {
+            kind: 'poster',
+            source: 'generated',
+            fileName: asString(item.savedFilename).split(/[\\/]/).pop()
+              ? `${asString(item.savedFilename).split(/[\\/]/).pop()}-poster.jpg`
+              : undefined,
+            mimeType: posterBlob.type || 'image/jpeg',
+            originalUrl: posterUrl
+          }
+          const posterRecord = await saveAssetFromBlob(posterBlob, posterMeta)
+          enriched.posterAssetId = posterRecord.id
+          enriched.thumbnailAssetId = posterRecord.id
+        }
+      } catch {
+        // [AssetStore] Poster cache failure stays silent — poster URL
+        // fallback in the renderer covers the gap.
+      }
+    }
+
+    return { enriched, ok: true }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[AssetStore] output cache failed', {
+      url: sourceUrl,
+      kind,
+      message: err instanceof Error ? err.message : String(err)
+    })
+    return { enriched: item, ok: false }
+  }
+}
+
+const enrichTopLevelPoster = async (output: OutputLike): Promise<OutputItemLike | null> => {
+  // Top-level thumbnailUrl / poster — applies to whole-output descriptors
+  // that don't carry per-item posters (legacy flat shape).
+  const url = asString(output.thumbnailUrl) || asString(output.poster)
+  if (!url) return null
+  const blob = await fetchBlobFromUrl(url)
+  if (!blob) return null
+  try {
+    const record = await saveAssetFromBlob(blob, {
+      kind: 'poster',
+      source: 'generated',
+      mimeType: blob.type || 'image/jpeg',
+      originalUrl: url
+    })
+    return { assetId: record.id, mimeType: record.mimeType, size: record.size }
+  } catch {
+    return null
+  }
+}
+
+const isObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v)
+
+/**
+ * Cache every URL inside a Generate-node output descriptor and return
+ * a new descriptor with `assetId` / `posterAssetId` / `thumbnailAssetId`
+ * populated where the cache succeeded. When nothing resolved, the
+ * input object is returned unchanged.
+ *
+ * The function NEVER throws — all fetch/save errors are swallowed and
+ * surfaced only via `console.warn` (real, gated-by-spec signal for an
+ * operator diagnosing CORS / expired-URL bugs).
+ */
+export const cacheGenerateOutputs = async (
+  output: unknown
+): Promise<unknown> => {
+  if (!output || typeof output !== 'object') return output
+  const root = output as OutputLike
+
+  const items: Array<OutputItemLike> = []
+  if (Array.isArray(root.outputs)) {
+    for (const candidate of root.outputs) {
+      if (isObject(candidate)) items.push(candidate as OutputItemLike)
+    }
+  }
+  if (items.length === 0 && Array.isArray(root.images)) {
+    for (const candidate of root.images) {
+      if (isObject(candidate)) items.push(candidate as OutputItemLike)
+    }
+  }
+  if (items.length === 0 && Array.isArray(root.imageUrls)) {
+    for (const url of root.imageUrls) {
+      if (typeof url === 'string' && url) {
+        items.push({ url })
+      }
+    }
+  }
+
+  if (items.length === 0) {
+    // Nothing to cache per-item, but still try the top-level poster.
+    const poster = await enrichTopLevelPoster(root)
+    if (!poster) return output
+    return { ...root, posterAssetId: poster.assetId, thumbnailAssetId: poster.assetId }
+  }
+
+  const results = await Promise.all(items.map((item, index) => enrichItemWithAsset(item, index)))
+  const enriched = results.map((r) => r.enriched)
+  let changed = results.some((r) => r.ok)
+
+  const topPoster = await enrichTopLevelPoster(root)
+  let nextRoot: OutputLike = { ...root, outputs: enriched }
+  if (topPoster) {
+    nextRoot = { ...nextRoot, posterAssetId: topPoster.assetId, thumbnailAssetId: topPoster.assetId }
+    changed = true
+  }
+  return changed ? nextRoot : output
+}

@@ -297,12 +297,9 @@ const HEAVY_PERSIST_KEYS = new Set([
   'rawFile',
   'file',
   'blob',
-  'outputs',
-  'images',
   'result',
   'runResult',
   'logs',
-  '_output',
   'mediaPoster',
   'videoPoster'
 ])
@@ -355,7 +352,63 @@ const ASSET_METADATA_KEYS = new Set([
 const TRANSIENT_OBJECT_URL_KEYS = new Set([
   'objectUrl',
   'assetObjectUrl',
-  'resolvedAssetUrl'
+  'resolvedAssetUrl',
+  'previewUrl'
+])
+
+// [AssetStore][GenerateOutput] Whitelist of safe keys to keep
+// inside a `_output.outputs[]` descriptor so the preview survives a
+// reload. Items without any matching key are dropped. Remote http(s)
+// URLs are short, assetIds are 16 chars, mimeType / size are short —
+// nothing here ever grows large.
+const GENERATE_OUTPUT_SAFE_KEYS = new Set([
+  'assetId',
+  'posterAssetId',
+  'thumbnailAssetId',
+  'url',
+  'videoUrl',
+  'imageUrl',
+  'mediaUrl',
+  'thumbnailUrl',
+  'poster',
+  'mediaType',
+  'type',
+  'mimeType',
+  'size',
+  'width',
+  'height',
+  'duration',
+  'savedFilename',
+  'fileNameFromFlow',
+  'name',
+  'outputAvailable',
+  'createdAt'
+])
+
+// [AssetStore][GenerateOutput] Safe top-level keys inside `_output`
+// itself. Mirrors what the renderer reads from `_output` — any URL
+// field is fine (short), thumbnail / poster URLs are short, and the
+// cached assetId pointers are tiny. We deliberately do NOT keep
+// arbitrary `_output` fields the runner may have stuffed in; if a
+// future field is needed, add it here.
+const GENERATE_OUTPUT_TOP_LEVEL_SAFE_KEYS = new Set([
+  'assetId',
+  'posterAssetId',
+  'thumbnailAssetId',
+  'outputs',
+  'images',
+  'imageUrls',
+  'url',
+  'videoUrl',
+  'imageUrl',
+  'mediaUrl',
+  'thumbnailUrl',
+  'poster',
+  'mediaType',
+  'type',
+  'mimeType',
+  'size',
+  'createdAt'
 ])
 
 const PERSIST_STRING_LENGTH_LIMIT = 100_000
@@ -401,6 +454,84 @@ const stripLegacyBase64WhenAssetPresent = (data: Record<string, unknown>): Recor
   return out
 }
 
+/**
+ * [AssetStore][GenerateOutput] Sanitize a `_output` descriptor so
+ * the persisted payload only carries the safe metadata the editor
+ * reads back on reload. Items inside `outputs[]` are filtered
+ * through `GENERATE_OUTPUT_SAFE_KEYS`; remote http(s) URLs are
+ * preserved; anything else (custom runner fields, runtime stats,
+ * diagnostic blobs) is dropped. Heavy strings (data:, blob:,
+ * > 100 KB) inside safe fields are still filtered by
+ * `isHeavyPersistString` in the generic recursive pass.
+ */
+const sanitizeGenerateOutput = (value: unknown): unknown => {
+  if (value === null || value === undefined) return undefined
+  if (typeof value !== 'object') return undefined
+  const record = value as Record<string, unknown>
+  const out: Record<string, unknown> = {}
+  for (const [key, child] of Object.entries(record)) {
+    if (!GENERATE_OUTPUT_TOP_LEVEL_SAFE_KEYS.has(key)) continue
+    if (key === 'outputs' && Array.isArray(child)) {
+      const sanitizedItems: unknown[] = []
+      for (const item of child) {
+        if (!item || typeof item !== 'object') continue
+        const itemRecord = item as Record<string, unknown>
+        const safeItem: Record<string, unknown> = {}
+        for (const [itemKey, itemValue] of Object.entries(itemRecord)) {
+          if (!GENERATE_OUTPUT_SAFE_KEYS.has(itemKey)) continue
+          if (typeof itemValue === 'string') {
+            if (isHeavyPersistString(itemValue)) continue
+            safeItem[itemKey] = itemValue
+          } else if (typeof itemValue === 'number' || typeof itemValue === 'boolean') {
+            safeItem[itemKey] = itemValue
+          } else {
+            // Nested object — drop. Outputs items are flat in the
+            // contract; nested objects are usually runner-only
+            // telemetry that has no business surviving reload.
+          }
+        }
+        if (Object.keys(safeItem).length > 0) sanitizedItems.push(safeItem)
+      }
+      if (sanitizedItems.length > 0) out.outputs = sanitizedItems
+      continue
+    }
+    if (key === 'images' && Array.isArray(child)) {
+      const safeImages: unknown[] = []
+      for (const item of child) {
+        if (!item || typeof item !== 'object') continue
+        const itemRecord = item as Record<string, unknown>
+        const safeItem: Record<string, unknown> = {}
+        for (const [itemKey, itemValue] of Object.entries(itemRecord)) {
+          if (!GENERATE_OUTPUT_SAFE_KEYS.has(itemKey)) continue
+          if (typeof itemValue === 'string' && !isHeavyPersistString(itemValue)) {
+            safeItem[itemKey] = itemValue
+          }
+        }
+        if (Object.keys(safeItem).length > 0) safeImages.push(safeItem)
+      }
+      if (safeImages.length > 0) out.images = safeImages
+      continue
+    }
+    if (key === 'imageUrls' && Array.isArray(child)) {
+      const safeUrls: unknown[] = []
+      for (const url of child) {
+        if (typeof url === 'string' && !isHeavyPersistString(url) && url.length > 0) {
+          safeUrls.push(url)
+        }
+      }
+      if (safeUrls.length > 0) out.imageUrls = safeUrls
+      continue
+    }
+    if (typeof child === 'string') {
+      if (isHeavyPersistString(child)) continue
+      out[key] = child
+    } else if (typeof child === 'number' || typeof child === 'boolean') {
+      out[key] = child
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
 const sanitizePersistValue = (value: unknown): unknown => {
   if (value === null || value === undefined) return value
   if (isHeavyPersistString(value)) return undefined
@@ -436,6 +567,15 @@ const sanitizePersistValue = (value: unknown): unknown => {
   for (const [key, child] of Object.entries(working)) {
     if (HEAVY_PERSIST_KEYS.has(key)) continue
     if (TRANSIENT_OBJECT_URL_KEYS.has(key)) continue
+    // [AssetStore][GenerateOutput] `_output` carries a rich
+    // descriptor; route it through the dedicated sanitiser so we
+    // never persist arbitrary runtime fields the runner may have
+    // stuffed in. Heavy strings are still filtered per-key.
+    if (key === '_output') {
+      const sanitizedOutput = sanitizeGenerateOutput(child)
+      if (sanitizedOutput !== undefined) out[key] = sanitizedOutput
+      continue
+    }
     const sanitized = sanitizePersistValue(child)
     if (sanitized !== undefined) out[key] = sanitized
   }

@@ -55,6 +55,7 @@ import {
   type AssetKind,
   type AssetMeta
 } from '@/lib/assets/assetStore'
+import { cacheGenerateOutputs } from '@/lib/assets/outputAssetCache'
 import {
   applyNodePreviews,
   categorizeSavedTemplate,
@@ -1608,6 +1609,16 @@ interface GenerateOutputItem {
   /** Mime hint (`image` or `video`). Drives extension choice (.png /
    *  .mp4) when synthesizing a filename. */
   mediaType?: 'image' | 'video'
+  /** [AssetStore] Cached assetId → resolved blob URL for this
+   *  output. Renderer prefers this over `url` so a reloaded editor
+   *  paints the preview from IndexedDB without going through the
+   *  remote signed URL. The original `url` stays untouched so
+   *  auto-download and downstream consumers keep working. */
+  previewUrl?: string
+  /** [AssetStore] Cached assetId for this output (kept on the
+   *  item so the resolver effect can pre-warm the sync cache even
+   *  before the blob URL resolves). */
+  assetId?: string
   source: 'outputs' | 'imageUrls' | 'fallback'
 }
 
@@ -1676,11 +1687,20 @@ function buildGenerateOutputItems(
             (typeof rich.type === 'string' && rich.type === 'image')
             ? 'image'
             : undefined
+      // [AssetStore] Resolve the cached blob URL when this rich
+      // descriptor carries an assetId. The original `url` stays
+      // untouched so auto-download and downstream consumers keep
+      // working — only the renderer's `previewUrl` flips to the
+      // blob once IndexedDB has the asset in the sync cache.
+      const itemAssetId = typeof rich.assetId === 'string' ? rich.assetId : ''
+      const previewUrl = itemAssetId ? syncAssetUrl(itemAssetId) || undefined : undefined
       return {
         url,
         name,
         savedFilename,
         mediaType,
+        ...(previewUrl ? { previewUrl } : {}),
+        ...(itemAssetId ? { assetId: itemAssetId } : {}),
         source: 'outputs' as const,
       }
     }
@@ -1908,6 +1928,10 @@ function renderDrawflowNode(node: WorkflowNode) {
     )
     const firstImageUrl = outputImageUrls[selectedOutputIndex] || outputImageUrls[0] || ''
     const selectedOutputItem = outputItems[selectedOutputIndex] || outputItems[0]
+    // [AssetStore] Prefer the cached blob URL when available so the
+    // preview paints from IndexedDB. The fallback chain is:
+    //   previewUrl (cached blob) → firstImageUrl (original URL).
+    const firstPreviewUrl = selectedOutputItem?.previewUrl || firstImageUrl
     const previewMediaType: 'image' | 'video' = selectedOutputItem?.mediaType === 'video'
       ? 'video'
       : 'image'
@@ -1916,16 +1940,28 @@ function renderDrawflowNode(node: WorkflowNode) {
     // is populated for video outputs; we still fall back to mediaUrl
     // / url / thumbnailUrl for legacy bundles.
     const previewVideoSrc = selectedOutputItem
-      ? String(selectedOutputItem.url || '')
+      ? String(selectedOutputItem.previewUrl || selectedOutputItem.url || '')
       : ''
+    // [AssetStore] Poster chain — cached assetId first, then original
+    // `thumbnailUrl` / `poster`. The cached assetId path is preferred
+    // so a video whose poster URL expired still paints a poster.
+    const posterAssetIdFromOutput =
+      typeof (output as Record<string, unknown> | undefined)?.posterAssetId === 'string'
+        ? String((output as Record<string, unknown> | undefined)?.posterAssetId)
+        : typeof (output as Record<string, unknown> | undefined)?.thumbnailAssetId === 'string'
+          ? String((output as Record<string, unknown> | undefined)?.thumbnailAssetId)
+          : ''
+    const cachedPosterUrl = posterAssetIdFromOutput ? syncAssetUrl(posterAssetIdFromOutput) : ''
     const previewPoster = selectedOutputItem
       ? String(
-        (output as Record<string, unknown> | undefined)?.thumbnailUrl ||
-        (output as Record<string, unknown> | undefined)?.poster ||
-        ''
+        cachedPosterUrl
+        || selectedOutputItem.previewUrl
+        || (output as Record<string, unknown> | undefined)?.thumbnailUrl
+        || (output as Record<string, unknown> | undefined)?.poster
+        || ''
       )
       : ''
-    const hasOutput = firstImageUrl.length > 0
+    const hasOutput = (firstPreviewUrl || firstImageUrl).length > 0
 
     body = `
       <div class="df-node-preview-wrap df-node-generate-preview-wrap">
@@ -1946,7 +1982,7 @@ function renderDrawflowNode(node: WorkflowNode) {
                 <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
               </span>
             ` : `
-              <img class="df-node-preview-media" src="${escapeHtml(firstImageUrl)}" alt="Generated output" draggable="false">
+              <img class="df-node-preview-media" src="${escapeHtml(firstPreviewUrl)}" alt="Generated output" draggable="false">
             `}
             ${/* [Workflow] Skeleton / shimmer only renders while a
                 generated output is in flight (no usable URL yet). Once
@@ -2980,6 +3016,39 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
           }
           updateNode(nodeId, nextData as Partial<FlowNodeData>)
 
+          // [AssetStore] Cache every output URL into IndexedDB in
+          // the background. We commit the original descriptor to
+          // node.data first so the preview paints from the URL
+          // immediately — no waiting on fetch / save. Once the
+          // enrichment resolves, we rewrite _output with assetId /
+          // posterAssetId fields so the renderer can prefer the
+          // local cache on subsequent renders and after reload.
+          // The original `url` / `videoUrl` / `imageUrl` /
+          // `mediaUrl` / `thumbnailUrl` are NEVER removed, so the
+          // auto-download path keeps working without changes.
+          void (async () => {
+            try {
+              const enriched = await cacheGenerateOutputs(output)
+              if (!enriched || enriched === output) return
+              setNodeOutputs((prev) => ({ ...prev, [nodeId]: enriched }))
+              const current = workflowRef.current.nodes.find((n) => n.id === nodeId)
+              if (current) {
+                const enrichedData: Record<string, unknown> = { _output: enriched }
+                if (typeof (current.data as Record<string, unknown>).selectedOutputIndex === 'number') {
+                  enrichedData.selectedOutputIndex = (current.data as Record<string, unknown>).selectedOutputIndex
+                } else {
+                  enrichedData.selectedOutputIndex = 0
+                }
+                updateNode(nodeId, enrichedData as Partial<FlowNodeData>)
+              }
+            } catch (err) {
+              // [AssetStore] Background enrichment failure stays
+              // silent — preview keeps rendering from the URL.
+              // eslint-disable-next-line no-console
+              console.warn('[AssetStore] cacheGenerateOutputs rejected', err instanceof Error ? err.message : String(err))
+            }
+          })()
+
           // [Workflow][NodeOutputPreview] — emitted exactly once per
           // Generate-node completion so operators can confirm the
           // editor sees the right shape: which URL fields are
@@ -3460,14 +3529,29 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   // rendering — no crash, no missing-image flicker beyond the first
   // IndexedDB read.
   useEffect(() => {
-    const nodeAssetPairs: Array<{ nodeId: string; assetId: string; kind: 'media' | 'poster' }> = []
+    const nodeAssetPairs: Array<{ nodeId: string; assetId: string; kind: 'media' | 'poster' | 'output' | 'outputPoster' }> = []
     for (const node of workflow.nodes) {
-      if (node.type !== 'image') continue
-      const data = node.data as Record<string, unknown>
-      const mediaAssetId = String(data.assetId || data.mediaAssetId || data.imageAssetId || '')
-      const posterAssetId = String(data.posterAssetId || data.thumbnailAssetId || '')
-      if (mediaAssetId) nodeAssetPairs.push({ nodeId: node.id, assetId: mediaAssetId, kind: 'media' })
-      if (posterAssetId) nodeAssetPairs.push({ nodeId: node.id, assetId: posterAssetId, kind: 'poster' })
+      if (node.type === 'image') {
+        const data = node.data as Record<string, unknown>
+        const mediaAssetId = String(data.assetId || data.mediaAssetId || data.imageAssetId || '')
+        const posterAssetId = String(data.posterAssetId || data.thumbnailAssetId || '')
+        if (mediaAssetId) nodeAssetPairs.push({ nodeId: node.id, assetId: mediaAssetId, kind: 'media' })
+        if (posterAssetId) nodeAssetPairs.push({ nodeId: node.id, assetId: posterAssetId, kind: 'poster' })
+      } else if (node.type === 'generate') {
+        const data = node.data as Record<string, unknown>
+        const output = (data._output as Record<string, unknown> | undefined) || undefined
+        const topPosterAssetId = String(output?.posterAssetId || output?.thumbnailAssetId || '')
+        if (topPosterAssetId) nodeAssetPairs.push({ nodeId: node.id, assetId: topPosterAssetId, kind: 'outputPoster' })
+        const outputs = Array.isArray(output?.outputs) ? output!.outputs as unknown[] : []
+        for (const raw of outputs) {
+          if (!raw || typeof raw !== 'object') continue
+          const item = raw as Record<string, unknown>
+          const itemAssetId = typeof item.assetId === 'string' ? item.assetId : ''
+          const itemPosterAssetId = typeof item.posterAssetId === 'string' ? item.posterAssetId : ''
+          if (itemAssetId) nodeAssetPairs.push({ nodeId: node.id, assetId: itemAssetId, kind: 'output' })
+          if (itemPosterAssetId) nodeAssetPairs.push({ nodeId: node.id, assetId: itemPosterAssetId, kind: 'outputPoster' })
+        }
+      }
     }
     if (nodeAssetPairs.length === 0) return
 
