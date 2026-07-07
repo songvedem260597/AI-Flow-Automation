@@ -880,6 +880,180 @@ function normalizeNodeType(value: unknown): FlowNodeType {
   return 'prompt'
 }
 
+/**
+ * Plain JSON import hotfix — pick the lightweight asset metadata
+ * fields that are safe to round-trip through `coerceNodeData`.
+ *
+ * Heavies are deliberately omitted:
+ *   - data:image / data:video / blob: strings
+ *   - imageData / mediaData / videoData / videoPoster / mediaPoster
+ *     (legacy base64 blobs that the migration helper rewrites on
+ *     open, see `assetMigration.ts`)
+ *   - objectUrl / previewUrl / resolvedAssetUrl / assetObjectUrl
+ *     (transient in-memory object URLs that die after reload)
+ *   - File / blob / rawFile / base64 / dataUrl (binary blobs that
+ *     never belonged in the store)
+ *
+ * Anything outside this whitelist is dropped. The persist
+ * sanitizer remains the safety net for anything that slips through.
+ */
+const SAFE_MEDIA_METADATA_KEYS: ReadonlySet<string> = new Set<string>([
+  // asset pointer ids
+  'assetId',
+  'mediaAssetId',
+  'imageAssetId',
+  'posterAssetId',
+  'thumbnailAssetId',
+  // file / mime metadata
+  'fileName',
+  'mediaName',
+  'mimeType',
+  'mediaMimeType',
+  'size',
+  // dimensions + duration
+  'width',
+  'height',
+  'mediaWidth',
+  'mediaHeight',
+  'imageWidth',
+  'imageHeight',
+  'videoWidth',
+  'videoHeight',
+  'duration'
+])
+
+const isShortString = (value: unknown): value is string =>
+  typeof value === 'string' && value.length > 0 && value.length < 4_096
+
+const isShortNumber = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value)
+
+/**
+ * Pick safe asset metadata (assetId pointers + dimensions + mime
+ * + size) from a raw `node.data` blob. Returns a flat object with
+ * ONLY the safe fields preserved. Always returns a fresh object.
+ */
+const pickSafeMediaMetadata = (raw: Record<string, unknown>): Record<string, unknown> => {
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(raw)) {
+    if (!SAFE_MEDIA_METADATA_KEYS.has(key)) continue
+    if (isShortString(value) || isShortNumber(value) || typeof value === 'boolean') {
+      out[key] = value
+    }
+  }
+  return out
+}
+
+/**
+ * Safe Generate `_output` whitelist for plain JSON import. Mirrors
+ * the persist-side `sanitizeGenerateOutput` contract — keep the
+ * metadata the renderer reads back on reload, drop heavy strings.
+ *
+ * Items inside `outputs[]` are filtered through
+ * `SAFE_GENERATE_OUTPUT_ITEM_KEYS`. URL fields are allowed only
+ * when they start with `http://` / `https://` / `blob:` — `data:`
+ * URLs are still stripped (Phase 3 migration handles those).
+ */
+const SAFE_GENERATE_OUTPUT_TOP_KEYS: ReadonlySet<string> = new Set<string>([
+  'assetId',
+  'posterAssetId',
+  'thumbnailAssetId',
+  'mediaType',
+  'type',
+  'mimeType',
+  'size',
+  'createdAt'
+])
+
+const SAFE_GENERATE_OUTPUT_ITEM_KEYS: ReadonlySet<string> = new Set<string>([
+  'assetId',
+  'posterAssetId',
+  'thumbnailAssetId',
+  'url',
+  'imageUrl',
+  'mediaUrl',
+  'videoUrl',
+  'thumbnailUrl',
+  'poster',
+  'mediaType',
+  'type',
+  'mimeType',
+  'size',
+  'width',
+  'height',
+  'duration',
+  'savedFilename',
+  'fileNameFromFlow',
+  'name',
+  'outputAvailable',
+  'createdAt'
+])
+
+const isHttpishUrl = (value: unknown): value is string =>
+  typeof value === 'string'
+  && value.length > 0
+  && value.length < 4_096
+  && (/^https?:\/\//i.test(value) || /^blob:/i.test(value))
+
+const pickSafeGenerateOutput = (raw: unknown): Record<string, unknown> | undefined => {
+  if (!raw || typeof raw !== 'object') return undefined
+  const record = raw as Record<string, unknown>
+  const out: Record<string, unknown> = {}
+
+  for (const [key, child] of Object.entries(record)) {
+    if (!SAFE_GENERATE_OUTPUT_TOP_KEYS.has(key)) continue
+    if (key === 'assetId' || key === 'posterAssetId' || key === 'thumbnailAssetId') {
+      if (isShortString(child)) out[key] = child
+      continue
+    }
+    if (isShortString(child) || isShortNumber(child) || typeof child === 'boolean') {
+      out[key] = child
+    }
+  }
+
+  if (Array.isArray(record.outputs)) {
+    const safeItems: unknown[] = []
+    for (const item of record.outputs) {
+      if (!item || typeof item !== 'object') continue
+      const itemRecord = item as Record<string, unknown>
+      const safeItem: Record<string, unknown> = {}
+      for (const [itemKey, itemValue] of Object.entries(itemRecord)) {
+        if (!SAFE_GENERATE_OUTPUT_ITEM_KEYS.has(itemKey)) continue
+        if (
+          itemKey === 'assetId'
+          || itemKey === 'posterAssetId'
+          || itemKey === 'thumbnailAssetId'
+        ) {
+          if (isShortString(itemValue)) safeItem[itemKey] = itemValue
+          continue
+        }
+        if (
+          itemKey === 'url'
+          || itemKey === 'imageUrl'
+          || itemKey === 'mediaUrl'
+          || itemKey === 'videoUrl'
+          || itemKey === 'thumbnailUrl'
+          || itemKey === 'poster'
+        ) {
+          // Only allow http(s) / blob: URLs to round-trip. `data:`
+          // strings are dropped — the persist sanitizer would
+          // strip them anyway and Phase 3 migration re-writes
+          // them through IndexedDB on the next open.
+          if (isHttpishUrl(itemValue)) safeItem[itemKey] = itemValue
+          continue
+        }
+        if (isShortString(itemValue) || isShortNumber(itemValue) || typeof itemValue === 'boolean') {
+          safeItem[itemKey] = itemValue
+        }
+      }
+      if (Object.keys(safeItem).length > 0) safeItems.push(safeItem)
+    }
+    if (safeItems.length > 0) out.outputs = safeItems
+  }
+
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
 function coerceNodeData(type: FlowNodeType, raw: Record<string, unknown>): FlowNodeData {
   const label = String(raw.label || raw.node_name || raw.name || type)
   const provider = coerceProvider(raw.provider || raw.gen_type || raw.model_provider)
@@ -923,7 +1097,12 @@ function coerceNodeData(type: FlowNodeType, raw: Record<string, unknown>): FlowN
       videoData: typeof raw.videoData === 'string' ? raw.videoData : undefined,
       videoPoster: typeof raw.videoPoster === 'string' ? raw.videoPoster : undefined,
       aspectRatio: String(raw.aspectRatio || raw.ratio || '1:1') as FlowNodeData['aspectRatio'],
-      provider
+      provider,
+      // Plain JSON import hotfix — preserve safe asset metadata so a
+      // local machine that already has the IndexedDB blob can keep
+      // rendering the preview without going through the .aiflow.json
+      // bundle. Drops heavy / data: / blob: strings automatically.
+      ...pickSafeMediaMetadata(raw)
     }
   }
 
@@ -945,6 +1124,13 @@ function coerceNodeData(type: FlowNodeType, raw: Record<string, unknown>): FlowN
       timeout: Number(raw.timeout || 90000),
       prompt: raw.prompt || ''
     }
+    // Plain JSON import hotfix — preserve safe _output metadata so
+    // cached Generate outputs (assetId / http(s) URLs) round-trip
+    // through plain JSON export / import. data: URLs and blob: are
+    // intentionally filtered; Phase 3 migration handles data: at
+    // next editor mount.
+    const safeOutput = pickSafeGenerateOutput(raw._output)
+    if (safeOutput) nodeData._output = safeOutput
     return { ...nodeData, ...sanitizeGenerateDataPatch(nodeData, {}) } as FlowNodeData
   }
 
