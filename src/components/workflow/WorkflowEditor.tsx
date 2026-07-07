@@ -66,6 +66,28 @@ const WORKFLOW_LIST_DEBUG = (): boolean => {
   }
 }
 
+// [WorkflowSelection] Debug channel used by the canvas selection /
+// highlight pipeline. Gated behind `AI_FLOW_DEBUG` so it stays silent
+// in normal runs. Prefix is greppable as `[WorkflowSelection]` so the
+// entire selection lifecycle can be reconstructed from a single browser
+// session without enabling the broader CanvasInvestigate flags.
+const WORKFLOW_SELECTION_DEBUG = (): boolean => {
+  try {
+    return typeof localStorage !== 'undefined' && localStorage.getItem('AI_FLOW_DEBUG') === '1'
+  } catch {
+    return false
+  }
+}
+
+const wfSelectionLog = (event: string, payload: Record<string, unknown> = {}): void => {
+  if (!WORKFLOW_SELECTION_DEBUG()) return
+  try {
+    console.log(`[WorkflowSelection][${event}]`, JSON.stringify(payload))
+  } catch {
+    // Never let debug logging throw into runtime.
+  }
+}
+
 const SUPPORTED_NODE_TYPES: FlowNodeType[] = [
   'prompt',
   'image',
@@ -1885,6 +1907,48 @@ function getWorkflowDataSignature(workflow: Workflow) {
     .join('|')
 }
 
+function buildWorkflowSliceForTarget(workflow: Workflow, targetNodeId: string): Workflow | null {
+  const targetNode = workflow.nodes.find((node) => node.id === targetNodeId)
+  if (!targetNode) return null
+
+  const incomingByTarget = new Map<string, WorkflowEdge[]>()
+  for (const edge of workflow.edges) {
+    const list = incomingByTarget.get(edge.target) || []
+    list.push(edge)
+    incomingByTarget.set(edge.target, list)
+  }
+
+  const nodeIds = new Set<string>([targetNodeId])
+  const edgeIds = new Set<string>()
+  const stack = [targetNodeId]
+
+  while (stack.length > 0) {
+    const nodeId = stack.pop()
+    if (!nodeId) continue
+    for (const edge of incomingByTarget.get(nodeId) || []) {
+      edgeIds.add(edge.id)
+      if (!nodeIds.has(edge.source)) {
+        nodeIds.add(edge.source)
+        stack.push(edge.source)
+      }
+    }
+  }
+
+  const nodes = workflow.nodes
+    .filter((node) => nodeIds.has(node.id))
+    .map((node) => cloneDeep(node))
+  const edges = workflow.edges
+    .filter((edge) => edgeIds.has(edge.id) && nodeIds.has(edge.source) && nodeIds.has(edge.target))
+    .map((edge) => cloneDeep(edge))
+
+  return {
+    ...workflow,
+    name: `${workflow.name} / ${String(targetNode.data?.label || targetNode.type)}`,
+    nodes,
+    edges
+  }
+}
+
 interface NodeInspectorProps {
   workflow: Workflow
   nodeId: string
@@ -2267,12 +2331,23 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const updateWorkflow = useWorkflowStore((s) => s.updateWorkflow)
   const addNode = useWorkflowStore((s) => s.addNode)
   const updateNode = useWorkflowStore((s) => s.updateNode)
+  const updateNodeAndRemoveEdges = useWorkflowStore((s) => s.updateNodeAndRemoveEdges)
   const updateNodePosition = useWorkflowStore((s) => s.updateNodePosition)
   const updateNodePositions = useWorkflowStore((s) => s.updateNodePositions)
   const addEdgeToStore = useWorkflowStore((s) => s.addEdge)
   const deleteNode = useWorkflowStore((s) => s.deleteNode)
   const deleteEdge = useWorkflowStore((s) => s.deleteEdge)
   const setSelectedNode = useWorkflowStore((s) => s.setSelectedNode)
+  // [WorkflowSelection] Logged wrapper. Routes every
+  // `setSelectedNode(...)` call from the entire component through
+  // a single log so a re-add after a clear is always traceable.
+  // Default reason is the callsite description; callers can
+  // override with a more specific source string.
+  const setSelectedNodeWithLog = (nodeId: string | null, reason: string) => {
+    const from = useWorkflowStore.getState().selectedNodeId
+    wfSelectionLog('setSelectedNode', { from, to: nodeId, reason })
+    setSelectedNode(nodeId)
+  }
   const selectedNodeId = useWorkflowStore((s) => s.selectedNodeId)
   const undoWorkflow = useWorkflowStore((s) => s.undoWorkflow)
   const redoWorkflow = useWorkflowStore((s) => s.redoWorkflow)
@@ -2329,6 +2404,24 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   // trigger the heavy full-canvas path.
   const lightweightConnectionRefreshFrameRef = useRef<number | null>(null)
   const lightweightConnectionRefreshNodeIdRef = useRef<string | null>(null)
+
+  // [WorkflowSelection] Defensive guard against a Drawflow-stale
+  // `nodeSelected` re-firing within the same mousedown that just
+  // cleared the selection. Drawflow's click handler is synchronous
+  // and runs inside the same mousedown event; if our `nodeUnselected`
+  // listener fires `clearCanvasSelection(...)` (which removes the
+  // `.selected` class and `setSelectedNode(null)`), but a subsequent
+  // `nodeSelected` event lands within the same event loop turn with
+  // a stale id, the highlight would re-appear. We use this ref to
+  // suppress that re-add for a short window. Default 0 = inactive.
+  const clearInFlightUntilRef = useRef<number>(0)
+
+  // [WorkflowSelection] Editor root wrapper ref used for a JSX
+  // `onPointerDownCapture` handler. We deliberately wire this
+  // through React (not `addEventListener`) so the lifecycle is
+  // tied to the component mount and cannot drift out of sync with
+  // the editor's `useEffect` cleanup path.
+  const editorRootRef = useRef<HTMLDivElement | null>(null)
 
   const [isPaletteOpen, setIsPaletteOpen] = useState(false)
   const [nodePickerSearch, setNodePickerSearch] = useState('')
@@ -2658,6 +2751,11 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       })
     },
   }), [workflow, updateNode]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const pipelineCallbacksRef = useRef<PipelineCallbacks>(pipelineCallbacks)
+  useEffect(() => {
+    pipelineCallbacksRef.current = pipelineCallbacks
+  }, [pipelineCallbacks])
 
   // Apply node run state classes to DOM nodes.
   //
@@ -3610,6 +3708,50 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     return Boolean(normalizePortConnection(source, target))
   }
 
+  const getNodePortTypeByHandle = (node: WorkflowNode | undefined, side: 'in' | 'out', handle: string): DrawflowPortType | null => {
+    if (!node) return null
+    const index = Number.parseInt(handle.split('_')[1] || '', 10) - 1
+    if (!Number.isFinite(index) || index < 0) return null
+    const ports = drawflowPortGroupsForNode(node)[side]
+    return ports[index]?.type || null
+  }
+
+  const isWorkflowEdgeCompatible = (edge: WorkflowEdge, nodesById: Map<string, WorkflowNode>) => {
+    const sourceType = getNodePortTypeByHandle(nodesById.get(edge.source), 'out', edge.sourceHandle || 'output_1')
+    const targetType = getNodePortTypeByHandle(nodesById.get(edge.target), 'in', edge.targetHandle || 'input_1')
+    return Boolean(sourceType && targetType && sourceType === targetType)
+  }
+
+  const unlinkIncompatibleConnectionsForNode = (nodeId: string, nextNode: WorkflowNode) => {
+    const currentWorkflow = workflowRef.current
+    const nodesById = new Map(currentWorkflow.nodes.map((item) => [item.id, item]))
+    nodesById.set(nodeId, nextNode)
+
+    const staleEdges = currentWorkflow.edges.filter((edge) =>
+      (edge.source === nodeId || edge.target === nodeId) &&
+      !isWorkflowEdgeCompatible(edge, nodesById)
+    )
+    if (staleEdges.length === 0) return []
+
+    const editor = editorRef.current
+    if (editor) {
+      suppressEdgeEventRef.current = true
+      for (const edge of staleEdges) {
+        editor.removeSingleConnection(
+          edge.source,
+          edge.target,
+          edge.sourceHandle || 'output_1',
+          edge.targetHandle || 'input_1'
+        )
+      }
+      suppressEdgeEventRef.current = false
+    }
+
+    requestAnimationFrame(applyPortAttributes)
+    scheduleConnectionSync()
+    return staleEdges.map((edge) => edge.id)
+  }
+
   const syncConnectionOverlays = () => {
     const canvas = canvasRef.current
     if (!canvas) return
@@ -3680,6 +3822,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   }
 
   const syncSelectedNodeDom = (selectedId = useWorkflowStore.getState().selectedNodeId) => {
+    wfSelectionLog('syncSelectedNodeDom', { selectedId })
     const canvas = canvasRef.current
     const editor = editorRef.current
     if (!canvas) return
@@ -3696,6 +3839,162 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
 
     if (editor) editor.node_selected = selectedEl
     scheduleConnectionSync()
+  }
+
+  // [WorkflowSelection] Single source of truth for clearing the
+  // canvas selection. ALL clear paths (canvas pointerdown, document
+  // pointerdown, drawflow nodeUnselected, root onPointerDownCapture)
+  // funnel through this helper. It:
+  //   1. Logs a `clear.before` snapshot of every selector that might
+  //      be holding the highlight on screen, so we can verify which
+  //      CSS class is the real one.
+  //   2. Removes all known highlight classes from the DOM.
+  //   3. Nulls out Drawflow's internal selected state so the library
+  //      cannot re-add the highlight from inside its own mousedown
+  //      handler.
+  //   4. Sets `clearInFlightUntilRef` to suppress any stale
+  //      `nodeSelected` re-firing for a short window.
+  //   5. Calls `setSelectedNode(null)` so the store-driven
+  //      `syncSelectedNodeDom(null)` effect also runs.
+  //   6. Logs a `clear.afterRAF` snapshot to confirm the DOM
+  //      actually cleared.
+  const clearCanvasSelection = (reason: string = 'unspecified') => {
+    const canvas = canvasRef.current
+    const editor = editorRef.current
+
+    if (canvas) {
+      // Snapshot BEFORE removing anything. Multiple selectors are
+      // checked because the original "click canvas doesn't clear"
+      // bug may have been caused by an unmeasured CSS class
+      // (e.g. `.df-node-selected`, `path.selected`, etc.).
+      const selectedNodes = Array.from(
+        canvas.querySelectorAll<HTMLElement>('.drawflow-node.selected')
+      ).map((el) => ({ id: el.id, classes: el.className }))
+      const highlightedConnNodeSelected = Array.from(
+        canvas.querySelectorAll<SVGSVGElement>('svg.connection.conn-node-selected')
+      ).map((el) => el.getAttribute('class'))
+      const activeConnections = Array.from(
+        canvas.querySelectorAll<SVGSVGElement>('svg.connection.connection-active')
+      ).map((el) => el.getAttribute('class'))
+      const pathSelected = Array.from(
+        canvas.querySelectorAll<SVGPathElement>('svg.connection path.main-path.selected')
+      ).map((el) => el.getAttribute('class'))
+      const dfNodeSelected = Array.from(
+        canvas.querySelectorAll<HTMLElement>('.drawflow-node.df-node-selected')
+      ).map((el) => el.className)
+
+      wfSelectionLog('clear.before', {
+        reason,
+        selectedNodeIdStore: useWorkflowStore.getState().selectedNodeId,
+        selectedNodes,
+        highlightedConnNodeSelected,
+        activeConnections,
+        pathSelected,
+        dfNodeSelected
+      })
+    }
+
+    // Selection intent ref must agree before Drawflow's `mouseUp` runs
+    // — otherwise the nodeUnselected handler will leave the .selected
+    // class stuck on the previously-clicked node.
+    selectionMouseDownRef.current = { nodeId: null, clearOnUnselect: true }
+
+    if (canvas) {
+      // Defensive DOM flush BEFORE the React render commits. We strip
+      // every selector that the [clear.before] snapshot checked so the
+      // `afterRAF` snapshot can confirm the count drops to 0.
+      canvas.querySelectorAll<HTMLElement>('.drawflow-node.selected').forEach((el) => {
+        el.classList.remove('selected')
+      })
+      canvas.querySelectorAll<HTMLElement>('.drawflow-node.df-node-selected').forEach((el) => {
+        el.classList.remove('df-node-selected')
+      })
+      canvas.querySelectorAll<SVGSVGElement>('.drawflow svg.connection').forEach((connection) => {
+        connection.classList.remove('conn-node-selected', 'connection-active', 'selected')
+        connection.querySelectorAll<SVGPathElement>('path.main-path').forEach((path) => {
+          path.classList.remove('selected')
+        })
+      })
+    }
+
+    // Clear Drawflow's INTERNAL selected state. Without this, Drawflow
+    // can re-add `.selected` on its next internal dispatch even after
+    // we removed the class — because `node_selected` still points at
+    // the same DOM element. We use `try` because the Drawflow
+    // typings don't formally declare these fields, and a stray missing
+    // property should never crash the clear path.
+    if (editor) {
+      try {
+        // Cast through `unknown` so we can clear internal fields
+        // without the TS compiler complaining about undeclared
+        // properties on the typed DrawflowInstance.
+        const e = editor as unknown as Record<string, unknown>
+        e.node_selected = null
+        e.ele_selected = null
+        e.connection_selected = null
+        e.connection_ele_selected = null
+        e.editor_selected = false
+      } catch {
+        // No-op: never let a missing field crash clear.
+      }
+    }
+
+    // Suppress any stale `nodeSelected` re-fire for the next 120ms.
+    // This is the safety net for the [clear.diag] case where
+    // drawflow's click handler re-dispatches `nodeSelected` after
+    // our `nodeUnselected` listener already cleared the selection.
+    clearInFlightUntilRef.current = performance.now() + 120
+
+    const previousSelectedId = useWorkflowStore.getState().selectedNodeId
+    if (previousSelectedId) {
+      // Route through the logging wrapper so a `[setSelectedNode]`
+      // entry appears in the trace even when the clear path is
+      // triggered by something other than the nodeUnselected
+      // event (e.g. document mousedown, root capture).
+      setSelectedNodeWithLog(null, `clear:${reason}`)
+    }
+
+    // Schedule the canonical sync in case any external source added
+    // a stray .selected / .conn-node-selected we did not know about.
+    // Explicit `null` argument ensures we don't pick up a stale
+    // store value if the setSelectedNode write has not flushed yet.
+    requestAnimationFrame(() => {
+      syncSelectedNodeDom(null)
+      if (canvas) {
+        const afterNodes = canvas.querySelectorAll('.drawflow-node.selected').length
+        const afterConn = canvas.querySelectorAll('svg.connection.conn-node-selected').length
+        const afterPath = canvas.querySelectorAll('svg.connection path.main-path.selected').length
+        const afterDfNode = canvas.querySelectorAll('.drawflow-node.df-node-selected').length
+        const afterActive = canvas.querySelectorAll('svg.connection.connection-active').length
+        wfSelectionLog('clear.afterRAF', {
+          reason,
+          selectedNodeIdStore: useWorkflowStore.getState().selectedNodeId,
+          afterNodes,
+          afterConn,
+          afterPath,
+          afterDfNode,
+          afterActive
+        })
+      }
+    })
+  }
+
+  const runGenerateNodeWithInputs = async (nodeId: string) => {
+    const currentWorkflow = workflowRef.current
+    const targetNode = currentWorkflow.nodes.find((node) => node.id === nodeId)
+    if (!targetNode || targetNode.type !== 'generate') return
+    if (usePipelineStore.getState().isRunning) return
+
+    const workflowSlice = buildWorkflowSliceForTarget(currentWorkflow, nodeId)
+    if (!workflowSlice) return
+
+    closeNodePillMenu()
+    clearAllRunDomClasses()
+    setNodeRunStates({})
+    setActiveEdges({})
+    setNodeOutputs({})
+
+    await runPipeline(workflowSlice, pipelineCallbacksRef.current)
   }
 
   const applyCanvasZoom = (nextZoom: number, anchor?: { x: number; y: number }) => {
@@ -3791,11 +4090,28 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     editor.start()
 
     editor.on('nodeSelected', (id: string | number) => {
-      setSelectedNode(String(id))
-      requestAnimationFrame(() => syncSelectedNodeDom(String(id)))
+      const nodeId = String(id)
+      // [WorkflowSelection] Stale-event guard. If a `clearCanvasSelection`
+      // fired within the last 120ms, a synchronous re-fire of
+      // `nodeSelected` from Drawflow's own click handler would
+      // re-add the highlight we just removed. Drop the event and log
+      // it so we can confirm the guard is doing its job.
+      if (performance.now() < clearInFlightUntilRef.current) {
+        wfSelectionLog('nodeSelected.suppressed', {
+          nodeId,
+          msUntilExpiry: Math.round(clearInFlightUntilRef.current - performance.now())
+        })
+        return
+      }
+      wfSelectionLog('nodeSelected.event', { nodeId })
+      setSelectedNodeWithLog(nodeId, 'editor:nodeSelected')
+      requestAnimationFrame(() => syncSelectedNodeDom(nodeId))
     })
 
     editor.on('nodeUnselected', () => {
+      wfSelectionLog('nodeUnselected.event', {
+        selectionIntent: selectionMouseDownRef.current
+      })
       const selectionIntent = selectionMouseDownRef.current
       if (selectionIntent?.nodeId) {
         requestAnimationFrame(() => syncSelectedNodeDom(selectionIntent.nodeId))
@@ -3803,7 +4119,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       }
 
       if (!selectionIntent || selectionIntent.clearOnUnselect) {
-        setSelectedNode(null)
+        clearCanvasSelection('drawflow-nodeUnselected')
       }
     })
 
@@ -4060,16 +4376,43 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       const canvasSurface = !nodeEl && Boolean(target.closest('.drawflow, .parent-drawflow'))
       const nodeId = nodeEl && !outputPort && !inputPort ? nodeEl.id.replace(/^node-/, '') : null
 
+      // [WorkflowSelection] Diagnostic log. Emits on EVERY mousedown
+      // landing inside the canvas. Off by default; enable with
+      // `localStorage.setItem('AI_FLOW_DEBUG','1')` to see whether
+      // the handler even runs for a given click.
+      wfSelectionLog('pointerdown.inspect', {
+        source: 'canvas-mousedown',
+        tag: target.tagName,
+        className: target.className,
+        id: target.id,
+        closestDrawflowNode: nodeEl?.id ?? null,
+        closestConnection: connectionPath ? true : false,
+        closestCanvas: canvasSurface,
+        closestParentDrawflow: !!target.closest('.parent-drawflow'),
+        closestControl: !!target.closest(
+          'button, input, textarea, select, [role="button"], [data-node-action]'
+        ),
+        selectedNodeIdBefore: useWorkflowStore.getState().selectedNodeId,
+        domSelectedNodesCount: canvasRef.current
+          ? canvasRef.current.querySelectorAll('.drawflow-node.selected').length
+          : 0,
+        domSelectedConnectionCount: canvasRef.current
+          ? canvasRef.current.querySelectorAll('svg.connection.conn-node-selected').length
+          : 0,
+        eventPhase: event.eventPhase,
+        button: event.button
+      })
+
       selectionMouseDownRef.current = {
         nodeId,
         clearOnUnselect: Boolean(outputPort || connectionPath || canvasSurface)
       }
 
       if (nodeId) {
-        setSelectedNode(nodeId)
+        setSelectedNodeWithLog(nodeId, 'canvas-mousedown:node')
         requestAnimationFrame(() => syncSelectedNodeDom(nodeId))
       } else if (canvasSurface || connectionPath) {
-        setSelectedNode(null)
+        clearCanvasSelection('canvas-mousedown:surface')
       }
     }
 
@@ -4084,6 +4427,74 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     // own drag logic on the canvas surface, then mutates
     // editor.canvas_x / canvas_y + the precanvas transform the same
     // way applyCanvasZoom does.
+    const handleDocumentSelectionMouseDown = (event: MouseEvent) => {
+      if (event.button !== 0) return
+
+      const target = event.target as HTMLElement | null
+      if (!target) return
+
+      // Skip when the click landed on any interactive element inside
+      // a node. Without this guard, clicking node toolbar buttons or
+      // inline editors would accidentally clear the selection.
+      if (
+        target.closest(
+          '.drawflow-node, .input, .output, .df-hover-toolbar, .df-node-toolbar, .df-node-settings-bar, .df-node-pill-menu, .df-node-prompt-editor, .aiflow-node-picker, button, [role="button"], input, textarea, select, [contenteditable="true"], [data-node-action]'
+        )
+      ) {
+        return
+      }
+
+      // Only handle clicks that landed inside the editor / canvas
+      // region. Clicks outside the editor (e.g. on the top nav or the
+      // sidebar) should NOT clear the workflow selection — the user
+      // might just be giving focus to another panel.
+      const insideEditor = !!target.closest(
+        '.ai-drawflow-canvas, .drawflow, .parent-drawflow, .aiflow-wf-toolbar, [data-workflow-editor-root]'
+      )
+      if (!insideEditor) return
+
+      // [WorkflowSelection] Diagnostic log. Captures the click that
+      // would have been silently dropped before — clicking on a
+      // non-Drawflow background (dotted overlay, padding around the
+      // canvas, etc.) used to fall through without clearing.
+      wfSelectionLog('pointerdown.inspect', {
+        source: 'document-mousedown',
+        tag: target.tagName,
+        className: target.className,
+        id: target.id,
+        closestDrawflowNode: target.closest('.drawflow-node')?.id ?? null,
+        closestConnection: !!target.closest('.main-path, svg.connection'),
+        closestCanvas: !!target.closest('.drawflow, .parent-drawflow'),
+        closestParentDrawflow: !!target.closest('.parent-drawflow'),
+        closestControl: !!target.closest(
+          'button, input, textarea, select, [role="button"], [data-node-action]'
+        ),
+        selectedNodeIdBefore: useWorkflowStore.getState().selectedNodeId,
+        domSelectedNodesCount: canvasRef.current
+          ? canvasRef.current.querySelectorAll('.drawflow-node.selected').length
+          : 0,
+        domSelectedConnectionCount: canvasRef.current
+          ? canvasRef.current.querySelectorAll('svg.connection.conn-node-selected').length
+          : 0,
+        eventPhase: event.eventPhase,
+        button: event.button
+      })
+
+      // No-op DOM diff: only clear when there IS a selected node OR
+      // a stray .selected / .conn-node-selected currently visible. We
+      // no longer early-return on `!selectedNodeId` — that early-return
+      // was the root cause of the "highlight won't clear" bug when the
+      // store was null but a stale class lingered.
+      const canvas = canvasRef.current
+      if (!canvas) return
+      const hasSelectedNodeClass = canvas.querySelector('.drawflow-node.selected') !== null
+      const hasSelectedEdgeClass = canvas.querySelector('svg.connection.conn-node-selected') !== null
+      const storeSelectedId = useWorkflowStore.getState().selectedNodeId
+      if (!storeSelectedId && !hasSelectedNodeClass && !hasSelectedEdgeClass) return
+
+      clearCanvasSelection(`document-mousedown:${target.tagName.toLowerCase()}:${target.className?.split(/\s+/).slice(0, 2).join('.') || 'unknown'}`)
+    }
+
     let panActive = false
     let panStartX = 0
     let panStartY = 0
@@ -4283,7 +4694,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
               aspectRatio
             }
 
-            updateNode(nodeId, {
+            const nextPatch = {
               ...basePatch,
               imageData: fileMediaType === 'image' ? imageData : '',
               imageUrl: '',
@@ -4296,7 +4707,10 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
               videoWidth: fileMediaType === 'video' ? width : undefined,
               videoHeight: fileMediaType === 'video' ? height : undefined,
               videoPoster: fileMediaType === 'video' ? poster || '' : ''
-            } as Partial<FlowNodeData>)
+            } as Partial<FlowNodeData>
+            const nextNode = { ...node, data: { ...node.data, ...nextPatch } as FlowNodeData }
+            const staleEdgeIds = unlinkIncompatibleConnectionsForNode(nodeId, nextNode)
+            updateNodeAndRemoveEdges(nodeId, nextPatch, staleEdgeIds)
             scheduleDrawflowConnectionRefresh(nodeId)
             cleanup()
           }
@@ -4387,6 +4801,11 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         closeNodePillMenu()
         deleteNode(nodeId)
         setInspectorNodeId((current) => (current === nodeId ? null : current))
+      } else if (action === 'run') {
+        closeNodePillMenu()
+        void runGenerateNodeWithInputs(nodeId).catch((error) => {
+          window.alert(error instanceof Error ? error.message : 'Unable to run node.')
+        })
       } else if (action === 'settings') {
         closeNodePillMenu()
         setInspectorNodeId(nodeId)
@@ -4686,6 +5105,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     canvasEl.addEventListener('mousedown', handleBidirectionalPortMouseDown, true)
     canvasEl.addEventListener('mousedown', handleSelectionMouseDown, true)
     canvasEl.addEventListener('mousedown', stopNodePillDragStart, true)
+    document.addEventListener('mousedown', handleDocumentSelectionMouseDown, true)
     canvasEl.addEventListener('pointerdown', handleViewportPanPointerDown, true)
     canvasEl.addEventListener('dblclick', handlePromptInlineEdit)
     canvasEl.addEventListener('dblclick', handleImageNodeUpload)
@@ -4720,6 +5140,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       canvasEl.removeEventListener('mousedown', handleBidirectionalPortMouseDown, true)
       canvasEl.removeEventListener('mousedown', handleSelectionMouseDown, true)
       canvasEl.removeEventListener('mousedown', stopNodePillDragStart, true)
+      document.removeEventListener('mousedown', handleDocumentSelectionMouseDown, true)
       canvasEl.removeEventListener('pointerdown', handleViewportPanPointerDown, true)
       canvasEl.removeEventListener('dblclick', handlePromptInlineEdit)
       canvasEl.removeEventListener('dblclick', handleImageNodeUpload)
@@ -4734,7 +5155,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       portDragCleanupRef.current?.()
       canvasEl.replaceChildren()
     }
-  }, [addEdgeToStore, deleteEdge, deleteNode, setSelectedNode, updateNode, updateNodePosition])
+  }, [addEdgeToStore, deleteEdge, deleteNode, setSelectedNode, updateNode, updateNodeAndRemoveEdges, updateNodePosition])
 
   useEffect(() => {
     hydrateDrawflow()
@@ -5324,8 +5745,54 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
 
       <div className="relative flex min-h-0 flex-1 overflow-hidden">
         <div
+          ref={editorRootRef}
+          data-workflow-editor-root="true"
           className="relative min-w-0 flex-1 overflow-hidden bg-[#101010]"
           onContextMenu={handleCanvasContextMenu}
+          onPointerDownCapture={(event) => {
+            // [WorkflowSelection] Authoritative React-level clear
+            // path. We wire this directly through React (not
+            // addEventListener) so:
+            //   1. The lifecycle is tied to the component mount —
+            //      no risk of a stale listener surviving a hot
+            //      reload.
+            //   2. It runs in the CAPTURE phase before any
+            //      bubble-phase listener (including Drawflow's
+            //      own click handler). This is the earliest point
+            //      at which we can guarantee our clear wins over
+            //      any other code that might re-add the highlight.
+            //
+            // The guard mirrors `handleDocumentSelectionMouseDown`:
+            // skip when the click landed on a node, port,
+            // connection, or any interactive control inside a
+            // node. The skip set is intentionally a superset of
+            // the inline checks below so we never accidentally
+            // clear a selection that lives inside a node the
+            // user is interacting with.
+            if (event.button !== 0) return
+            const target = event.target as HTMLElement | null
+            if (!target) return
+            if (
+              target.closest(
+                '.drawflow-node, .input, .output, .df-hover-toolbar, .df-node-toolbar, .df-node-settings-bar, .df-node-pill-menu, .df-node-prompt-editor, .aiflow-node-picker, button, [role="button"], input, textarea, select, [contenteditable="true"], [data-node-action]'
+              )
+            ) {
+              return
+            }
+            // We only want to clear when the click is on the
+            // canvas background — not when the user clicks the
+            // toolbar, the run/stop button, or any other UI
+            // control. The wrapper we attach this handler to
+            // contains the canvas AND the toolbar, so we use the
+            // closest('.ai-drawflow-canvas, .parent-drawflow')
+            // check to ensure we only clear on canvas-surface
+            // clicks.
+            const onCanvas = !!target.closest(
+              '.ai-drawflow-canvas, .parent-drawflow, .drawflow'
+            )
+            if (!onCanvas) return
+            clearCanvasSelection('root-pointerdown-capture')
+          }}
         >
           <div className="pointer-events-none absolute inset-0 opacity-[0.32] [background-image:radial-gradient(circle,rgba(255,255,255,0.12)_1px,transparent_1px)] [background-size:22px_22px]" />
           <div ref={canvasRef} className="ai-drawflow-canvas absolute inset-0" />

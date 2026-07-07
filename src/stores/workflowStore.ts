@@ -285,6 +285,7 @@ interface WorkflowState {
 
   addNode: (type: FlowNodeType, position: { x: number; y: number }) => WorkflowNode | null
   updateNode: (nodeId: string, data: Partial<WorkflowNode['data']>) => void
+  updateNodeAndRemoveEdges: (nodeId: string, data: Partial<WorkflowNode['data']>, edgeIds: string[]) => void
   updateNodePosition: (nodeId: string, position: { x: number; y: number }) => void
   updateNodePositions: (positions: Record<string, { x: number; y: number }>, workflowId?: string) => void
   deleteNode: (nodeId: string) => void
@@ -741,6 +742,36 @@ export const useWorkflowStore = create<WorkflowState>()(
           ),
           isDirty: true
         }))
+      },
+
+      updateNodeAndRemoveEdges: (nodeId, data, edgeIds) => {
+        const edgeIdSet = new Set(edgeIds)
+        set((state) => {
+          const workflow = state.workflows.find((w) => w.id === state.activeWorkflowId)
+          if (!workflow) return state
+
+          const nodeExists = workflow.nodes.some((node) => node.id === nodeId)
+          if (!nodeExists) return state
+
+          const shouldRemoveEdges = edgeIdSet.size > 0
+          return {
+            history: pushWorkflowHistory(state),
+            workflows: state.workflows.map((w) =>
+              w.id === state.activeWorkflowId
+                ? {
+                    ...w,
+                    nodes: w.nodes.map((n) =>
+                      n.id === nodeId ? { ...n, data: { ...n.data, ...data } } : n
+                    ),
+                    edges: shouldRemoveEdges ? w.edges.filter((edge) => !edgeIdSet.has(edge.id)) : w.edges,
+                    updatedAt: Date.now()
+                  }
+                : w
+            ),
+            selectedEdgeId: state.selectedEdgeId && edgeIdSet.has(state.selectedEdgeId) ? null : state.selectedEdgeId,
+            isDirty: true
+          }
+        })
       },
 
       updateNodePosition: (nodeId, position) => {

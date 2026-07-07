@@ -969,6 +969,10 @@ export class PipelineRunner {
     const mediaData = asString(data.mediaData) || asString(data.imageData) || asString(data.videoData)
     const mediaUrl = asString(data.mediaUrl) || asString(data.imageUrl) || asString(data.videoUrl)
     const mediaName = asString(data.mediaName) || asString(data.imageName) || asString(data.videoName) || 'media'
+    if (!mediaData && !mediaUrl) {
+      const label = asString(data.label) || 'Media node'
+      throw new Error(`${label} has no media. Upload an image or video before running.`)
+    }
     const mimeType = asString(data.mediaMimeType)
       || (mediaData.match(/^data:([^;]+);base64,/)?.[1] || '')
       || (mediaType === 'video' ? 'video/mp4' : 'image/png')
@@ -1166,8 +1170,16 @@ export class PipelineRunner {
     const downstreamUseAll = data.useAllOutputs === true
     const allMedia: MediaInput[] = []
     const edgeContributions: Array<{ edgeId: string; sourceType: string; sourceHandle: string; count: number; mode: string; names: string[] }> = []
+    const emptyMediaEdges: Array<{ edgeId: string; sourceLabel: string; targetHandle: string }> = []
     for (const input of inputs.items) {
       const mediaItems = this.extractEdgeMedia(input, downstreamUseAll)
+      if ((input.targetHandle === 'input_1' || input.targetHandle === 'input_3') && mediaItems.length === 0) {
+        emptyMediaEdges.push({
+          edgeId: String(input.edge?.id || ''),
+          sourceLabel: asString(input.sourceNode?.data?.label) || input.sourceNode?.type || 'upstream node',
+          targetHandle: input.targetHandle
+        })
+      }
       for (const media of mediaItems) {
         allMedia.push({ ...media, targetHandle: input.targetHandle })
       }
@@ -1209,6 +1221,11 @@ export class PipelineRunner {
         edges: edgeContributions,
       }))
     } catch (_) {}
+
+    if (emptyMediaEdges.length > 0) {
+      const first = emptyMediaEdges[0]
+      throw new Error(`Generate node has a connected media input from "${first.sourceLabel}", but that node has no media.`)
+    }
 
     // [SeqDebug][Runner] resolved generate inputs — TEMPORARY diagnostic,
     // always-on while investigating sequential multi-generate duplicate
