@@ -58,6 +58,11 @@ import {
 import { cacheGenerateOutputs } from '@/lib/assets/outputAssetCache'
 import { migrateLegacyWorkflowAssets } from '@/lib/assets/assetMigration'
 import {
+  exportWorkflowAssetBundle,
+  importWorkflowAssetBundle,
+  parseWorkflowAssetBundle
+} from '@/lib/assets/assetBundle'
+import {
   applyNodePreviews,
   categorizeSavedTemplate,
   deleteWorkflowTemplate,
@@ -1217,11 +1222,47 @@ function downloadWorkflowJson(workflow: Workflow) {
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
   anchor.href = url
-  anchor.download = `${workflow.name.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'workflow'}.json`
+  anchor.download = `${sanitizeExportFilename(workflow.name)}.json`
   document.body.appendChild(anchor)
   anchor.click()
   anchor.remove()
   URL.revokeObjectURL(url)
+}
+
+function sanitizeExportFilename(name: string): string {
+  const cleaned = String(name || '')
+    .replace(/[^\w.-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .toLowerCase()
+  return cleaned || 'workflow'
+}
+
+/**
+ * [AssetBundle] Export the workflow as a portable `.aiflow.json`
+ * bundle carrying every asset blob. Bundle file is the ONLY place
+ * the data URLs live — they must never reach chrome.storage.local.
+ * Async because IndexedDB reads + FileReader dataURLs are async.
+ */
+async function downloadWorkflowAssetBundle(
+  workflow: Workflow,
+  status?: { okCount: number; missingCount: number; error?: string }
+): Promise<void> {
+  const { bundle } = await exportWorkflowAssetBundle(workflow)
+  const payload = JSON.stringify(bundle, null, 2)
+  const blob = new Blob([payload], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `${sanitizeExportFilename(workflow.name)}.aiflow.json`
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  URL.revokeObjectURL(url)
+
+  if (status) {
+    status.okCount = bundle.assets.length
+    status.missingCount = Array.isArray(bundle.missingAssets) ? bundle.missingAssets.length : 0
+  }
 }
 
 interface DrawflowConnection {
@@ -7695,7 +7736,7 @@ const groupDragMirrorLog = (
           <button
             type="button"
             title="Export workflow"
-            onClick={() => downloadWorkflowJson(workflow)}
+            onClick={() => void downloadWorkflowAssetBundle(workflow)}
             className="flex h-9 w-9 items-center justify-center rounded-lg text-white/42 transition-colors hover:bg-white/[0.06] hover:text-white"
           >
             <FileDown className="h-4 w-4" />
@@ -7876,7 +7917,7 @@ const groupDragMirrorLog = (
             <button type="button" title="Settings" className="aiflow-wf-tool-btn">
               <Settings2 className="h-4 w-4" />
             </button>
-            <button type="button" title="Export workflow" onClick={() => downloadWorkflowJson(workflow)} className="aiflow-wf-tool-btn">
+            <button type="button" title="Export workflow" onClick={() => void downloadWorkflowAssetBundle(workflow)} className="aiflow-wf-tool-btn">
               <FileDown className="h-4 w-4" />
             </button>
           </div>
@@ -8597,6 +8638,35 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
     try {
       const text = await file.text()
       const payload = JSON.parse(text) as unknown
+
+      // [AssetBundle] Bundle path: a `.aiflow.json` payload carries
+      // workflow + assets. Decode first, surface partial failures
+      // as alerts only when something is broken. A fully-successful
+      // import is silent (no toast library in this codebase).
+      const bundle = parseWorkflowAssetBundle(payload)
+      if (bundle) {
+        const result = await importWorkflowAssetBundle(bundle)
+        if (!result.ok || !result.workflow) {
+          const firstError = result.errors[0] || 'Asset bundle was empty or unreadable.'
+          window.alert(`Asset bundle import failed.\n\n${firstError}`)
+          return
+        }
+        // Warn the user when the local IndexedDB was missing
+        // assets the bundle expected — the imported workflow will
+        // still open, but those slots will show placeholder.
+        if (result.missingAssetIds.length > 0) {
+          // eslint-disable-next-line no-console
+          console.warn('[AssetBundle] imported workflow has missing assets', {
+            missingAssetIds: result.missingAssetIds,
+            count: result.missingAssetIds.length
+          })
+        }
+        importWorkflow(result.workflow)
+        await openWorkflowEditorWindow(result.workflow)
+        return
+      }
+
+      // Plain JSON path — keep the original behavior untouched.
       const workflow = normalizeImportedWorkflow(payload)
       if (!workflow) {
         window.alert('This file does not look like a workflow export.')
@@ -8635,7 +8705,7 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
       <input
         ref={fileInputRef}
         type="file"
-        accept="application/json,.json"
+        accept="application/json,.json,.aiflow.json"
         className="hidden"
         onChange={handleImportWorkflow}
       />
@@ -9041,7 +9111,7 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                         <button
                           type="button"
                           title="Export"
-                          onClick={() => downloadWorkflowJson(workflow)}
+                          onClick={() => void downloadWorkflowAssetBundle(workflow)}
                           onDoubleClick={(event) => event.stopPropagation()}
                           className="flex h-7 w-7 items-center justify-center rounded-md text-white/35 transition-colors hover:bg-white/[0.06] hover:text-white/75"
                         >
