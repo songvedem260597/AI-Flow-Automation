@@ -219,6 +219,15 @@ interface WorkflowState {
   updateNodeAndRemoveEdges: (nodeId: string, data: Partial<WorkflowNode['data']>, edgeIds: string[]) => void
   updateNodePosition: (nodeId: string, position: { x: number; y: number }) => void
   updateNodePositions: (positions: Record<string, { x: number; y: number }>, workflowId?: string) => void
+  /**
+   * [AssetStore] Replace an entire workflow's `nodes[]` without
+   * pushing history. Used by the IndexedDB migration helper to swap
+   * legacy base64 fields for assetId pointers in a single store
+   * write — looping `updateNode` would push one history entry per
+   * node and bloat the undo stack with technical cleanup that the
+   * user never asked for.
+   */
+  replaceWorkflowNodes: (workflowId: string, nextNodes: WorkflowNode[]) => void
   deleteNode: (nodeId: string) => void
   deleteNodes: (workflowId: string, nodeIds: string[]) => void
   setSelectedNode: (nodeId: string | null) => void
@@ -932,6 +941,41 @@ export const useWorkflowStore = create<WorkflowState>()(
                     updatedAt: nextUpdatedAt
                   }
                 : w
+            ),
+            isDirty: true
+          }
+        })
+      },
+
+      // [AssetStore] Silent bulk node replacement for migration.
+      // Single store write, no history push. Migration is a
+      // technical cleanup (legacy data: URLs → IndexedDB assetIds);
+      // the user never asked for it and undo-ing back to base64
+      // would be wrong (IndexedDB holds the bytes now, undo would
+      // produce a broken preview). Persist still fires via the
+      // zustand middleware, so the migration lands in
+      // chrome.storage.local on the next tick.
+      replaceWorkflowNodes: (workflowId, nextNodes) => {
+        set((state) => {
+          const workflow = state.workflows.find((w) => w.id === workflowId)
+          if (!workflow) return state
+          // Skip the write when nothing actually changed — short
+          // circuit avoids spurious `isDirty` flips and persist
+          // cycles when the migration helper returned the same
+          // nodes back (e.g. nothing had legacy data).
+          const before = workflow.nodes
+          const sameLength = before.length === nextNodes.length
+          const allEqual = sameLength && before.every((node, idx) => {
+            const candidate = nextNodes[idx]
+            if (!candidate) return false
+            if (candidate.id !== node.id) return false
+            if (candidate.position.x !== node.position.x || candidate.position.y !== node.position.y) return false
+            return true
+          })
+          if (allEqual) return state
+          return {
+            workflows: state.workflows.map((w) =>
+              w.id === workflowId ? { ...w, nodes: nextNodes, updatedAt: Date.now() } : w
             ),
             isDirty: true
           }

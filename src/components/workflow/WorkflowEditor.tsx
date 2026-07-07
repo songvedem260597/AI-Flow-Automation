@@ -56,6 +56,7 @@ import {
   type AssetMeta
 } from '@/lib/assets/assetStore'
 import { cacheGenerateOutputs } from '@/lib/assets/outputAssetCache'
+import { migrateLegacyWorkflowAssets } from '@/lib/assets/assetMigration'
 import {
   applyNodePreviews,
   categorizeSavedTemplate,
@@ -2592,6 +2593,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const updateNodeAndRemoveEdges = useWorkflowStore((s) => s.updateNodeAndRemoveEdges)
   const updateNodePosition = useWorkflowStore((s) => s.updateNodePosition)
   const updateNodePositions = useWorkflowStore((s) => s.updateNodePositions)
+  const replaceWorkflowNodes = useWorkflowStore((s) => s.replaceWorkflowNodes)
   const addEdgeToStore = useWorkflowStore((s) => s.addEdge)
   const deleteNode = useWorkflowStore((s) => s.deleteNode)
   const deleteNodes = useWorkflowStore((s) => s.deleteNodes)
@@ -3486,6 +3488,55 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   useEffect(() => {
     workflowRef.current = workflow
   }, [workflow])
+
+  // [AssetStore] Migrate legacy base64 / data URL fields on the
+  // active workflow to IndexedDB assetIds. Runs once per workflow
+  // id (or once per node-mutation that touches a legacy field) —
+  // the `migratedWorkflowIdsRef` short-circuits repeat fires. The
+  // migration writes go through `replaceWorkflowNodes`, which is
+  // a SILENT store action — no history push, no undo entry, the
+  // user never asked for it. If migration fails for some nodes,
+  // the legacy data stays in memory and the next session retries.
+  const migratedWorkflowIdsRef = useRef<Set<string>>(new Set())
+  const migrationInProgressRef = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    if (!workflow || !workflow.id) return
+    if (migratedWorkflowIdsRef.current.has(workflow.id)) return
+    if (migrationInProgressRef.current.has(workflow.id)) return
+
+    // Snapshot the nodes we plan to migrate. If the user keeps
+    // editing the workflow mid-migration, `replaceWorkflowNodes`
+    // may overwrite their work — gate on a generation counter.
+    const capturedNodes = workflow.nodes
+    const capturedUpdatedAt = workflow.updatedAt ?? 0
+    migrationInProgressRef.current.add(workflow.id)
+
+    void (async () => {
+      try {
+        const summary = await migrateLegacyWorkflowAssets({
+          workflowId: workflow.id,
+          nodes: capturedNodes
+        })
+        // Skip the store write if the workflow has been mutated
+        // since we started. The next render of this effect (driven
+        // by updatedAt) will pick up the new state and re-evaluate.
+        const latest = useWorkflowStore.getState().workflows.find((w) => w.id === workflow.id)
+        if (!latest || (latest.updatedAt ?? 0) !== capturedUpdatedAt) return
+        if (summary.changed) {
+          replaceWorkflowNodes(workflow.id, summary.nextNodes as WorkflowNode[])
+        }
+        migratedWorkflowIdsRef.current.add(workflow.id)
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[AssetStore] legacy workflow migration failed', {
+          workflowId: workflow.id,
+          message: err instanceof Error ? err.message : String(err)
+        })
+      } finally {
+        migrationInProgressRef.current.delete(workflow.id)
+      }
+    })()
+  }, [workflow, replaceWorkflowNodes])
 
   useEffect(() => {
     const completedGenerateNodeIds = workflow.nodes
