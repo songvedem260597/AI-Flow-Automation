@@ -81,13 +81,25 @@ const resolveItemKind = (item: OutputItemLike, blob: Blob | null): 'image' | 'vi
 
 const fetchBlobFromUrl = async (url: string, timeoutMs = 8000): Promise<Blob | null> => {
   if (!url) return null
-  // Skip blob: / data: — those already live in the same tab; caching
-  // them into IndexedDB is wasted work and `URL.createObjectURL` for
-  // a `blob:` URL is already free.
-  if (url.startsWith('blob:') || url.startsWith('data:')) return null
-  // Only attempt http(s); chrome-extension: / chrome: cannot be fetched
-  // safely from the side-panel page.
-  if (!/^https?:/i.test(url)) return null
+  // Skip only opaque page-internal protocols we cannot fetch from the
+  // side panel document without security / CORS errors. `blob:` and
+  // `data:` are fine — `fetch` against them in the same Document
+  // resolves synchronously to the underlying Blob/byte stream, and
+  // the cached asset lets the preview survive reload (the original
+  // `blob:` URL is page-scoped and dies with the tab).
+  if (/^(chrome-extension|chrome|file|about):/i.test(url)) return null
+  // Only http(s)/blob/data survive the protocol allow-list above;
+  // anything else (e.g. unsupported schemes) is skipped.
+  if (!/^(https?|blob|data):/i.test(url)) return null
+  // Soft cap: a `data:` URL larger than the size limit is almost
+  // certainly a b64 image; we'd still cache it, but warn so an
+  // operator can see why. Persisted `_output` will strip the URL
+  // either way (sanitizer rejects data:/blob: strings > 100 KB).
+  if (url.startsWith('data:') && url.length > 2_000_000) {
+    // eslint-disable-next-line no-console
+    console.warn('[AssetStore] data URL over 2 MB, skipping cache', { bytes: url.length })
+    return null
+  }
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
   const timer = controller
     ? setTimeout(() => controller.abort(), timeoutMs)
