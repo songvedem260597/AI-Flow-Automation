@@ -2620,3 +2620,57 @@ button.df-node-tag {
   from { opacity: 0; transform: translateY(6px) scale(0.98); }
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
+
+/* ── Marquee selection rectangle (workflow editor) ─────────── */
+/* Drawn while the user holds Ctrl and drags on the empty canvas.
+   Positioned absolutely inside the editor root; left/top are
+   translated from viewport coords (clientX/Y) by subtracting the
+   editor root's bounding rect in JSX. */
+.aiflow-marquee-rect {
+  border: 1px solid rgba(124, 92, 255, 0.85);
+  background: rgba(124, 92, 255, 0.08);
+  box-shadow:
+    0 0 0 1px rgba(124, 92, 255, 0.25),
+    inset 0 0 0 1px rgba(124, 92, 255, 0.18);
+  border-radius: 2px;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* ── Selection count badge ───────────────────────────────────── */
+/* Floats in the top-right corner of the editor when 2+ nodes are
+   selected, so the user always has a visible signal that multi-
+   selection is active (and not just a stray .selected class on
+   one node). */
+.aiflow-selection-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px 6px 8px;
+  border-radius: 8px;
+  background: rgba(20, 20, 20, 0.92);
+  border: 1px solid rgba(124, 92, 255, 0.35);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.45);
+  font-size: 11px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.85);
+  user-select: none;
+}
+
+.aiflow-selection-badge-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #7C5CFF;
+  box-shadow: 0 0 8px rgba(124, 92, 255, 0.65);
+  flex-shrink: 0;
+}
+
+.aiflow-selection-badge-hint {
+  font-size: 10px;
+  font-weight: 400;
+  color: rgba(255, 255, 255, 0.45);
+  padding-left: 4px;
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+  margin-left: 2px;
+}

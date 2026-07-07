@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import Drawflow from '@/lib/drawflow/drawflow.min.js'
 import '@/lib/drawflow/drawflow.min.css'
 import { autoUpdate, computePosition, flip, offset, shift } from '@floating-ui/dom'
@@ -46,6 +46,29 @@ import { runPipeline, stopPipeline, pausePipeline, resumePipeline } from '@/pipe
 import type { PipelineCallbacks } from '@/pipeline'
 import { usePipelineStore } from '@/stores/pipelineStore'
 import { debugLog, debugWarn } from '@/lib/debug'
+import {
+  saveAssetFromFile,
+  saveAssetFromBlob,
+  getAssetObjectUrl,
+  revokeAssetObjectUrl,
+  revokeAllAssetObjectUrls,
+  type AssetKind,
+  type AssetMeta
+} from '@/lib/assets/assetStore'
+import {
+  applyNodePreviews,
+  categorizeSavedTemplate,
+  deleteWorkflowTemplate,
+  extractImageNodePreviews,
+  extractWorkflowThumbnailWithSource,
+  generateUniqueTemplateName,
+  listWorkflowTemplates,
+  onWorkflowTemplatesChanged,
+  resolveTemplateCardThumbnail,
+  sanitizeWorkflowForTemplate,
+  saveWorkflowTemplate,
+  type UserWorkflowTemplate
+} from '@/lib/workflowTemplates'
 
 const WORKFLOW_PERSIST_DEBUG = (): boolean => {
   try {
@@ -390,16 +413,71 @@ function getMediaNodeType(data: Record<string, unknown>): MediaNodeType {
   return 'image'
 }
 
+/**
+ * Module-level cache of assetId → object URL. Populated by an effect
+ * inside the editor that watches every node for `data.assetId` /
+ * `data.posterAssetId` changes. Functions reading this cache stay
+ * synchronous so the static `renderDrawflowNode` HTML builder does
+ * not have to grow an async path. The cache is empty until the
+ * effect runs (during a render) so the first frame still falls back
+ * to the legacy data URL / template preview; the second frame after
+ * IndexedDB resolves replaces it via `rerenderDrawflowNode`.
+ */
+const assetObjectUrlSyncCache = new Map<string, string>()
+
+const syncAssetUrl = (assetId: unknown): string => {
+  if (typeof assetId !== 'string' || !assetId) return ''
+  return assetObjectUrlSyncCache.get(assetId) || ''
+}
+
 function getMediaNodeSource(data: Record<string, unknown>) {
   const mediaType = getMediaNodeType(data)
+  // [WorkflowTemplate] Last-resort fallback chain reads the
+  // compressed per-node preview that survives the template
+  // round-trip. The sanitizer strips every `imageData`/`mediaData`
+  // /`videoData` raw base64, so without this fallback every
+  // restored Media node renders as a placeholder.
+  // [AssetStore] assetId takes priority — resolved blob URL comes
+  // from the module-level sync cache populated by an effect.
   if (mediaType === 'video') {
-    return String(data.videoData || data.videoUrl || data.mediaData || data.mediaUrl || '')
+    const videoAssetUrl = syncAssetUrl(data.assetId) || syncAssetUrl(data.mediaAssetId)
+    if (videoAssetUrl) return videoAssetUrl
+    return String(
+      data.videoData
+      || data.videoUrl
+      || data.mediaData
+      || data.mediaUrl
+      || data.templateVideoPoster
+      || data.templateImagePreview
+      || ''
+    )
   }
-  return String(data.imageData || data.imageUrl || data.mediaData || data.mediaUrl || '')
+  const imageAssetUrl = syncAssetUrl(data.assetId) || syncAssetUrl(data.mediaAssetId) || syncAssetUrl(data.imageAssetId)
+  if (imageAssetUrl) return imageAssetUrl
+  return String(
+    data.imageData
+    || data.imageUrl
+    || data.mediaData
+    || data.mediaUrl
+    || data.templateImagePreview
+    || ''
+  )
 }
 
 function getMediaNodePoster(data: Record<string, unknown>) {
-  return String(data.videoPoster || data.mediaPoster || '')
+  // [WorkflowTemplate] Same fallback — the video poster slot
+  // collapses onto the same compressed preview when nothing else
+  // is available.
+  // [AssetStore] posterAssetId takes priority — same sync cache.
+  const posterUrl = syncAssetUrl(data.posterAssetId) || syncAssetUrl(data.thumbnailAssetId)
+  if (posterUrl) return posterUrl
+  return String(
+    data.videoPoster
+    || data.mediaPoster
+    || data.templateVideoPoster
+    || data.templateImagePreview
+    || ''
+  )
 }
 
 function captureVideoPoster(videoSrc: string): Promise<{ width?: number; height?: number; poster?: string }> {
@@ -516,6 +594,14 @@ interface WorkflowTemplate {
   nodes: WorkflowNode[]
   edges: WorkflowEdge[]
   tags: string[]
+  /** Source marker for cards rendered from chrome.storage.local. Cards
+   *  derived from `BUILT_IN_TEMPLATES` leave this undefined; cards
+   *  built by `userTemplateToCardShape` set it to `'user'`. */
+  source?: 'user'
+  /** Optional JPEG data URL extracted at save time. Built-in cards
+   *  leave this undefined. The Templates tab renders it as a 240px
+   *  cover image when present. */
+  thumbnail?: string
 }
 
 const BUILT_IN_TEMPLATES: WorkflowTemplate[] = [
@@ -922,6 +1008,125 @@ function instantiateTemplate(template: WorkflowTemplate): Workflow {
     createdAt: now,
     updatedAt: now,
     tags: template.tags
+  }
+}
+
+/**
+ * Instantiate a user-saved template into a brand-new Workflow. Same
+ * shape as `instantiateTemplate` but reads from the
+ * `UserWorkflowTemplate.workflow.nodes/edges` shape and prefixes the
+ * new workflow name with the template name so the user can spot the
+ * origin. The template itself is never mutated — every node and edge
+ * gets a fresh id so the workflow can live side-by-side with the
+ * original without collision.
+ */
+function instantiateUserTemplate(template: UserWorkflowTemplate): Workflow {
+  const nodeIdMap = new Map<string, string>()
+  const now = Date.now()
+  // [WorkflowTemplate] Card-thumbnail fallback. When a node that
+  // emitted the card thumbnail is missing a per-node preview
+  // (CORS / decode failure), we substitute the card thumbnail as
+  // its preview so the restored Media node still renders. This is
+  // what the spec calls "thumbnailSourceNodeId restore" — only
+  // fires when the per-node path was unable to fill that slot.
+  const cardFallback = template.thumbnail && template.thumbnailSourceNodeId
+    ? template.thumbnail
+    : undefined
+  const cardFallbackSlot: 'templateImagePreview' | 'templateVideoPoster' | undefined = (() => {
+    if (!cardFallback) return undefined
+    // [WorkflowTemplate] Honour the source node's mediaType. A
+    // video Media-node should not get the image-card dropped into
+    // the image-slot when the poster slot is what its renderer
+    // will actually read.
+    const sourceNode = template.workflow.nodes.find((n) => n.id === template.thumbnailSourceNodeId)
+    if (!sourceNode) return undefined
+    const t = String((sourceNode.data as Record<string, unknown>)?.mediaType || '').toLowerCase()
+    return t === 'video' ? 'templateVideoPoster' : 'templateImagePreview'
+  })()
+  const nodes = template.workflow.nodes.map((node) => {
+    const id = createId('node')
+    nodeIdMap.set(node.id, id)
+    const dataRecord = (node.data && typeof node.data === 'object'
+      ? (node.data as Record<string, unknown>)
+      : {}) as Record<string, unknown>
+    const nextData: Record<string, unknown> = { ...cloneDeep(dataRecord) }
+    // [WorkflowTemplate] Card-thumbnail fallback only applied
+    // when the original source node is the one we are restoring
+    // AND no per-node preview is already populated. Built-in
+    // nodes are not affected — they never participate in the
+    // source-id mapping.
+    if (
+      cardFallback
+      && cardFallbackSlot
+      && node.id === template.thumbnailSourceNodeId
+      && !nextData[cardFallbackSlot]
+    ) {
+      nextData[cardFallbackSlot] = cardFallback
+    }
+    return {
+      ...cloneDeep(node),
+      id,
+      position: { ...node.position },
+      data: nextData as unknown as Workflow['nodes'][number]['data']
+    }
+  })
+
+  const edges = template.workflow.edges
+    .map((edge) => {
+      const source = nodeIdMap.get(edge.source)
+      const target = nodeIdMap.get(edge.target)
+      if (!source || !target) return null
+      return {
+        ...cloneDeep(edge),
+        id: createId('edge'),
+        source,
+        target
+      }
+    })
+    .filter(Boolean) as WorkflowEdge[]
+
+  const baseName = `${template.name}`.trim() || 'Saved Template'
+  return {
+    id: createId('workflow'),
+    name: baseName,
+    description: template.description,
+    nodes,
+    edges,
+    createdAt: now,
+    updatedAt: now,
+    tags: []
+  }
+}
+
+/**
+ * [WorkflowTemplate] Adapter that lifts a UserWorkflowTemplate into
+ * the card-render shape that built-in templates already use. The
+ * Templates tab card renders `template.name`, `template.description`,
+ * `template.category`, `template.tags`, `template.nodes.length`,
+ * `template.edges.length`, `template.accent`, and (for the new
+ * thumbnail render) `template.thumbnail`. All of those are filled
+ * from the saved record. Source markers (`source: 'user'`) are kept
+ * so a future delete affordance can tell the two apart.
+ */
+function userTemplateToCardShape(template: UserWorkflowTemplate): WorkflowTemplate {
+  // [WorkflowTemplate] Card-cover thumbnail falls back through
+  // `template.thumbnail` → first node's compressed preview →
+  // safe URL field. We never read raw base64 here because the
+  // sanitizer stripped it; the per-node `templateImagePreview`
+  // is the already-compressed JPEG that survives the save
+  // round-trip.
+  const cardThumbnail = resolveTemplateCardThumbnail(template)
+  return {
+    id: template.id,
+    name: template.name,
+    description: template.description || `Saved template — ${template.nodeCount} nodes / ${template.edgeCount} edges`,
+    category: categorizeSavedTemplate(template.workflow),
+    accent: 'sky',
+    tags: ['Saved'],
+    nodes: template.workflow.nodes,
+    edges: template.workflow.edges,
+    source: 'user',
+    ...(cardThumbnail ? { thumbnail: cardThumbnail } : {})
   }
 }
 
@@ -2528,6 +2733,42 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const [showLogs, setShowLogs] = useState(false)
   const [zoomLevel, setZoomLevel] = useState(100)
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null)
+  // [WorkflowTemplate] Tiny inline toast for Save-to-Template feedback.
+  // Plain useState instead of a global store — only this component
+  // mounts the editor header where the button lives, and a single
+  // toast slot keeps the body free of third-party toast libs in
+  // production. The state holds either null or { tone, message } and
+  // auto-clears on a timer started by handleSaveAsTemplate.
+  const [templateToast, setTemplateToast] = useState<{
+    tone: 'success' | 'error' | 'warning'
+    message: string
+  } | null>(null)
+  const templateToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const flashTemplateToast = (
+    tone: 'success' | 'error' | 'warning',
+    message: string
+  ) => {
+    if (templateToastTimerRef.current) {
+      clearTimeout(templateToastTimerRef.current)
+      templateToastTimerRef.current = null
+    }
+    setTemplateToast({ tone, message })
+    templateToastTimerRef.current = setTimeout(() => {
+      setTemplateToast(null)
+      templateToastTimerRef.current = null
+    }, 2600)
+  }
+
+  // [WorkflowTemplate] Drop the timeout on unmount so a stale
+  // setState doesn't fire after the editor has closed.
+  useEffect(() => {
+    return () => {
+      if (templateToastTimerRef.current) {
+        clearTimeout(templateToastTimerRef.current)
+        templateToastTimerRef.current = null
+      }
+    }
+  }, [])
   const [inspectorNodeId, setInspectorNodeId] = useState<string | null>(null)
   const [marqueeRect, setMarqueeRect] = useState<MarqueeRect | null>(null)
   // Multi-selection: the Set lives in a ref for hot-path reads inside
@@ -3208,6 +3449,54 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       setInspectorNodeId(null)
     }
   }, [inspectorNodeId, workflow.nodes])
+
+  // [AssetStore] Resolve IndexedDB asset references to object URLs.
+  // Walks every node on every workflow change, fetches every assetId
+  // (and posterAssetId) once, caches the result in the module-level
+  // `assetObjectUrlSyncCache`, then triggers a per-node rerender so
+  // the static `getMediaNodeSource` helper picks up the resolved URL
+  // on the next render. Asset IDs that fail to resolve stay out of
+  // the cache and the legacy data URL / template preview chain keeps
+  // rendering — no crash, no missing-image flicker beyond the first
+  // IndexedDB read.
+  useEffect(() => {
+    const nodeAssetPairs: Array<{ nodeId: string; assetId: string; kind: 'media' | 'poster' }> = []
+    for (const node of workflow.nodes) {
+      if (node.type !== 'image') continue
+      const data = node.data as Record<string, unknown>
+      const mediaAssetId = String(data.assetId || data.mediaAssetId || data.imageAssetId || '')
+      const posterAssetId = String(data.posterAssetId || data.thumbnailAssetId || '')
+      if (mediaAssetId) nodeAssetPairs.push({ nodeId: node.id, assetId: mediaAssetId, kind: 'media' })
+      if (posterAssetId) nodeAssetPairs.push({ nodeId: node.id, assetId: posterAssetId, kind: 'poster' })
+    }
+    if (nodeAssetPairs.length === 0) return
+
+    let cancelled = false
+    const dirtyNodeIds = new Set<string>()
+    void Promise.allSettled(
+      nodeAssetPairs.map(async (entry) => {
+        const url = await getAssetObjectUrl(entry.assetId)
+        if (!url) return
+        if (cancelled) return
+        if (assetObjectUrlSyncCache.get(entry.assetId) === url) return
+        assetObjectUrlSyncCache.set(entry.assetId, url)
+        dirtyNodeIds.add(entry.nodeId)
+      })
+    ).then(() => {
+      if (cancelled) return
+      dirtyNodeIds.forEach((nodeId) => rerenderDrawflowNode(nodeId))
+    })
+    return () => { cancelled = true }
+  }, [workflow.nodes, dataSignature])
+
+  // [AssetStore] Revoke every cached object URL when the editor
+  // unmounts. Without this, every reload leaks the prior session's
+  // blob references until the page is closed.
+  useEffect(() => {
+    return () => {
+      revokeAllAssetObjectUrls()
+    }
+  }, [])
 
   useEffect(() => {
     setSelectedPickerIndex(0)
@@ -5816,6 +6105,71 @@ const groupDragMirrorLog = (
             return
           }
 
+          // [AssetStore] Save the raw file Blob into IndexedDB in
+          // parallel with the legacy FileReader.readAsDataURL flow.
+          // Renderer prefers `data.assetId` / `data.posterAssetId`
+          // over the data URL; failure here leaves the legacy path
+          // intact so the upload preview still appears in-session.
+          const writeAssetIdAndPosterId = async (nextAssetId?: string, nextPosterAssetId?: string) => {
+            const patch: Record<string, unknown> = {}
+            if (nextAssetId) patch.assetId = nextAssetId
+            if (nextPosterAssetId) patch.posterAssetId = nextPosterAssetId
+            if (Object.keys(patch).length === 0) return
+            try {
+              const currentNode = workflowRef.current.nodes.find((n) => n.id === nodeId)
+              if (!currentNode) return
+              updateNode(nodeId, patch as Partial<FlowNodeData>)
+              void currentNode
+            } catch {
+              // Persistence is best-effort; render path already
+              // handles a missing assetId via legacy fallbacks.
+            }
+          }
+
+          const persistUploadedAsset = (): void => {
+            try {
+              const meta: AssetMeta = {
+                kind: fileMediaType === 'video' ? 'video' : 'image',
+                source: 'upload',
+                fileName: file.name,
+                mimeType: file.type,
+                width: undefined,
+                height: undefined
+              }
+              const metaWithDims = (w: number | undefined, h: number | undefined, dur?: number): AssetMeta =>
+                ({ ...meta, width: w, height: h, duration: dur })
+              if (fileMediaType === 'video') {
+                const videoMeta = metaWithDims(undefined, undefined)
+                saveAssetFromFile(file, videoMeta).then((rec) => writeAssetIdAndPosterId(rec.id, undefined)).catch((err) => {
+                  // [AssetStore] Persisted-asset failures must surface so the operator can
+                  // diagnose why a reload loses the upload. Silent failure would
+                  // regress the runtime-only fallback to a hidden bug.
+                  // eslint-disable-next-line no-console
+                  console.warn('[AssetStore] saveAssetFromFile failed', { kind: 'video', message: err instanceof Error ? err.message : String(err) })
+                })
+              }
+              // Image asset dimensions resolve once decode completes.
+              const uploadedImage = document.createElement('img')
+              uploadedImage.onload = () => {
+                const w = uploadedImage.naturalWidth || undefined
+                const h = uploadedImage.naturalHeight || undefined
+                if (fileMediaType === 'image') {
+                  saveAssetFromFile(file, metaWithDims(w, h))
+                    .then((rec) => writeAssetIdAndPosterId(rec.id, undefined))
+                    .catch((err) => {
+                      // eslint-disable-next-line no-console
+                      console.warn('[AssetStore] saveAssetFromFile failed', { kind: 'image', message: err instanceof Error ? err.message : String(err) })
+                    })
+                }
+              }
+              uploadedImage.onerror = () => { /* ignore decode failures — render path falls back */ }
+              uploadedImage.src = imageData
+            } catch (err) {
+              // eslint-disable-next-line no-console
+              console.warn('[AssetStore] persistUploadedAsset threw', err instanceof Error ? err.message : String(err))
+            }
+          }
+
           const finishUpload = (width?: number, height?: number, poster?: string) => {
             const aspectRatio = width && height ? closestImageAspectRatio(width, height) : fileMediaType === 'video' ? '16:9' : '1:1'
             const basePatch: Record<string, unknown> = {
@@ -5849,6 +6203,31 @@ const groupDragMirrorLog = (
             updateNodeAndRemoveEdges(nodeId, nextPatch, staleEdgeIds)
             scheduleDrawflowConnectionRefresh(nodeId)
             cleanup()
+
+            // [AssetStore] Once the data URL is committed to
+            // node.data, kick off the IndexedDB save. We do not
+            // block the render flow — the assetId is added on top
+            // of the existing fields when the save resolves.
+            persistUploadedAsset()
+            if (fileMediaType === 'video' && poster) {
+              // Save the captured poster as its own asset record so
+              // the video Media-node can resolve a poster without
+              // decoding the full video blob every render.
+              try {
+                void (async () => {
+                  const blob = await (await fetch(poster)).blob()
+                  saveAssetFromBlob(blob, { kind: 'poster', source: 'upload', mimeType: blob.type || 'image/jpeg' })
+                    .then((rec) => writeAssetIdAndPosterId(undefined, rec.id))
+                    .catch((err) => {
+                      // eslint-disable-next-line no-console
+                      console.warn('[AssetStore] saveAssetFromBlob(poster) failed', err instanceof Error ? err.message : String(err))
+                    })
+                })()
+              } catch (err) {
+                // eslint-disable-next-line no-console
+                console.warn('[AssetStore] poster blob conversion failed', err instanceof Error ? err.message : String(err))
+              }
+            }
           }
 
           if (fileMediaType === 'video') {
@@ -7013,6 +7392,120 @@ const groupDragMirrorLog = (
       scheduleConnectionSync()
     })
   }
+  // [WorkflowTemplate] Save the active workflow as a user template.
+  // Lifecycle:
+  //   1. Bail with a warning toast when there is no active workflow
+  //      (defensive — the button is only rendered when one exists).
+  //   2. Sanitize the workflow via `sanitizeWorkflowForTemplate`.
+  //      Heavy fields (base64 / blob / dataUrl) are stripped, nested
+  //      Generate-node outputs are flattened to URL-only descriptors.
+  //   3. Try to extract a 320x180 JPEG thumbnail, then save the
+  //      template. Thumbnail is best-effort — failure falls through
+  //      silently so a CORS-blocked asset URL still produces a
+  //      thumbnailless save.
+  //   4. Persist under chrome.storage.local key
+  //      `ai-flow-workflow-templates` via the local store helper.
+  //      Errors are surfaced as error toasts.
+  // No production debug logs — this is a user-facing action.
+  const handleSaveAsTemplate = async (active: Workflow) => {
+    if (!active) {
+      flashTemplateToast('warning', 'No workflow selected.')
+      return
+    }
+    let existing: UserWorkflowTemplate[] = []
+    try {
+      existing = await listWorkflowTemplates()
+    } catch {
+      existing = []
+    }
+    const sanitized = sanitizeWorkflowForTemplate({
+      nodes: active.nodes,
+      edges: active.edges
+    })
+    const sanitizedNodes = sanitized.nodes.length
+    const sanitizedEdges = sanitized.edges.length
+
+    let thumbnail: string | undefined
+    let thumbnailSourceNodeId: string | undefined
+    try {
+      // [WorkflowTemplate] Use the with-source variant so the
+      // restore path can prefer the originating node's per-node
+      // preview. Backwards-compatible — existing call sites that
+      // only need the data URL can keep using
+      // `extractWorkflowThumbnail`.
+      const card = await extractWorkflowThumbnailWithSource({ nodes: active.nodes })
+      thumbnail = card?.dataUrl
+      thumbnailSourceNodeId = card?.sourceNodeId
+    } catch {
+      thumbnail = undefined
+      thumbnailSourceNodeId = undefined
+    }
+
+    // [WorkflowTemplate] Per-node previews. Walk every
+    // image-bearing node and store a 1024px JPEG data URL inside
+    // `data.templateImagePreview` / `data.templateVideoPoster`.
+    // Without this the restored workflow's Media nodes render as
+    // placeholders — sanitizer strips the raw base64 the upload
+    // path writes into `imageData` / `mediaData`. Per-node
+    // previews are independent of the card thumbnail so a CORS
+    // failure on the card does not poison the node previews.
+    let previewCount = 0
+    try {
+      const previews = await extractImageNodePreviews({ nodes: active.nodes })
+      if (previews.size > 0) {
+        sanitized.nodes = applyNodePreviews(sanitized.nodes, previews)
+        previewCount = previews.size
+      }
+    } catch {
+      previewCount = 0
+    }
+
+    const now = Date.now()
+    const template: UserWorkflowTemplate = {
+      id:
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? `tpl_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`
+          : `tpl_${now.toString(36)}_${Math.random().toString(36).slice(2, 10)}`,
+      name: generateUniqueTemplateName(active.name, existing),
+      workflow: {
+        nodes: sanitized.nodes,
+        edges: sanitized.edges
+      },
+      nodeCount: sanitizedNodes,
+      edgeCount: sanitizedEdges,
+      createdAt: now,
+      updatedAt: now,
+      source: 'user',
+      ...(thumbnail ? { thumbnail } : {}),
+      ...(thumbnailSourceNodeId ? { thumbnailSourceNodeId } : {})
+    }
+
+    try {
+      await saveWorkflowTemplate(template)
+    } catch (err) {
+      flashTemplateToast(
+        'error',
+        err instanceof Error
+          ? `Storage failed: ${err.message}`
+          : 'Unable to save template to storage.'
+      )
+      return
+    }
+
+    // [WorkflowTemplate] Tell the user how many of their
+    // image-bearing nodes survived. 0 is the same wording as
+    // before. >0 is the new green path — saved with image
+    // previews restored on Use. Errors are kept in user-facing
+    // copy, not the console.
+    const previewSuffix = previewCount > 0 ? `, ${previewCount} image preview${previewCount === 1 ? '' : 's'}` : ''
+    flashTemplateToast(
+      'success',
+      thumbnail
+        ? `Saved to templates — "${template.name}" (${sanitizedNodes} nodes${previewSuffix})`
+        : `Saved to templates — "${template.name}" (${sanitizedNodes} nodes, no thumbnail${previewSuffix})`
+    )
+  }
+
   const nodePillMenuScale = Math.min(1, Math.max(0.55, zoomLevel / 100))
 
   return (
@@ -7054,6 +7547,16 @@ const groupDragMirrorLog = (
         </div>
 
         <div className="flex items-center gap-1">
+          <button
+            type="button"
+            title="Save to Template"
+            onClick={() => {
+              void handleSaveAsTemplate(workflow)
+            }}
+            className="flex h-9 w-9 items-center justify-center rounded-lg text-white/42 transition-colors hover:bg-white/[0.06] hover:text-white"
+          >
+            <LayoutTemplate className="h-4 w-4" />
+          </button>
           <button
             type="button"
             title="Export workflow"
@@ -7543,6 +8046,42 @@ const lightboxCanDownload = Boolean(imagePreview.src) && (
             onClose={() => setInspectorNodeId(null)}
           />
         )}
+        {/* [WorkflowTemplate] Save-to-Template toast. Sits inside the
+            editor root so it doesn't cross into a fresh stacking
+            context — z-[80] keeps it above the lightbox (z-70) and
+            the marquee (z-50). Hidden by `templateToast` being null
+            after auto-clear. No debugging hooks. */}
+        {templateToast && (
+          <div
+            role="status"
+            aria-live="polite"
+            className={cn(
+              'pointer-events-none absolute inset-x-0 bottom-5 z-[80] flex justify-center px-3'
+            )}
+          >
+            <div
+              className={cn(
+                'pointer-events-auto flex max-w-[420px] items-start gap-2 rounded-lg border px-3 py-2 text-[12px] font-medium shadow-2xl backdrop-blur-sm',
+                templateToast.tone === 'success' &&
+                  'border-emerald-400/35 bg-[#0F2018]/92 text-emerald-100',
+                templateToast.tone === 'error' &&
+                  'border-rose-400/40 bg-[#271318]/92 text-rose-100',
+                templateToast.tone === 'warning' &&
+                  'border-amber-400/35 bg-[#2A1F0F]/92 text-amber-100'
+              )}
+            >
+              <span
+                className={cn(
+                  'mt-[3px] inline-block h-1.5 w-1.5 shrink-0 rounded-full',
+                  templateToast.tone === 'success' && 'bg-emerald-400',
+                  templateToast.tone === 'error' && 'bg-rose-400',
+                  templateToast.tone === 'warning' && 'bg-amber-400'
+                )}
+              />
+              <span className="leading-snug">{templateToast.message}</span>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )
@@ -7577,11 +8116,54 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   const [view, setView] = usePersistedState<WorkflowShellView>('workflow.view', workflows.length > 0 ? 'workflows' : 'templates')
   const [templateCategory, setTemplateCategory] = usePersistedState<string>('workflow.templateCategory', 'All')
   const [workflowSearch, setWorkflowSearch] = useState('')
+  // [WorkflowTemplate] Saved templates pulled from
+  // chrome.storage.local `ai-flow-workflow-templates`. Refreshed on
+  // mount, on chrome.storage.onChanged, and on tab-focus inside the
+  // Templates tab so a Save-to-Template from the canvas shows up
+  // without a manual reload.
+  const [savedTemplates, setSavedTemplates] = useState<UserWorkflowTemplate[]>([])
+  const [deleteConfirmTemplate, setDeleteConfirmTemplate] = useState<UserWorkflowTemplate | null>(null)
   const [deleteConfirmWorkflow, setDeleteConfirmWorkflow] = useState<Workflow | null>(null)
   const [renameWorkflow, setRenameWorkflow] = useState<Workflow | null>(null)
   const [renameDraft, setRenameDraft] = useState('')
   const renameInputRef = useRef<HTMLInputElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+
+  const refreshSavedTemplates = useCallback(async () => {
+    try {
+      const list = await listWorkflowTemplates()
+      setSavedTemplates(list)
+    } catch {
+      setSavedTemplates([])
+    }
+  }, [])
+
+  // Initial load + chrome.storage.onChanged subscription. The
+  // listener is deduped so a tab-blur / focus does not double-bind.
+  useEffect(() => {
+    void refreshSavedTemplates()
+    const unsubscribe = onWorkflowTemplatesChanged((next) => {
+      setSavedTemplates(next)
+    })
+    return unsubscribe
+  }, [refreshSavedTemplates])
+
+  // When the user switches into the Templates tab we re-read storage
+  // so a save that happened in the canvas (which fired onChanged
+  // already) is reflected even if the listener was registered after
+  // the write. Also re-read on window focus because the Side Panel
+  // can be hidden then shown without unmounting the editor.
+  useEffect(() => {
+    if (view !== 'templates') return
+    void refreshSavedTemplates()
+    const onFocus = () => {
+      void refreshSavedTemplates()
+    }
+    window.addEventListener('focus', onFocus)
+    return () => {
+      window.removeEventListener('focus', onFocus)
+    }
+  }, [view, refreshSavedTemplates])
 
   useEffect(() => {
     hydrateFromStorage().catch(() => {})
@@ -7622,12 +8204,14 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   }, [hydrateFromStorage])
 
   useEffect(() => {
-    if (!deleteConfirmWorkflow && !renameWorkflow) return
+    if (!deleteConfirmWorkflow && !renameWorkflow && !deleteConfirmTemplate) return
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.stopPropagation()
         if (renameWorkflow) {
           handleCancelRenameWorkflow()
+        } else if (deleteConfirmTemplate) {
+          setDeleteConfirmTemplate(null)
         } else if (deleteConfirmWorkflow) {
           setDeleteConfirmWorkflow(null)
         }
@@ -7640,7 +8224,7 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
     }
     document.addEventListener('keydown', handleKeyDown, true)
     return () => document.removeEventListener('keydown', handleKeyDown, true)
-  }, [deleteConfirmWorkflow, renameWorkflow, renameDraft])
+  }, [deleteConfirmWorkflow, deleteConfirmTemplate, renameWorkflow, renameDraft])
 
   useEffect(() => {
     if (!renameWorkflow) return
@@ -7703,13 +8287,38 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   }, [view, workflows.length, activeWorkflowId])
 
   const activeWorkflow = workflows.find((workflow) => workflow.id === activeWorkflowId) || workflows[0] || null
-  const templateCategories = useMemo(
-    () => ['All', ...Array.from(new Set(BUILT_IN_TEMPLATES.map((template) => template.category)))],
-    []
+  // [WorkflowTemplate] Combine built-in templates with user-saved
+  // templates into a single render list. Saved templates sort before
+  // built-in ones (newest first by createdAt desc) so a freshly saved
+  // card lands at the top of the grid instead of being buried under
+  // the built-in starters. Built-in cards keep their existing order.
+  const savedAsCards = useMemo(
+    () => savedTemplates.map(userTemplateToCardShape),
+    [savedTemplates]
+  )
+  const sortedSavedCards = useMemo(() => {
+    return [...savedAsCards].sort((a, b) => {
+      const aRecord = savedTemplates.find((t) => t.id === a.id)
+      const bRecord = savedTemplates.find((t) => t.id === b.id)
+      const ac = aRecord ? aRecord.createdAt : 0
+      const bc = bRecord ? bRecord.createdAt : 0
+      if (bc !== ac) return bc - ac
+      return String(a.id).localeCompare(String(b.id))
+    })
+  }, [savedAsCards, savedTemplates])
+
+  const templateCategories = useMemo(() => {
+    const builtIn = new Set(BUILT_IN_TEMPLATES.map((template) => template.category))
+    const saved = new Set(savedAsCards.map((template) => template.category))
+    return ['All', ...Array.from(new Set([...builtIn, ...saved]))]
+  }, [savedAsCards])
+  const combinedTemplates = useMemo<WorkflowTemplate[]>(
+    () => [...sortedSavedCards, ...BUILT_IN_TEMPLATES],
+    [sortedSavedCards]
   )
   const filteredTemplates = templateCategory === 'All'
-    ? BUILT_IN_TEMPLATES
-    : BUILT_IN_TEMPLATES.filter((template) => template.category === templateCategory)
+    ? combinedTemplates
+    : combinedTemplates.filter((template) => template.category === templateCategory)
   // [WorkflowList] Stable ordering policy — sort by `createdAt` desc (with id
   // tie-break). The Zustand `workflows` array is kept in insertion order; the
   // dashboard renders a derived `[...filtered]` snapshot here. This means
@@ -7765,9 +8374,42 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   }
 
   const handleUseTemplate = async (template: WorkflowTemplate) => {
-    const workflow = instantiateTemplate(template)
+    // [WorkflowTemplate] Branch on `source` so saved templates use
+    // the user-template instantiator (which knows about
+    // `template.workflow.nodes/edges` and renames the new workflow
+    // to match the saved entry). Built-in templates keep the
+    // existing path verbatim.
+    const workflow = template.source === 'user'
+      ? instantiateUserTemplate(savedTemplates.find((t) => t.id === template.id) || {
+          id: template.id,
+          name: template.name,
+          workflow: { nodes: template.nodes, edges: template.edges },
+          nodeCount: template.nodes.length,
+          edgeCount: template.edges.length,
+          createdAt: 0,
+          updatedAt: 0,
+          source: 'user',
+          ...(template.thumbnail ? { thumbnail: template.thumbnail } : {})
+        })
+      : instantiateTemplate(template)
     importWorkflow(workflow)
     await openWorkflowEditorWindow(workflow)
+  }
+
+  // [WorkflowTemplate] Delete a saved template from chrome.storage.
+  // Wired to a small "Delete" affordance on user cards only — built-in
+  // cards keep their existing Use-only path. Failure surfaces an
+  // alert; success re-reads the storage list (the onChanged listener
+  // would also fire, but the explicit refresh avoids a one-render
+  // flicker on slow MV3 wake-ups).
+  const handleDeleteSavedTemplate = async (template: UserWorkflowTemplate) => {
+    setDeleteConfirmTemplate(null)
+    try {
+      await deleteWorkflowTemplate(template.id)
+      await refreshSavedTemplates()
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'Unable to delete template.')
+    }
   }
 
   const handleOpenWorkflow = async (workflow: Workflow) => {
@@ -7944,50 +8586,202 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
           <div className="grid min-h-0 flex-1 grid-cols-[repeat(auto-fit,minmax(240px,1fr))] gap-3 overflow-y-auto pr-1">
             {filteredTemplates.map((template) => {
               const colors = NODE_COLORS[template.accent]
+              const isUserTemplate = template.source === 'user'
+              const hasCover = Boolean(template.thumbnail)
+              // [WorkflowTemplate] Two card shapes share one grid
+              // cell.
+              // - hasCover: content-flow layout, no `min-h-*`,
+              //   footer is `static mt-1 gap-2` and stays flush
+              //   below the tags. Cover image lives flush to the
+              //   card top (card has `overflow-hidden`). Built-in
+              //   text-only behaviour is intentionally NOT
+              //   affected — that layout still relies on the
+              //   `min-h-[190px]` + footer `mt-auto pt-4` pair.
+              // - !hasCover: original equal-height grid cell —
+              //   identical behaviour, identical class strings,
+              //   identical render output. Both branches share the
+              //   same cover div and inner-block markup when a
+              //   thumbnail exists.
+              const cardClass = hasCover
+                ? cn(
+                    'flex flex-col overflow-hidden rounded-lg border bg-[#171717] transition-colors hover:border-white/15',
+                    colors.border,
+                    'border-l-2 border-white/[0.06]'
+                  )
+                : cn(
+                    'flex min-h-[190px] flex-col overflow-hidden rounded-lg border bg-[#171717] p-4 transition-colors hover:border-white/15',
+                    colors.border,
+                    'border-l-2 border-white/[0.06]'
+                  )
+              const footerClass = hasCover
+                ? 'mt-1 flex items-center justify-between gap-2'
+                : 'mt-auto flex items-center justify-between pt-4'
               return (
                 <div
                   key={template.id}
-                  className={cn(
-                    'flex min-h-[190px] flex-col rounded-lg border bg-[#171717] p-4 transition-colors hover:border-white/15',
-                    colors.border,
-                    'border-l-2 border-white/[0.06]'
-                  )}
+                  className={cardClass}
                 >
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <Sparkles className={cn('h-4 w-4', colors.text)} />
-                        <h3 className="truncate text-[12px] font-medium text-white/80">{template.name}</h3>
+                  {/* [WorkflowTemplate] Thumbnail cover. Sits flush
+                      at the card top — `overflow-hidden` on the
+                      card root clips the cover into the card's
+                      rounded corners. Description is `line-clamp-2`
+                      so a long template description cannot blow
+                      the card back out to tall heights. The cover
+                      is rendered inside the `hasCover` branch
+                      below, with title / category / description as
+                      an inset overlay so it matches the spec
+                      layout. The legacy standalone cover div
+                      used to live here — it's gone now. */}
+                  {/* [WorkflowTemplate] Cover cards wrap the rest
+                      of the body in a single padding block so the
+                      `mt-1` on the footer pins it just below the
+                      tags instead of filling the leftover vertical
+                      space. Text-only cards render the body flat
+                      like before, no wrapper div, so the original
+                      min-h + mt-auto behaviour is preserved
+                      pixel-for-pixel. */}
+                  {hasCover ? (
+                    <>
+                      {/* [WorkflowTemplate] Cover image with title /
+                          category badge / saved-description rendered
+                          INSIDE the cover as a bottom overlay. The
+                          overlay block gets a bottom-to-black
+                          gradient so white text stays legible on any
+                          JPEG. Tags + footer live below the cover
+                          (not floating on the image) so the
+                          action row stays crisp on the dark card
+                          background. */}
+                      <div className="relative aspect-video h-full overflow-hidden border-b border-white/[0.06] bg-[#111]">
+                        <img
+                          src={template.thumbnail}
+                          alt={`${template.name} preview`}
+                          className="h-full w-full object-cover"
+                          draggable={false}
+                        />
+                        <div
+                          aria-hidden="true"
+                          className="pointer-events-none absolute inset-x-0 bottom-0 h-2/3 bg-gradient-to-b from-transparent via-black/40 to-black/80"
+                        />
+                        <div className="absolute inset-x-0 bottom-0 flex items-end justify-between gap-3 p-3">
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <Sparkles className={cn('h-4 w-4 shrink-0 text-white/85')} />
+                              <h3 className="truncate text-[12px] font-medium text-white">{template.name}</h3>
+                            </div>
+                            <p className="mt-1 line-clamp-2 text-[11px] leading-[16px] text-white/70">{template.description}</p>
+                          </div>
+                          <span className="shrink-0 rounded-md bg-white/15 px-2 py-1 text-[10px] font-medium text-white">
+                            {template.category}
+                          </span>
+                        </div>
                       </div>
-                      <p className="mt-1 line-clamp-2 text-[11px] leading-[18px] text-white/40">{template.description}</p>
-                    </div>
-                    <span className="rounded-md bg-white/[0.05] px-2 py-1 text-[10px] font-medium text-white/40">
-                      {template.category}
-                    </span>
-                  </div>
+                      <div className="flex flex-col gap-3 p-3">
+                        {template.tags.length > 0 && (
+                          <div className="flex flex-wrap gap-1.5">
+                            {template.tags.map((tag) => (
+                              <span key={tag} className="rounded-md bg-white/[0.05] px-2 py-1 text-[10px] text-white/35">
+                                {tag}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                        <div className={footerClass}>
+                          <div className="flex items-center gap-3 text-[11px] text-white/30">
+                            <span className="inline-flex items-center gap-1">
+                              <WorkflowIcon className="h-3 w-3" aria-hidden="true" />
+                              {template.nodes.length} nodes
+                            </span>
+                            <span className="inline-flex items-center gap-1">
+                              <Zap className="h-3 w-3" aria-hidden="true" />
+                              {template.edges.length} links
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            {isUserTemplate && (
+                              <button
+                                type="button"
+                                title="Delete template"
+                                onClick={() => {
+                                  const saved = savedTemplates.find((t) => t.id === template.id)
+                                  if (saved) setDeleteConfirmTemplate(saved)
+                                }}
+                                className="flex h-8 w-8 items-center justify-center rounded-lg text-white/35 transition-colors hover:bg-rose-500/15 hover:text-rose-200"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => handleUseTemplate(template)}
+                              className="flex h-8 items-center gap-1.5 rounded-lg bg-[#7C5CFF]/15 px-3 text-[11px] font-medium text-[#B8A8FF] transition-colors hover:bg-[#7C5CFF]/25"
+                            >
+                              <Play className="h-3.5 w-3.5" />
+                              Use
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2">
+                            <Sparkles className={cn('h-4 w-4', colors.text)} />
+                            <h3 className="truncate text-[12px] font-medium text-white/80">{template.name}</h3>
+                          </div>
+                          <p className="mt-1 line-clamp-2 text-[11px] leading-[18px] text-white/40">{template.description}</p>
+                        </div>
+                        <span className="rounded-md bg-white/[0.05] px-2 py-1 text-[10px] font-medium text-white/40">
+                          {template.category}
+                        </span>
+                      </div>
 
-                  <div className="mt-4 flex flex-wrap gap-1.5">
-                    {template.tags.map((tag) => (
-                      <span key={tag} className="rounded-md bg-white/[0.05] px-2 py-1 text-[10px] text-white/35">
-                        {tag}
-                      </span>
-                    ))}
-                  </div>
+                      <div className="mt-4 flex flex-wrap gap-1.5">
+                        {template.tags.map((tag) => (
+                          <span key={tag} className="rounded-md bg-white/[0.05] px-2 py-1 text-[10px] text-white/35">
+                            {tag}
+                          </span>
+                        ))}
+                      </div>
 
-                  <div className="mt-auto flex items-center justify-between pt-4">
-                    <div className="flex items-center gap-3 text-[11px] text-white/30">
-                      <span>{template.nodes.length} nodes</span>
-                      <span>{template.edges.length} links</span>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => handleUseTemplate(template)}
-                      className="flex h-8 items-center gap-1.5 rounded-lg bg-[#7C5CFF]/15 px-3 text-[11px] font-medium text-[#B8A8FF] transition-colors hover:bg-[#7C5CFF]/25"
-                    >
-                      <Play className="h-3.5 w-3.5" />
-                      Use
-                    </button>
-                  </div>
+                      <div className={footerClass}>
+                        <div className="flex items-center gap-3 text-[11px] text-white/30">
+                          <span className="inline-flex items-center gap-1">
+                            <WorkflowIcon className="h-3 w-3" aria-hidden="true" />
+                            {template.nodes.length} nodes
+                          </span>
+                          <span className="inline-flex items-center gap-1">
+                            <Zap className="h-3 w-3" aria-hidden="true" />
+                            {template.edges.length} links
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          {isUserTemplate && (
+                            <button
+                              type="button"
+                              title="Delete template"
+                              onClick={() => {
+                                const saved = savedTemplates.find((t) => t.id === template.id)
+                                if (saved) setDeleteConfirmTemplate(saved)
+                              }}
+                              className="flex h-8 w-8 items-center justify-center rounded-lg text-white/35 transition-colors hover:bg-rose-500/15 hover:text-rose-200"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleUseTemplate(template)}
+                            className="flex h-8 items-center gap-1.5 rounded-lg bg-[#7C5CFF]/15 px-3 text-[11px] font-medium text-[#B8A8FF] transition-colors hover:bg-[#7C5CFF]/25"
+                          >
+                            <Play className="h-3.5 w-3.5" />
+                            Use
+                          </button>
+                        </div>
+                      </div>
+                    </>
+                  )}
                 </div>
               )
             })}
@@ -8172,6 +8966,52 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                 type="button"
                 className="workflow-confirm-delete"
                 onClick={handleConfirmDeleteWorkflow}
+              >
+                <Trash2 className="h-4 w-4" />
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {deleteConfirmTemplate && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="template-confirm-title"
+          aria-describedby="template-confirm-desc"
+          className="workflow-confirm-overlay"
+          onClick={() => setDeleteConfirmTemplate(null)}
+        >
+          <div
+            className="workflow-confirm-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="workflow-confirm-icon">
+              <Trash2 className="h-4 w-4" />
+            </div>
+            <div className="workflow-confirm-body">
+              <h2 id="template-confirm-title" className="workflow-confirm-title">
+                Delete “{deleteConfirmTemplate.name}”?
+              </h2>
+              <p id="template-confirm-desc" className="workflow-confirm-desc">
+                This action cannot be undone.
+              </p>
+            </div>
+            <div className="workflow-confirm-actions">
+              <button
+                type="button"
+                className="workflow-confirm-cancel"
+                onClick={() => setDeleteConfirmTemplate(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="workflow-confirm-delete"
+                onClick={() => {
+                  void handleDeleteSavedTemplate(deleteConfirmTemplate)
+                }}
               >
                 <Trash2 className="h-4 w-4" />
                 Delete

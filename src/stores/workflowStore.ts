@@ -307,6 +307,57 @@ const HEAVY_PERSIST_KEYS = new Set([
   'videoPoster'
 ])
 
+// [AssetStore] Legacy base64-style fields that are explicitly safe to
+// drop whenever the node already carries an assetId pointer. Used by
+// the sanitizer so a freshly uploaded image does not bloat
+// chrome.storage.local with the parallel data URL — IndexedDB owns
+// the blob now and the store only has a 16-char id.
+const LEGACY_BASE64_DROP_WHEN_ASSET_PRESENT = new Set([
+  'mediaData',
+  'imageData',
+  'videoData',
+  'mediaPoster',
+  'videoPoster'
+])
+
+// [AssetStore] Lightweight metadata fields written by the upload
+// path that are SAFE-TO-KEEP across persist because they are short
+// strings. They never grow large.
+const ASSET_METADATA_KEYS = new Set([
+  'assetId',
+  'mediaAssetId',
+  'imageAssetId',
+  'posterAssetId',
+  'thumbnailAssetId',
+  'fileName',
+  'mediaName',
+  'imageName',
+  'videoName',
+  'mimeType',
+  'mediaMimeType',
+  'size',
+  'width',
+  'height',
+  'mediaWidth',
+  'mediaHeight',
+  'imageWidth',
+  'imageHeight',
+  'videoWidth',
+  'videoHeight',
+  'duration',
+  'mediaType',
+  'aspectRatio'
+])
+
+// [AssetStore] Object URL strings minted by `URL.createObjectURL`.
+// The blob lives only inside the asset cache and the URL is useless
+// after a reload. Never persist them.
+const TRANSIENT_OBJECT_URL_KEYS = new Set([
+  'objectUrl',
+  'assetObjectUrl',
+  'resolvedAssetUrl'
+])
+
 const PERSIST_STRING_LENGTH_LIMIT = 100_000
 const PERSIST_BUDGET_WARN_KB = 5000
 
@@ -321,6 +372,35 @@ const isHeavyPersistString = (value: unknown): boolean => {
   return value.length > PERSIST_STRING_LENGTH_LIMIT
 }
 
+/**
+ * [AssetStore] Strip legacy base64-style fields from a node's `data`
+ * when an `assetId` reference is already in place. Called from
+ * `sanitizePersistValue` for objects that look like a workflow node
+ * (`type` + `data`). Returns a new object — never mutates input.
+ */
+const stripLegacyBase64WhenAssetPresent = (data: Record<string, unknown>): Record<string, unknown> => {
+  const assetId = typeof data.assetId === 'string'
+    ? data.assetId
+    : typeof data.mediaAssetId === 'string'
+      ? data.mediaAssetId
+      : typeof data.imageAssetId === 'string'
+        ? data.imageAssetId
+        : ''
+  const posterAssetId = typeof data.posterAssetId === 'string'
+    ? data.posterAssetId
+    : typeof data.thumbnailAssetId === 'string'
+      ? data.thumbnailAssetId
+      : ''
+  if (!assetId && !posterAssetId) return data
+
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(data)) {
+    if (LEGACY_BASE64_DROP_WHEN_ASSET_PRESENT.has(key)) continue
+    out[key] = value
+  }
+  return out
+}
+
 const sanitizePersistValue = (value: unknown): unknown => {
   if (value === null || value === undefined) return value
   if (isHeavyPersistString(value)) return undefined
@@ -331,9 +411,31 @@ const sanitizePersistValue = (value: unknown): unknown => {
   }
   if (typeof value !== 'object') return value
 
+  const record = value as Record<string, unknown>
+  // [AssetStore] Detect a workflow-node shape (it carries a string
+  // `type` and an object `data`). Apply the per-node legacy-base64
+  // strip BEFORE the generic recursive walk so the heavy fields
+  // never reach `isHeavyPersistString` (which would already catch
+  // them, but pre-stripping keeps the persisted payload smaller and
+  // avoids the typeof string check for thousands of nested values).
+  let working = record
+  if (
+    typeof working.type === 'string'
+    && working.data
+    && typeof working.data === 'object'
+    && !Array.isArray(working.data)
+  ) {
+    const dataRecord = working.data as Record<string, unknown>
+    const strippedData = stripLegacyBase64WhenAssetPresent(dataRecord)
+    if (strippedData !== dataRecord) {
+      working = { ...working, data: strippedData }
+    }
+  }
+
   const out: Record<string, unknown> = {}
-  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+  for (const [key, child] of Object.entries(working)) {
     if (HEAVY_PERSIST_KEYS.has(key)) continue
+    if (TRANSIENT_OBJECT_URL_KEYS.has(key)) continue
     const sanitized = sanitizePersistValue(child)
     if (sanitized !== undefined) out[key] = sanitized
   }
