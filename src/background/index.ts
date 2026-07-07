@@ -20,8 +20,6 @@ import type { ChromeMessage } from '@/types'
 import { PROVIDER_TABS } from '@/constants'
 import { DEBUG_FLAGS, debugLog } from '@/lib/debug'
 
-console.log('[Background] index.ts loaded')
-
 // Enable with: localStorage.setItem('AI_FLOW_DEBUG', '1') in the extension page/tab
 // Guard: localStorage does not exist in service worker contexts.
 function readBgDebugFlag(): boolean {
@@ -374,10 +372,6 @@ chrome.runtime.onStartup?.addListener(() => {
 
 chrome.windows.onRemoved.addListener((windowId) => {
   if (workflowEditorWindowId === windowId) {
-    console.log('[Workflow][EditorFocus] cleared', JSON.stringify({
-      reason: 'workflow-editor-window-closed',
-      windowId,
-    }))
     clearStoredWorkflowEditorIds().catch(() => {})
   }
 })
@@ -507,15 +501,6 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
         return { success: false, error: 'Workflow editor tab sender is missing' }
       }
       await rememberWorkflowEditorWindow(tab.windowId, tab.id)
-      // [Workflow][EditorFocus] captured — every workflow run
-      // should preserve this origin so provider-tab focus operations
-      // never navigate / close / minimize the editor popup.
-      console.log('[Workflow][EditorFocus] captured', JSON.stringify({
-        tabId: tab.id,
-        windowId: tab.windowId,
-        url: tab.url || tab.pendingUrl || '',
-        type: tab.windowType || '',
-      }))
       return { success: true }
     }
 
@@ -528,27 +513,10 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
       // + `windows.update(focused)` on the editor origin. Defensive
       // checks ensure we never restore a tab that has been closed
       // since capture.
-      const payload = (message.payload || {}) as {
-        nodeId?: string
-        provider?: string
-      }
-      const nodeId = String(payload.nodeId || '')
-      const provider = String(payload.provider || '')
       const editorRef = await readStoredWorkflowEditorIds()
       const editorTabId = Array.from(editorRef.tabIds)[0]
       const editorWindowId = Array.from(editorRef.windowIds)[0]
-      console.log('[Workflow][EditorFocus] restoreStart', JSON.stringify({
-        nodeId,
-        provider,
-        tabId: editorTabId ?? null,
-        windowId: editorWindowId ?? null,
-      }))
       if (editorTabId === undefined || editorWindowId === undefined) {
-        console.log('[Workflow][EditorFocus] restoreSkipped', JSON.stringify({
-          reason: 'no-stored-editor-origin',
-          nodeId,
-          provider,
-        }))
         return { success: false, error: 'No stored workflow editor origin' }
       }
       // Confirm the tab + window still exist before restoring. The
@@ -562,12 +530,6 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
         liveTab = null
       }
       if (!liveTab) {
-        console.log('[Workflow][EditorFocus] restoreSkipped', JSON.stringify({
-          reason: 'editor-tab-no-longer-exists',
-          nodeId,
-          provider,
-          tabId: editorTabId,
-        }))
         // Stale storage — clear it so subsequent restores are quick.
         clearStoredWorkflowEditorIds().catch(() => {})
         return { success: false, error: 'Editor tab no longer exists' }
@@ -575,23 +537,8 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
       try {
         await chrome.tabs.update(editorTabId, { active: true })
         await chrome.windows.update(editorWindowId, { focused: true })
-        console.log('[Workflow][EditorFocus] restored', JSON.stringify({
-          nodeId,
-          provider,
-          tabId: editorTabId,
-          windowId: editorWindowId,
-          url: liveTab.url || '',
-        }))
         return { success: true, tabId: editorTabId, windowId: editorWindowId }
       } catch (err) {
-        console.log('[Workflow][EditorFocus] restoreSkipped', JSON.stringify({
-          reason: 'tab-or-window-update-failed',
-          nodeId,
-          provider,
-          tabId: editorTabId,
-          windowId: editorWindowId,
-          error: (err as Error).message,
-        }))
         return { success: false, error: (err as Error).message }
       }
     }
@@ -939,7 +886,10 @@ async function logWorkflowEditorVisibility(
     payload.providerWindowFocused = providerWindow?.focused ?? null
   }
 
-  console.log('[Workflow][EditorVisibility] ' + event, JSON.stringify(payload))
+  if (BG_DEBUG) {
+    // eslint-disable-next-line no-console
+    console.debug('[Workflow][EditorVisibility] ' + event, JSON.stringify(payload))
+  }
 
   if (
     editor?.tabId !== null &&
@@ -1076,26 +1026,13 @@ async function ensureProviderTabForWorkflow(
       const windowIdNum = toPositiveNumber(tab.windowId)
       const tabUrl = String(tab.url || tab.pendingUrl || '')
       if (tabIdNum !== null && editorTabIds.has(tabIdNum)) {
-        console.log('[Workflow][EditorFocus] preserved', JSON.stringify({
-          reason: 'tab-id-matches-editor',
-          provider,
-          candidateTabId: tabIdNum,
-          candidateUrl: tabUrl,
-          editorTabId: Array.from(editorTabIds)[0] ?? null,
-        }))
         return false
       }
       if (windowIdNum !== null && editorPopupWindowIds.has(windowIdNum)) {
-        console.log('[Workflow][EditorFocus] preserved', JSON.stringify({
-          reason: 'window-id-matches-editor',
-          provider,
-          candidateTabId: tabIdNum,
-          candidateWindowId: windowIdNum,
-          editorWindowId: Array.from(editorWindowIds)[0] ?? null,
-        }))
         return false
       }
       if (windowIdNum !== null && editorWindowIds.has(windowIdNum)) {
+        // eslint-disable-next-line no-console
         console.warn('[Workflow][EditorVisibility] same_window_conflict', JSON.stringify({
           editorTabId: Array.from(editorTabIds)[0] ?? null,
           editorWindowId: windowIdNum,
@@ -1106,12 +1043,6 @@ async function ensureProviderTabForWorkflow(
         }))
       }
       if (tabUrl.startsWith(editorExtensionPrefix)) {
-        console.log('[Workflow][EditorFocus] preserved', JSON.stringify({
-          reason: 'extension-url-match',
-          provider,
-          candidateTabId: tabIdNum,
-          candidateUrl: tabUrl,
-        }))
         return false
       }
       return true

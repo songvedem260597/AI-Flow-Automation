@@ -88,17 +88,24 @@ export type DebugFlag = keyof DebugFlags
 
 export function debugLog(flag: DebugFlag, ...args: unknown[]): void {
   if (DEBUG_FLAGS[flag]) {
-    // Use console.log directly (NOT console.debug) so the message
-    // shows up in default-sidepanel/extension-page consoles without
-    // requiring "Verbose" filter level.
+    // [DebugFlags] Use `console.debug` so the message lands at Verbose
+    // level. Chrome DevTools hides Verbose by default, which keeps the
+    // production console clean even when an operator flips a debug
+    // flag. To inspect a particular flag, enable the Verbose filter
+    // and set the matching `AI_FLOW_DEBUG_<NAME>` localStorage key.
     // eslint-disable-next-line no-console
-    console.log(...args)
+    console.debug(...args)
   }
 }
 
 export function debugWarn(flag: DebugFlag, ...args: unknown[]): void {
   if (DEBUG_FLAGS[flag]) {
+    // Use `console.debug` (Verbose) so even unexpected-state warnings
+    // stay out of the default production console. To inspect, enable
+    // the matching `AI_FLOW_DEBUG_<NAME>` flag AND the Verbose
+    // filter in DevTools. Note: `console.error` for genuine failures
+    // should still be called directly so they remain visible.
     // eslint-disable-next-line no-console
-    console.warn(...args)
+    console.debug(...args)
   }
 }

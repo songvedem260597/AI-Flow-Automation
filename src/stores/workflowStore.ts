@@ -62,13 +62,14 @@ const pushWorkflowHistory = (
  * Fix: a single `StateStorage` object whose setItem takes (name, value)
  * and writes `{ [name]: value }` to chrome.storage.local.
  *
- * Diagnostic logs (prefix `[WorkflowPersist][storage.*]`) help confirm
- * the signature is wired correctly. They are gated by
- * `localStorage.AI_FLOW_DEBUG === '1'`; default OFF.
+ * Diagnostic logs (`[WorkflowPersist][storage.*]`) were removed in the
+ * log-cleanup pass — production console must stay quiet. Only the
+ * `[WorkflowPersist][storage.setItem:quota.retry]` warning remains
+ * because quota exhaustion is a real operational signal.
  */
 const DEBUG_PERSIST = (): boolean => {
   try {
-    return typeof localStorage !== 'undefined' && localStorage.getItem('AI_FLOW_DEBUG') === '1'
+    return typeof localStorage !== 'undefined' && localStorage.getItem('AI_FLOW_DEBUG_PERSIST') === '1'
   } catch {
     return false
   }
@@ -109,88 +110,25 @@ const stringifyStoredValue = (raw: unknown): string | null => {
   }
 }
 
-const parseValueForDiag = (value: string): {
-  parsedTopKeys: string[] | null
-  parsedStateKeys: string[] | null
-  workflowCountFromParsed: number | null
-  activeWorkflowIdFromParsed: string | null
-} => {
-  let parsedTopKeys: string[] | null = null
-  let parsedStateKeys: string[] | null = null
-  let workflowCountFromParsed: number | null = null
-  let activeWorkflowIdFromParsed: string | null = null
-  try {
-    const top = JSON.parse(value) as Record<string, unknown>
-    parsedTopKeys = Object.keys(top)
-    if (top && typeof top === 'object' && 'state' in top) {
-      const inner = (top as { state?: Record<string, unknown> }).state
-      if (inner && typeof inner === 'object') {
-        parsedStateKeys = Object.keys(inner)
-        workflowCountFromParsed = Array.isArray((inner as { workflows?: unknown[] }).workflows)
-          ? (inner as { workflows: unknown[] }).workflows.length
-          : 0
-        activeWorkflowIdFromParsed =
-          (inner as { activeWorkflowId?: string | null }).activeWorkflowId ?? null
-      }
-    }
-  } catch {
-    parsedTopKeys = null
-  }
-  return { parsedTopKeys, parsedStateKeys, workflowCountFromParsed, activeWorkflowIdFromParsed }
-}
-
 const chromeStorage: StateStorage = {
   getItem: (name: string): Promise<string | null> => {
-    if (DEBUG_PERSIST()) {
-      console.log('[WorkflowPersist][storage.getItem:start]', JSON.stringify({ name }))
-    }
     return new Promise((resolve) => {
       chrome.storage.local.get(name, (result) => {
         const raw = result[name]
         const value = stringifyStoredValue(raw)
         lastPersistedWorkflowValues.set(name, value)
-        if (DEBUG_PERSIST()) {
-          console.log('[WorkflowPersist][storage.getItem:resolved]', JSON.stringify({
-            name,
-            hasValue: value !== null,
-            rawLength: value?.length ?? 0,
-            workflowCount: countWorkflows(value),
-            activeWorkflowId: activeWorkflowIdFromRaw(value)
-          }))
-        }
         resolve(value)
       })
     })
   },
   setItem: (name: string, value: string): Promise<void> => {
     const nextWorkflowCount = countWorkflows(value)
-    if (DEBUG_PERSIST()) {
-      const diag = parseValueForDiag(value)
-      console.log('[WorkflowPersist][storage.setItem]', JSON.stringify({
-        name,
-        valuePreview: value.slice(0, 300),
-        valueLength: value.length,
-        parsedTopKeys: diag.parsedTopKeys,
-        parsedStateKeys: diag.parsedStateKeys,
-        workflowCountFromParsed: diag.workflowCountFromParsed,
-        activeWorkflowIdFromParsed: diag.activeWorkflowIdFromParsed
-      }))
-      if (diag.workflowCountFromParsed === 0) {
-        console.trace('[WorkflowPersist][storage.setItem:zero-workflows]')
-      }
-    }
     return new Promise((resolve, reject) => {
       if (isManualHydratingWorkflowStorage) {
-        if (DEBUG_PERSIST()) {
-          console.log('[WorkflowPersist][storage.setItem:skip-manual-hydrate]', JSON.stringify({ name, nextWorkflowCount }))
-        }
         resolve()
         return
       }
       if (!workflowStorageHydrated && nextWorkflowCount === 0) {
-        if (DEBUG_PERSIST()) {
-          console.log('[WorkflowPersist][storage.setItem:skip-prehydrate-empty]', JSON.stringify({ name }))
-        }
         resolve()
         return
       }
@@ -220,6 +158,9 @@ const chromeStorage: StateStorage = {
             reject(err)
             return
           }
+          // Real warning, not gated debug — quota retry is a real
+          // operational signal worth surfacing even in production.
+          // eslint-disable-next-line no-console
           console.warn('[WorkflowPersist][storage.setItem:quota.retry]', JSON.stringify({
             name,
             beforeKb: Math.round(nextValue.length / 1024 * 10) / 10,
@@ -239,13 +180,6 @@ const chromeStorage: StateStorage = {
           return
         }
         if (nextWorkflowCount === 0 && currentWorkflowCount > 0 && !allowNextEmptyWorkflowPersist) {
-          if (DEBUG_PERSIST()) {
-            console.warn('[WorkflowPersist][storage.setItem:skip-stale-empty-overwrite]', JSON.stringify({
-              name,
-              currentWorkflowCount,
-              nextWorkflowCount
-            }))
-          }
           resolve()
           return
         }
@@ -254,9 +188,6 @@ const chromeStorage: StateStorage = {
     })
   },
   removeItem: (name: string): Promise<void> => {
-    if (DEBUG_PERSIST()) {
-      console.log('[WorkflowPersist][storage.removeItem]', JSON.stringify({ name }))
-    }
     return new Promise((resolve, reject) => {
       chrome.storage.local.remove(name, () => {
         const err = chrome.runtime.lastError
@@ -289,6 +220,7 @@ interface WorkflowState {
   updateNodePosition: (nodeId: string, position: { x: number; y: number }) => void
   updateNodePositions: (positions: Record<string, { x: number; y: number }>, workflowId?: string) => void
   deleteNode: (nodeId: string) => void
+  deleteNodes: (workflowId: string, nodeIds: string[]) => void
   setSelectedNode: (nodeId: string | null) => void
 
   addEdge: (edge: Omit<WorkflowEdge, 'id'>) => void
@@ -477,20 +409,11 @@ export const useWorkflowStore = create<WorkflowState>()(
       history: {},
 
       hydrateFromStorage: async () => {
-        if (DEBUG_PERSIST()) console.log('[WorkflowPersist][hydrateFromStorage:start]')
         const result = await chrome.storage.local.get('ai-flow-workflows')
         const saved = result['ai-flow-workflows']
         if (!saved) {
           workflowStorageHydrated = true
           lastPersistedWorkflowValues.set('ai-flow-workflows', null)
-          if (DEBUG_PERSIST()) {
-            console.log('[WorkflowPersist][hydrateFromStorage:read]', JSON.stringify({
-              hasValue: false,
-              workflowCount: 0,
-              activeWorkflowId: null,
-              rawLength: 0
-            }))
-          }
           return
         }
         const savedRaw = stringifyStoredValue(saved)
@@ -506,29 +429,10 @@ export const useWorkflowStore = create<WorkflowState>()(
           parsed = JSON.parse(savedRaw) as { state?: Partial<WorkflowState> }
         } catch {
           workflowStorageHydrated = true
-          if (DEBUG_PERSIST()) {
-            console.log('[WorkflowPersist][hydrateFromStorage:read]', JSON.stringify({
-              hasValue: true,
-              workflowCount: 0,
-              activeWorkflowId: null,
-              rawLength: savedRaw.length,
-              parseError: true
-            }))
-          }
           return
         }
 
         const state = parsed?.state
-        const wc = Array.isArray(state?.workflows) ? state.workflows.length : 0
-        const aw = state?.activeWorkflowId ?? null
-        if (DEBUG_PERSIST()) {
-          console.log('[WorkflowPersist][hydrateFromStorage:read]', JSON.stringify({
-            hasValue: true,
-            workflowCount: wc,
-            activeWorkflowId: aw,
-            rawLength: savedRaw.length
-          }))
-        }
 
         if (!state?.workflows) {
           workflowStorageHydrated = true
@@ -537,16 +441,6 @@ export const useWorkflowStore = create<WorkflowState>()(
         const sanitizedWorkflows = sanitizeWorkflowsForPersist(state.workflows as Workflow[])
         const activeWorkflowId = state.activeWorkflowId ?? sanitizedWorkflows[0]?.id ?? null
 
-        if (DEBUG_PERSIST()) {
-          console.log('[WorkflowPersist][hydrateFromStorage:set]', JSON.stringify({
-            workflowCount: sanitizedWorkflows.length,
-            activeWorkflowId: aw,
-            sanitizedKb: approxKb(sanitizedWorkflows)
-          }))
-          if (sanitizedWorkflows.length === 0) {
-            console.trace('[WorkflowPersist][hydrateFromStorage:set:zero-workflows]')
-          }
-        }
         isManualHydratingWorkflowStorage = true
         try {
           set({
@@ -565,14 +459,8 @@ export const useWorkflowStore = create<WorkflowState>()(
           try {
             await chrome.storage.local.set({ 'ai-flow-workflows': sanitizedPayload })
             lastPersistedWorkflowValues.set('ai-flow-workflows', sanitizedPayload)
-            if (DEBUG_PERSIST()) {
-              console.log('[WorkflowPersist][hydrateFromStorage:persist-back]', JSON.stringify({
-                beforeKb: Math.round(savedRaw.length / 1024 * 10) / 10,
-                afterKb: Math.round(sanitizedPayload.length / 1024 * 10) / 10,
-                workflowCount: sanitizedWorkflows.length
-              }))
-            }
           } catch (err) {
+            // eslint-disable-next-line no-console
             console.warn('[WorkflowPersist][hydrateFromStorage:persist-back:failed]', (err as Error).message)
           }
         }
@@ -587,32 +475,16 @@ export const useWorkflowStore = create<WorkflowState>()(
           createdAt: Date.now(),
           updatedAt: Date.now()
         }
-        if (DEBUG_PERSIST()) {
-          console.log('[WorkflowPersist][createWorkflow:before]', JSON.stringify({
-            currentCount: get().workflows.length
-          }))
-        }
         set((state) => ({
           workflows: [...state.workflows, workflow],
           activeWorkflowId: workflow.id,
           history: { ...state.history, [workflow.id]: emptyHistory() },
           isDirty: true
         }))
-        if (DEBUG_PERSIST()) {
-          console.log('[WorkflowPersist][createWorkflow:after]', JSON.stringify({
-            nextCount: get().workflows.length,
-            createdId: workflow.id,
-            activeWorkflowId: get().activeWorkflowId
-          }))
-        }
         return workflow
       },
 
       updateWorkflow: (id, updates) => {
-        const beforeOrder = get().workflows.map((w) => w.id)
-        const before = get().workflows.find((w) => w.id === id)
-        const beforeUpdatedAt = before?.updatedAt ?? null
-        const changedKeys = Object.keys(updates)
         set((state) => ({
           history: pushWorkflowHistory(state, id),
           workflows: state.workflows.map((w) =>
@@ -620,22 +492,6 @@ export const useWorkflowStore = create<WorkflowState>()(
           ),
           isDirty: true
         }))
-        if (DEBUG_PERSIST()) {
-          const after = get().workflows.find((w) => w.id === id)
-          const afterUpdatedAt = after?.updatedAt ?? null
-          const afterOrder = get().workflows.map((w) => w.id)
-          console.log('[WorkflowStore][updateWorkflow]', JSON.stringify({
-            action: 'updateWorkflow',
-            workflowId: id,
-            changedKeys,
-            updatedAtChanged: beforeUpdatedAt !== afterUpdatedAt,
-            beforeOrder,
-            afterOrder,
-            reorderedIds: false,
-            mutating: true,
-            note: 'stable list policy: createdAt-desc; updatedAt changes do not reorder'
-          }))
-        }
       },
 
       deleteWorkflow: (id) => {
@@ -672,32 +528,7 @@ export const useWorkflowStore = create<WorkflowState>()(
       },
 
       setActiveWorkflow: (id) => {
-        if (DEBUG_PERSIST()) {
-          const beforeOrder = get().workflows.map((w) => w.id)
-          console.log('[WorkflowPersist][setActiveWorkflow:before]', JSON.stringify({
-            currentCount: get().workflows.length,
-            currentActiveWorkflowId: get().activeWorkflowId,
-            nextActiveWorkflowId: id,
-            beforeOrder
-          }))
-          console.log('[WorkflowStore][setActiveWorkflow]', JSON.stringify({
-            action: 'setActiveWorkflow',
-            beforeOrder,
-            afterOrder: beforeOrder,
-            mutating: false,
-            reorderedIds: false,
-            updatedAtChanged: false
-          }))
-        }
         set({ activeWorkflowId: id, selectedNodeId: null, selectedEdgeId: null })
-        if (DEBUG_PERSIST()) {
-          const afterOrder = get().workflows.map((w) => w.id)
-          console.log('[WorkflowPersist][setActiveWorkflow:after]', JSON.stringify({
-            nextCount: get().workflows.length,
-            activeWorkflowId: get().activeWorkflowId,
-            afterOrder
-          }))
-        }
       },
 
       getActiveWorkflow: () => {
@@ -883,6 +714,41 @@ export const useWorkflowStore = create<WorkflowState>()(
         }))
       },
 
+      // [WorkflowDelete] Batch delete. Removes every node whose id is
+      // in `nodeIds` plus every edge whose source OR target is in the
+      // same set, in a single state write so undo/redo collapses the
+      // whole gesture into one history entry. This is the path
+      // `deleteSelectedNodes` (multi-select + Delete) takes — looping
+      // `deleteNode` would push one history entry per node and require
+      // the user to Ctrl+Z once per node.
+      deleteNodes: (workflowId, nodeIds) => {
+        const ids = Array.from(new Set((nodeIds || []).filter(Boolean)))
+        if (ids.length === 0) return
+
+        const before = get().workflows.find((w) => w.id === workflowId)
+        if (!before) return
+
+        const idSet = new Set(ids)
+
+        set((state) => ({
+          history: pushWorkflowHistory(state, workflowId),
+          workflows: state.workflows.map((w) =>
+            w.id === workflowId
+              ? {
+                  ...w,
+                  nodes: w.nodes.filter((n) => !idSet.has(n.id)),
+                  edges: w.edges.filter((e) => !idSet.has(e.source) && !idSet.has(e.target)),
+                  updatedAt: Date.now()
+                }
+              : w
+          ),
+          selectedNodeId: state.selectedNodeId && idSet.has(state.selectedNodeId)
+            ? null
+            : state.selectedNodeId,
+          isDirty: true
+        }))
+      },
+
       setSelectedNode: (nodeId) => {
         set({ selectedNodeId: nodeId, selectedEdgeId: nodeId ? null : get().selectedEdgeId })
       },
@@ -1064,27 +930,13 @@ export const useWorkflowStore = create<WorkflowState>()(
           workflows: sanitized,
           activeWorkflowId: state.activeWorkflowId
         }
-        if (DEBUG_PERSIST()) {
-          console.log('[WorkflowPersist][partialize]', JSON.stringify({
-            workflowCount: state.workflows?.length,
-            activeWorkflowId: state.activeWorkflowId,
-            sanitizedKb: approxKb(sanitized),
-            keys: Object.keys(partialized)
-          }))
-        }
         return partialized
       },
       onRehydrateStorage: () => (state, error) => {
         workflowStorageHydrated = true
-        const wc = Array.isArray(state?.workflows) ? state.workflows.length : 0
-        const aw = state?.activeWorkflowId ?? null
-        if (DEBUG_PERSIST()) {
-          console.log('[WorkflowPersist][rehydrate:finish]', JSON.stringify({
-            workflowCount: wc,
-            activeWorkflowId: aw,
-            error: error ? String(error) : null
-          }))
-        }
+        // `error` is left unused — rehydrate is currently best-effort
+        // and the `hydrateFromStorage()` action runs after mount.
+        void error
       }
     }
   )

@@ -49,7 +49,7 @@ import { debugLog, debugWarn } from '@/lib/debug'
 
 const WORKFLOW_PERSIST_DEBUG = (): boolean => {
   try {
-    return typeof localStorage !== 'undefined' && localStorage.getItem('AI_FLOW_DEBUG') === '1'
+    return typeof localStorage !== 'undefined' && localStorage.getItem('AI_FLOW_DEBUG_PERSIST') === '1'
   } catch {
     return false
   }
@@ -81,8 +81,13 @@ const WORKFLOW_SELECTION_DEBUG = (): boolean => {
 
 const wfSelectionLog = (event: string, payload: Record<string, unknown> = {}): void => {
   if (!WORKFLOW_SELECTION_DEBUG()) return
+  // Verbose level — Chrome DevTools hides this by default.
+  // Per-frame pointerdown inspect logs and selection sync logs
+  // stay out of production consoles unless the user explicitly
+  // enables the `Verbose` filter.
   try {
-    console.log(`[WorkflowSelection][${event}]`, JSON.stringify(payload))
+    // eslint-disable-next-line no-console
+    console.debug(`[WorkflowSelection][${event}]`, JSON.stringify(payload))
   } catch {
     // Never let debug logging throw into runtime.
   }
@@ -229,6 +234,17 @@ interface ImagePreviewState {
    *  `savedFilename` basename). Same lifecycle as `outputName` —
    *  re-synced on every carousel step. */
   downloadFilename?: string
+}
+
+interface MarqueeRect {
+  /** Left edge in viewport (clientX) coordinates. */
+  left: number
+  /** Top edge in viewport (clientY) coordinates. */
+  top: number
+  /** Width in viewport pixels. */
+  width: number
+  /** Height in viewport pixels. */
+  height: number
 }
 
 function normalizePillOptions(options: Array<{ value: string; label: string }> | string[]): NodePillOption[] {
@@ -1103,6 +1119,7 @@ function providerSlug(provider: unknown) {
 
 const DF_ICONS = {
   generate: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="13.5" cy="6.5" r="0.5" fill="currentColor"/><circle cx="17.5" cy="10.5" r="0.5" fill="currentColor"/><circle cx="8.5" cy="7.5" r="0.5" fill="currentColor"/><circle cx="6.5" cy="12.5" r="0.5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.555C21.965 6.012 17.461 2 12 2z"/></svg>',
+  run: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M10 8.5v7l5.5-3.5L10 8.5z" fill="currentColor" stroke="none"/></svg>',
   download: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
   image: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>',
   delay: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
@@ -1248,7 +1265,7 @@ function providerBadge(provider: unknown) {
 function nodeHoverToolbar() {
   return `
     <div class="df-hover-toolbar">
-      <button type="button" class="df-hover-btn" data-node-action="run" title="Run node">${DF_ICONS.generate}</button>
+      <button type="button" class="df-hover-btn" data-node-action="run" title="Run node">${DF_ICONS.run}</button>
       <button type="button" class="df-hover-btn" data-node-action="duplicate" title="Duplicate"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
       <button type="button" class="df-hover-btn" data-node-action="settings" title="Settings"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.17a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68 1.65 1.65 0 0 0 10 3.17V3a2 2 0 0 1 4 0v.17a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.32 9c.23.61.81 1 1.51 1H21a2 2 0 0 1 0 4h-.17a1.65 1.65 0 0 0-1.43 1z"/></svg></button>
       <button type="button" class="df-hover-btn df-hover-btn-danger" data-node-action="delete" title="Delete node">${DF_ICONS.trash}</button>
@@ -2336,6 +2353,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const updateNodePositions = useWorkflowStore((s) => s.updateNodePositions)
   const addEdgeToStore = useWorkflowStore((s) => s.addEdge)
   const deleteNode = useWorkflowStore((s) => s.deleteNode)
+  const deleteNodes = useWorkflowStore((s) => s.deleteNodes)
   const deleteEdge = useWorkflowStore((s) => s.deleteEdge)
   const setSelectedNode = useWorkflowStore((s) => s.setSelectedNode)
   // [WorkflowSelection] Logged wrapper. Routes every
@@ -2370,7 +2388,20 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const nodeResizeObserversRef = useRef<Map<string, ResizeObserver>>(new Map())
   const overlayObserversRef = useRef<WeakMap<SVGPathElement, MutationObserver>>(new WeakMap())
   const nodePickerSpawnRef = useRef<{ x: number; y: number } | null>(null)
-  const copiedNodeRef = useRef<WorkflowNode | null>(null)
+  const copiedNodeGroupRef = useRef<{ targetNodeId: string; nodes: WorkflowNode[]; edges: WorkflowEdge[] } | null>(null)
+  const multiSelectedNodeIdsRef = useRef<Set<string>>(new Set())
+  // [WorkflowMarquee] Live preview set. Populated only WHILE the user
+  // is Ctrl+dragging a marquee rectangle. The `.selected` /
+  // `.conn-node-selected` classes applied from this set are transient
+  // — they vanish the moment the marquee ends, the mouseup commits
+  // the selection, or the gesture is cancelled. Keeping this in a
+  // ref (not React state) lets the rAF hit-test mutate it ~60 Hz
+  // without re-rendering the workflow tree.
+  const marqueePreviewNodeIdsRef = useRef<Set<string>>(new Set())
+  const marqueePreviewFrameRef = useRef<number | null>(null)
+  const marqueeLastRectRef = useRef<MarqueeRect | null>(null)
+  const marqueeActiveRef = useRef<boolean>(false)
+  const marqueePreviewCountRef = useRef<number>(0)
   const lastCanvasPointerRef = useRef<{ x: number; y: number } | null>(null)
   const nodePickerRef = useRef<HTMLDivElement | null>(null)
   const nodePillMenuRef = useRef<HTMLDivElement | null>(null)
@@ -2393,6 +2424,72 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   // `updateNodePositions` bulk call so the store + persist +
   // undo history each receives exactly one write per drag.
   const pendingDragPositionsRef = useRef<Map<string, { x: number; y: number }>>(new Map())
+
+  // [GroupDrag] Group drag state. Activated when the user clicks on a
+  // node that belongs to a multi-selection set of ≥2 nodes. Captures
+  // the leader's start position and snapshots the start positions of
+  // every other selected node, then mirrors the leader's per-tick
+  // delta onto each follower. No store write, no history, no
+  // hydrateDrawflow / editor.import during the gesture — positions
+  // are written to `pendingDragPositionsRef` (the same map the
+  // single-node drag uses) and the existing `mouseUp` handler drains
+  // them into a single bulk `updateNodePositions` call. That means
+  // one history entry per group drag, and Ctrl+Z restores the whole
+  // group in one undo step.
+  type GroupDragState = {
+    active: boolean
+    leaderNodeId: string | null
+    leaderStart: { x: number; y: number } | null
+    startPositions: Map<string, { x: number; y: number }>
+    selectedIds: Set<string>
+    lastDelta: { x: number; y: number }
+    frame: number | null
+    applyingFollowers: boolean
+  }
+
+  // [GroupDrag][mirror] Mirror state captured on plain mousedown
+  // over a node that is already in the multi-selection. Holds:
+  //   - `grabbedId`: the leader Drawflow will drag natively.
+  //   - `selectedIds`: snapshot of the multi-selection at start.
+  //   - `starts`: per-node pre-drag {left,top} read from the DOM
+  //     (with editor-internal pos_x/pos_y as fallback).
+  //   - `mouseStartX/Y`: viewport pixels at mousedown.
+  //   - `zoom`: editor.zoom at start (delta is divided by zoom so
+  //     dx/dy stays canvas-px regardless of the current zoom level).
+  // Document `mousemove` / `mouseup` capture-phase listeners compute
+  // `dx = (clientX - mouseStartX) / zoom` and apply that delta to
+  // every follower via `applyDrawflowNodePosition`. The leader is
+  // skipped — Drawflow moves it natively. Mouseup commits bulk.
+  type MultiDragState = {
+    grabbedId: string
+    selectedIds: Set<string>
+    starts: Map<string, { el: HTMLElement; left: number; top: number }>
+    mouseStartX: number
+    mouseStartY: number
+    zoom: number
+    /**
+     * True once a `mirrorMove` tick has fired with a non-zero
+     * delta. Used by `finishMultiDragMirror` to skip the bulk
+     * commit when the user just clicked without dragging — we
+     * must NOT call `updateNodePositions` for an unchanged
+     * cluster (otherwise the store would see a phantom write
+     * and `updatedAt` / history would move on a no-op gesture).
+     */
+    moved: boolean
+  }
+  const multiDragRef = useRef<MultiDragState | null>(null)
+  const multiDragFrameRef = useRef<number | null>(null)
+
+  const groupDragRef = useRef<GroupDragState>({
+    active: false,
+    leaderNodeId: null,
+    leaderStart: null,
+    startPositions: new Map(),
+    selectedIds: new Set(),
+    lastDelta: { x: 0, y: 0 },
+    frame: null,
+    applyingFollowers: false
+  })
 
   // [CanvasFix] Per-node lightweight rAF handle for `nodeMoved`
   // ticks. Unlike `scheduleDrawflowConnectionRefresh`, this does
@@ -2432,6 +2529,27 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const [zoomLevel, setZoomLevel] = useState(100)
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null)
   const [inspectorNodeId, setInspectorNodeId] = useState<string | null>(null)
+  const [marqueeRect, setMarqueeRect] = useState<MarqueeRect | null>(null)
+  // Multi-selection: the Set lives in a ref for hot-path reads inside
+  // syncSelectedNodeDom / syncConnectionOverlays, and we mirror the
+  // same data into a state so React-driven UI (marquee overlay,
+  // selection counter) re-renders. Keep both in sync via the
+  // `setMultiSelectedNodeIds` helper defined further down.
+  const [multiSelectedNodeIds, setMultiSelectedNodeIdsState] = useState<string[]>([])
+  // [WorkflowMarquee] React-side mirror of `marqueePreviewNodeIdsRef.size`.
+  // We only push this through state (causing one render per COUNT CHANGE,
+  // not per pixel of mouse motion) so the badge can update during drag.
+  const [marqueePreviewCount, setMarqueePreviewCount] = useState<number>(0)
+  const setMultiSelectedNodeIds = (next: Iterable<string> | null) => {
+    if (next == null) {
+      multiSelectedNodeIdsRef.current = new Set()
+      setMultiSelectedNodeIdsState([])
+      return
+    }
+    const arr = Array.from(new Set(next))
+    multiSelectedNodeIdsRef.current = new Set(arr)
+    setMultiSelectedNodeIdsState(arr)
+  }
 
   // ── Pipeline run visual state ─────────────────────────────────────────
   type NodeRunStatus = 'idle' | 'running' | 'completed' | 'failed'
@@ -3417,6 +3535,34 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     return String(nodeId).replace(/^node-/, '')
   }
 
+  // [GroupDragInvestigate] Resolve a raw id (workflow, drawflow
+  // element, or numeric) to all the variants and tell the caller
+  // where the same id lives across the layers. Used by
+  // groupDragInvestigateLog call sites that need to disambiguate
+  // id formats.
+  const debugResolveNodeId = (rawId: string | number): Record<string, unknown> => {
+    const editor = editorRef.current
+    const rawStr = String(rawId)
+    const drawflowElId = toDrawflowElementId(rawStr)
+    const workflowId = toWorkflowNodeId(rawStr)
+    const canvas = canvasRef.current
+    const domEl = canvas?.querySelector<HTMLElement>(`#${CSS.escape(drawflowElId)}`)
+    const editorNode = editor?.getNodeFromId(workflowId)
+    const workflowNode = workflowRef.current.nodes.find((node) => node.id === workflowId)
+    return {
+      rawId,
+      rawStr,
+      drawflowElId,
+      workflowId,
+      domExists: !!domEl,
+      domClassList: domEl ? Array.from(domEl.classList) : null,
+      editorNodeExists: !!editorNode,
+      editorPos: editorNode ? { x: editorNode.pos_x, y: editorNode.pos_y } : null,
+      workflowNodeExists: !!workflowNode,
+      workflowPos: workflowNode ? workflowNode.position : null
+    }
+  }
+
   function mountedWorkflowNodeIds() {
     const ids = new Set(workflowRef.current.nodes.map((node) => node.id))
     canvasRef.current?.querySelectorAll<HTMLElement>('.drawflow-node[id^="node-"]').forEach((nodeEl) => {
@@ -3612,10 +3758,398 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     }
   }
 
+  // [GroupDrag][mirror] Legacy single-node rAF follower apply
+  // removed in favour of the mirror pattern in
+  // `applyMultiDragMirror`. The functions
+  // `scheduleGroupDragFollowerUpdate` and
+  // `applyGroupDragFollowers` previously driven by `nodeMoved`
+  // delta are now no-ops kept only because old `groupDragRef`
+  // flag reads still exist in defence paths. The mirror path is
+  // the one that actually drives cluster movement.
+  const scheduleGroupDragFollowerUpdate = () => {
+    // No-op — mirror is the active path.
+  }
+
+  const applyGroupDragFollowers = () => {
+    // No-op — mirror is the active path.
+  }
+
+// [GroupDrag][mirror] Legacy finish path. The mirror pattern
+  // drives the actual cluster movement + commit. This function is
+  // kept as a state-reset helper so any leftover call sites
+  // (legacy cancel paths, defence branches that read `gd.active`)
+  // stay safe.
+  const finishGroupDrag = (options: { commit: boolean; reason?: string } = { commit: true }) => {
+    const gd = groupDragRef.current
+    if (gd.frame !== null) {
+      cancelAnimationFrame(gd.frame)
+      gd.frame = null
+    }
+    gd.active = false
+    gd.leaderNodeId = null
+    gd.leaderStart = null
+    gd.startPositions = new Map()
+    gd.selectedIds = new Set()
+    gd.lastDelta = { x: 0, y: 0 }
+  }
+
+  const cancelGroupDrag = (reason: string) => {
+    finishGroupDrag({ commit: false, reason })
+  }
+
+  // [GroupDrag][mirror] Capture pre-drag state on plain mousedown
+  // over a node that is already in the multi-selection. Stores the
+  // node DOM element + parsed `style.left/top` for every selected
+  // node, plus the mouse start coords and current zoom. The
+  // mousemove handler attached right after this reads
+  // `multiDragRef.current` and applies `(clientX - mouseStartX) /
+  // zoom` to every follower.
+  const startMultiDragMirror = (grabbedId: string, event: MouseEvent): boolean => {
+    const editor = editorRef.current
+    const canvas = canvasRef.current
+    if (!editor || !canvas) return false
+    const multi = multiSelectedNodeIdsRef.current
+    if (multi.size < 2 || !multi.has(grabbedId)) return false
+
+    const starts = new Map<string, { el: HTMLElement; left: number; top: number }>()
+    for (const selectedId of multi) {
+      const el = canvas.querySelector<HTMLElement>(`#${CSS.escape(toDrawflowElementId(selectedId))}`)
+      if (!el) continue
+      const domLeft = parseFloat(el.style.left)
+      const domTop = parseFloat(el.style.top)
+      const internal = editor.getNodeFromId(selectedId)
+      const left = Number.isFinite(domLeft) ? domLeft : internal?.pos_x ?? 0
+      const top = Number.isFinite(domTop) ? domTop : internal?.pos_y ?? 0
+      starts.set(selectedId, { el, left, top })
+    }
+
+    if (!starts.has(grabbedId)) return false
+
+    multiDragRef.current = {
+      grabbedId,
+      selectedIds: new Set(multi),
+      starts,
+      mouseStartX: event.clientX,
+      mouseStartY: event.clientY,
+      zoom: editor.zoom || 1,
+      moved: false
+    }
+
+    // Cancel any in-flight rAF and reset the frame slot.
+    if (multiDragFrameRef.current !== null) {
+      cancelAnimationFrame(multiDragFrameRef.current)
+      multiDragFrameRef.current = null
+    }
+    attachMultiDragMirrorListeners()
+    groupDragMirrorLog('mirrorStart', {
+      grabbedId,
+      selectedCount: starts.size,
+      followerCount: starts.size - 1,
+      mouseStartX: event.clientX,
+      mouseStartY: event.clientY,
+      zoom: editor.zoom || 1
+    })
+    return true
+  }
+
+  // [GroupDrag][mirror] Document-level mousemove handler. Reads the
+  // viewport delta, divides by `multiDragRef.zoom` to get canvas-px,
+  // and updates each follower's `style.left/top` + Drawflow internal
+  // `pos_x/pos_y`. The leader is skipped because Drawflow is moving
+  // it natively via its own mousedown handler.
+  const applyMultiDragMirror = (event: MouseEvent) => {
+    const md = multiDragRef.current
+    if (!md) return
+    const dx = (event.clientX - md.mouseStartX) / md.zoom
+    const dy = (event.clientY - md.mouseStartY) / md.zoom
+    const editor = editorRef.current
+    if (!editor) return
+
+    for (const selectedId of md.selectedIds) {
+      if (selectedId === md.grabbedId) continue
+      const start = md.starts.get(selectedId)
+      if (!start) continue
+      const nextX = start.left + dx
+      const nextY = start.top + dy
+      try {
+        const internal = editor.getNodeFromId(selectedId)
+        if (internal) {
+          internal.pos_x = nextX
+          internal.pos_y = nextY
+        }
+      } catch {
+        // rehydrate race — DOM update below still applies
+      }
+      start.el.style.left = `${nextX}px`
+      start.el.style.top = `${nextY}px`
+      try {
+        editor.updateConnectionNodes(toDrawflowElementId(selectedId))
+      } catch {
+        // Drawflow can briefly miss DOM nodes mid-rehydrate.
+      }
+      pendingDragPositionsRef.current.set(selectedId, { x: nextX, y: nextY })
+    }
+    // [GroupDrag] Per-frame `mirrorMove` / `mirrorFollower` logs
+    // are intentionally removed. These fired every animation
+    // frame (and once per follower per frame) — even with the
+    // `groupDragInvestigateEnabled` gate, enabling that flag in
+    // a normal user session would spam the console. Lifecycle
+    // events (mirrorStart / mirrorCommit / mirrorCancel /
+    // mirrorCleanupOnUnmount) still log via
+    // `groupDragMirrorLog`, which now uses `console.debug` so
+    // production consoles stay clean.
+    if (Math.abs(dx) > 0.0001 || Math.abs(dy) > 0.0001) {
+      md.moved = true
+    }
+  }
+
+  const scheduleMultiDragMirror = (event: MouseEvent) => {
+    if (multiDragFrameRef.current !== null) return
+    multiDragFrameRef.current = window.requestAnimationFrame(() => {
+      multiDragFrameRef.current = null
+      applyMultiDragMirror(event)
+    })
+  }
+
+  // [GroupDrag][mirror] Mouseup handler. Drains pending → bulk
+  // commit, then detaches listeners and clears state. Selection is
+  // preserved (the user expects the multi-set to remain after a
+  // group drag).
+  const finishMultiDragMirror = (commit: boolean) => {
+    const md = multiDragRef.current
+    if (!md) return
+    if (multiDragFrameRef.current !== null) {
+      cancelAnimationFrame(multiDragFrameRef.current)
+      multiDragFrameRef.current = null
+    }
+    const editor = editorRef.current
+    const positions: Record<string, { x: number; y: number }> = {}
+    if (commit && editor && md.moved) {
+      // Pull leader's final pos from Drawflow — Drawflow already
+      // moved it natively, so `pos_x/pos_y` is the post-drag truth.
+      const leaderInternal = editor.getNodeFromId(md.grabbedId)
+      if (leaderInternal) {
+        positions[md.grabbedId] = { x: leaderInternal.pos_x, y: leaderInternal.pos_y }
+      }
+      for (const [id, pos] of pendingDragPositionsRef.current.entries()) {
+        if (!positions[id]) positions[id] = pos
+      }
+      const activeWorkflowId = useWorkflowStore.getState().activeWorkflowId
+      if (activeWorkflowId && Object.keys(positions).length > 0) {
+        updateNodePositions(positions, activeWorkflowId)
+      }
+      // Sync lastApplied so positionSignature does not snap back.
+      for (const [id, pos] of Object.entries(positions)) {
+        lastAppliedPositionsRef.current.set(id, pos)
+      }
+      scheduleDrawflowConnectionRefresh(null, { all: true })
+      groupDragMirrorLog('mirrorCommit', {
+        count: Object.keys(positions).length,
+        nodeIds: Object.keys(positions),
+        leaderFinal: positions[md.grabbedId] ?? null,
+        positions
+      })
+    } else {
+      // No movement happened, or commit=false (cancel) — restore
+      // followers and skip the store write entirely.
+      if (commit) {
+        groupDragMirrorLog('mirrorCommitSkipped', {
+          reason: md.moved ? 'no_pending' : 'no_movement',
+          moved: md.moved,
+          pendingCount: pendingDragPositionsRef.current.size
+        })
+      }
+      // Restore followers in either cancel or no-movement case so
+      // any sub-pixel rAF-painted positions don't linger.
+      for (const [id, start] of md.starts.entries()) {
+        if (id === md.grabbedId) continue
+        try {
+          const internal = editor?.getNodeFromId(id)
+          if (internal) {
+            internal.pos_x = start.left
+            internal.pos_y = start.top
+          }
+        } catch {
+          // ignore
+        }
+        start.el.style.left = `${start.left}px`
+        start.el.style.top = `${start.top}px`
+      }
+      pendingDragPositionsRef.current.clear()
+      if (!commit) {
+        groupDragMirrorLog('mirrorCancel', {
+          reason: 'cancel',
+          restoredFollowerCount: md.starts.size - 1
+        })
+      }
+    }
+    multiDragRef.current = null
+    detachMultiDragMirrorListeners()
+  }
+
+  // [GroupDrag][mirror] Attach / detach document capture-phase
+  // listeners. Idempotent. The references are kept on `window`
+  // so the detach path can find them across closures.
+  const attachMultiDragMirrorListeners = () => {
+    if ((window as unknown as { __aiflow_multiDragMove__?: boolean }).__aiflow_multiDragMove__) {
+      return
+    }
+    const onMove = (event: MouseEvent) => {
+      if (!multiDragRef.current) return
+      scheduleMultiDragMirror(event)
+    }
+    const onUp = () => {
+      finishMultiDragMirror(true)
+    }
+    const onCancel = () => {
+      finishMultiDragMirror(false)
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        finishMultiDragMirror(false)
+      }
+    }
+    document.addEventListener('mousemove', onMove, true)
+    document.addEventListener('mouseup', onUp, true)
+    document.addEventListener('pointercancel', onCancel, true)
+    window.addEventListener('blur', onCancel)
+    window.addEventListener('keydown', onKeyDown, true)
+    ;(window as unknown as {
+      __aiflow_multiDragMove__?: boolean
+      __aiflow_multiDragOnMove__?: (event: MouseEvent) => void
+      __aiflow_multiDragOnUp__?: () => void
+      __aiflow_multiDragOnCancel__?: () => void
+      __aiflow_multiDragOnKeyDown__?: (event: KeyboardEvent) => void
+    }).__aiflow_multiDragMove__ = true
+    ;(window as unknown as {
+      __aiflow_multiDragOnMove__?: (event: MouseEvent) => void
+    }).__aiflow_multiDragOnMove__ = onMove
+    ;(window as unknown as {
+      __aiflow_multiDragOnUp__?: () => void
+    }).__aiflow_multiDragOnUp__ = onUp
+    ;(window as unknown as {
+      __aiflow_multiDragOnCancel__?: () => void
+    }).__aiflow_multiDragOnCancel__ = onCancel
+    ;(window as unknown as {
+      __aiflow_multiDragOnKeyDown__?: (event: KeyboardEvent) => void
+    }).__aiflow_multiDragOnKeyDown__ = onKeyDown
+  }
+
+  const detachMultiDragMirrorListeners = () => {
+    const w = window as unknown as {
+      __aiflow_multiDragMove__?: boolean
+      __aiflow_multiDragOnMove__?: (event: MouseEvent) => void
+      __aiflow_multiDragOnUp__?: () => void
+      __aiflow_multiDragOnCancel__?: () => void
+      __aiflow_multiDragOnKeyDown__?: (event: KeyboardEvent) => void
+    }
+    if (!w.__aiflow_multiDragMove__) return
+    if (w.__aiflow_multiDragOnMove__) {
+      document.removeEventListener('mousemove', w.__aiflow_multiDragOnMove__, true)
+    }
+    if (w.__aiflow_multiDragOnUp__) {
+      document.removeEventListener('mouseup', w.__aiflow_multiDragOnUp__, true)
+    }
+    if (w.__aiflow_multiDragOnCancel__) {
+      document.removeEventListener('pointercancel', w.__aiflow_multiDragOnCancel__, true)
+      window.removeEventListener('blur', w.__aiflow_multiDragOnCancel__)
+    }
+    if (w.__aiflow_multiDragOnKeyDown__) {
+      window.removeEventListener('keydown', w.__aiflow_multiDragOnKeyDown__, true)
+    }
+    w.__aiflow_multiDragMove__ = false
+    w.__aiflow_multiDragOnMove__ = undefined
+    w.__aiflow_multiDragOnUp__ = undefined
+    w.__aiflow_multiDragOnCancel__ = undefined
+    w.__aiflow_multiDragOnKeyDown__ = undefined
+  }
+
+  // [GroupDrag] Debug log gated by AI_FLOW_DEBUG /
+  // AI_FLOW_DEBUG_CANVAS_INVESTIGATE so production consoles stay
+  // clean. The lifecycle events are: start (when the leader's first
+  // tick activates group drag), commit (mouseUp drain), cancel
+  // (Escape / blur / pointercancel / off-window mouseup).
+  const groupDragDebugLog = (
+    event: 'start' | 'commit' | 'cancel',
+    payload: Record<string, unknown>
+  ) => {
+    if (typeof window === 'undefined') return
+    const w = window as unknown as { __GROUP_DRAG_DEBUG__?: boolean }
+    const enabled = Boolean(w.__GROUP_DRAG_DEBUG__)
+    if (!enabled) return
+    // eslint-disable-next-line no-console
+    console.debug(`[GroupDrag][${event}]`, payload)
+  }
+
+  // [GroupDragInvestigate] Investigation-only log.
+//
+// Three flag sources are honored, in order:
+//   1. window.__GROUP_DRAG_INVESTIGATE__ === true (page-console toggle)
+//   2. localStorage.AI_FLOW_DEBUG_GROUP_DRAG === '1' (dedicated flag)
+//   3. localStorage.AI_FLOW_DEBUG === '1' (master debug switch)
+//
+// The helper emits at `console.debug` level so production consoles
+// stay clean — Chrome DevTools hides Verbose by default. Call sites
+// for the per-frame probes (`mirrorMove`, `mirrorFollower`,
+// `nodeMoved.raw`, `nodeMoved.context`, etc.) have been removed
+// entirely; only lifecycle event sites remain in
+// `groupDragMirrorLog`. Enable the `Verbose` filter in DevTools
+// (or set `window.__GROUP_DRAG_INVESTIGATE__ = true`) to observe
+// the remaining probes.
+const groupDragInvestigateEnabled = (): boolean => {
+  if (typeof window === 'undefined') return false
+  const w = window as unknown as { __GROUP_DRAG_INVESTIGATE__?: boolean }
+  if (w.__GROUP_DRAG_INVESTIGATE__) return true
+  try {
+    if (window.localStorage.getItem('AI_FLOW_DEBUG_GROUP_DRAG') === '1') return true
+    if (window.localStorage.getItem('AI_FLOW_DEBUG') === '1') return true
+  } catch {
+    return false
+  }
+  return false
+}
+const groupDragInvestigateLog = (
+  event: string,
+  payload: Record<string, unknown>
+) => {
+  if (!groupDragInvestigateEnabled()) return
+  // [GroupDrag] Verbose level — Chrome DevTools hides this by
+  // default. Production consoles stay clean unless the user
+  // enables the `Verbose` filter. Per-frame probes (mirrorMove,
+  // mirrorFollower) are intentionally NOT called from
+  // `applyMultiDragMirror` anymore — see `applyMultiDragMirror`
+  // for the per-frame decision.
+  // eslint-disable-next-line no-console
+  console.debug(`[GroupDragInvestigate][${event}]`, payload)
+}
+
+// [GroupDrag] Mirror-mode logger — same flag as the investigation
+// logger, but uses the `[GroupDrag]` prefix. Lifecycle events
+// (mirrorStart / mirrorCommit / mirrorCommitSkipped /
+// mirrorCancel / mirrorCleanupOnUnmount) call this at most once
+// per gesture, so the Verbose level is appropriate.
+const groupDragMirrorLog = (
+  event: string,
+  payload: Record<string, unknown>
+) => {
+  if (!groupDragInvestigateEnabled()) return
+  // eslint-disable-next-line no-console
+  console.debug(`[GroupDrag][${event}]`, payload)
+}
+
   const rerenderDrawflowNode = (nodeId: string) => {
     const editor = editorRef.current
     const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
     if (!editor || !node) return
+
+    // [GroupDrag] Per-node rerender wipes the node's
+    // `.drawflow_content_node` innerHTML. A rerender for a
+    // follower during group drag can re-apply the original
+    // `style.left/top` from the freshly-rendered Drawflow data
+    // and snap it back to its pre-drag spot. The investigation
+    // log was removed — see
+    // `groupDragInvestigateLog` definition for the gating
+    // contract.
 
     // [CanvasInvestigate] probe — fires every time a SINGLE node's
     // HTML is replaced. Pair with [hydrateDrawflow] to distinguish
@@ -3752,11 +4286,9 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     return staleEdges.map((edge) => edge.id)
   }
 
-  const syncConnectionOverlays = () => {
+  const syncConnectionOverlaysForSelectedIds = (selectedIds: Set<string>) => {
     const canvas = canvasRef.current
     if (!canvas) return
-
-    const selectedId = useWorkflowStore.getState().selectedNodeId
 
     canvas.querySelectorAll<SVGSVGElement>('.drawflow svg.connection').forEach((connection) => {
       const mainPath = connection.querySelector<SVGPathElement>('path.main-path:not(.main-path-overlay)')
@@ -3805,12 +4337,27 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       connection.classList.add(`conn-type-${connectionType}`)
       connection.classList.toggle(
         'conn-node-selected',
-        Boolean(
-          selectedId &&
-          (connection.classList.contains(`node_in_node-${selectedId}`) || connection.classList.contains(`node_out_node-${selectedId}`))
-        )
+        Boolean((sourceId && selectedIds.has(sourceId)) || (targetId && selectedIds.has(targetId)))
       )
     })
+  }
+
+  const syncConnectionOverlays = () => {
+    const selectedId = useWorkflowStore.getState().selectedNodeId
+    const selectedIds = new Set(multiSelectedNodeIdsRef.current)
+    if (selectedId) selectedIds.add(selectedId)
+    // [WorkflowMarquee] When the user is mid-drag, the live preview
+    // set overrides the committed store selection. Preview glow is
+    // drawn from the marquee rectangle and must shrink/expand
+    // realtime — the committed set would lag by one mouseup.
+    if (marqueeActiveRef.current) {
+      const previewIds = new Set(marqueePreviewNodeIdsRef.current)
+      if (previewIds.size > 0) {
+        return syncConnectionOverlaysForSelectedIds(previewIds)
+      }
+      return syncConnectionOverlaysForSelectedIds(new Set())
+    }
+    return syncConnectionOverlaysForSelectedIds(selectedIds)
   }
 
   const scheduleConnectionSync = () => {
@@ -3821,23 +4368,43 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     })
   }
 
-  const syncSelectedNodeDom = (selectedId = useWorkflowStore.getState().selectedNodeId) => {
-    wfSelectionLog('syncSelectedNodeDom', { selectedId })
+  const syncSelectedNodeDomForIds = (selectedIds: Set<string>, options: { mutateEditor?: boolean; preferredSelectedId?: string | null } = {}) => {
+    const { mutateEditor = true, preferredSelectedId = null } = options
     const canvas = canvasRef.current
     const editor = editorRef.current
-    if (!canvas) return
+    if (!canvas) return null
 
     let selectedEl: HTMLElement | null = null
     canvas.querySelectorAll<HTMLElement>('.drawflow-node.selected').forEach((el) => {
-      if (!selectedId || el.id !== `node-${selectedId}`) el.classList.remove('selected')
+      const nodeId = el.id.replace(/^node-/, '')
+      if (!selectedIds.has(nodeId)) el.classList.remove('selected')
     })
 
-    if (selectedId) {
-      selectedEl = canvas.querySelector<HTMLElement>(`#node-${CSS.escape(selectedId)}`)
-      selectedEl?.classList.add('selected')
+    for (const nodeId of selectedIds) {
+      const nodeEl = canvas.querySelector<HTMLElement>(`#node-${CSS.escape(nodeId)}`)
+      nodeEl?.classList.add('selected')
+      if (nodeId === preferredSelectedId) selectedEl = nodeEl
     }
 
-    if (editor) editor.node_selected = selectedEl
+    // Only the store-driven path mutates `editor.node_selected`.
+    // Marquee-preview takes the same visual glow but leaves Drawflow's
+    // internal selection alone — otherwise a mid-drag `node_selected`
+    // assignment would fight the user's Ctrl+drag intent and confuse
+    // the library's own click handlers.
+    if (mutateEditor && editor) {
+      editor.node_selected = selectedEl
+    }
+    return selectedEl
+  }
+
+  const syncSelectedNodeDom = (selectedId = useWorkflowStore.getState().selectedNodeId) => {
+    const selectedIds = new Set(multiSelectedNodeIdsRef.current)
+    if (selectedId) selectedIds.add(selectedId)
+    wfSelectionLog('syncSelectedNodeDom', { selectedId, selectedIds: Array.from(selectedIds) })
+    syncSelectedNodeDomForIds(selectedIds, {
+      mutateEditor: true,
+      preferredSelectedId: selectedId
+    })
     scheduleConnectionSync()
   }
 
@@ -3861,6 +4428,10 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const clearCanvasSelection = (reason: string = 'unspecified') => {
     const canvas = canvasRef.current
     const editor = editorRef.current
+
+    // [GroupDrag] Investigation log was removed — see
+    // `groupDragInvestigateLog` definition for the gating
+    // contract.
 
     if (canvas) {
       // Snapshot BEFORE removing anything. Multiple selectors are
@@ -3898,6 +4469,14 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     // — otherwise the nodeUnselected handler will leave the .selected
     // class stuck on the previously-clicked node.
     selectionMouseDownRef.current = { nodeId: null, clearOnUnselect: true }
+
+    // Clear multi-selection ref + state so background / outside clicks
+    // also wipe the marquee selection. Without this, ctrl+drag → click
+    // empty space would leave stale .selected classes on previously
+    // marquee-selected nodes.
+    if (multiSelectedNodeIdsRef.current.size > 0 || multiSelectedNodeIds.length > 0) {
+      setMultiSelectedNodeIds(null)
+    }
 
     if (canvas) {
       // Defensive DOM flush BEFORE the React render commits. We strip
@@ -3997,6 +4576,127 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     await runPipeline(workflowSlice, pipelineCallbacksRef.current)
   }
 
+  const duplicateNodeWithInputs = (nodeId: string) => {
+    const currentWorkflow = workflowRef.current
+    const workflowSlice = buildWorkflowSliceForTarget(currentWorkflow, nodeId)
+    if (!workflowSlice || workflowSlice.nodes.length === 0) return false
+
+    const idMap = new Map<string, string>()
+    for (const node of workflowSlice.nodes) {
+      idMap.set(node.id, createId('node'))
+    }
+
+    const offset = { x: 72, y: 72 }
+    const duplicatedNodes: WorkflowNode[] = workflowSlice.nodes.map((node) => ({
+      ...cloneDeep(node),
+      id: idMap.get(node.id) || createId('node'),
+      position: {
+        x: Math.max(0, Math.round(node.position.x + offset.x)),
+        y: Math.max(0, Math.round(node.position.y + offset.y))
+      },
+      data: cloneDeep(node.data)
+    }))
+
+    const duplicatedEdges: WorkflowEdge[] = workflowSlice.edges
+      .map((edge) => {
+        const source = idMap.get(edge.source)
+        const target = idMap.get(edge.target)
+        if (!source || !target) return null
+        return {
+          ...cloneDeep(edge),
+          id: createId('edge'),
+          source,
+          target
+        } satisfies WorkflowEdge
+      })
+      .filter((edge): edge is WorkflowEdge => Boolean(edge))
+
+    const duplicatedTargetId = idMap.get(nodeId) || duplicatedNodes[duplicatedNodes.length - 1]?.id
+    updateWorkflow(currentWorkflow.id, {
+      nodes: [...currentWorkflow.nodes, ...duplicatedNodes],
+      edges: [...currentWorkflow.edges, ...duplicatedEdges]
+    })
+
+    if (duplicatedTargetId) {
+      setSelectedNode(duplicatedTargetId)
+    }
+
+    requestAnimationFrame(() => {
+      duplicatedNodes.forEach((node) => attachNodeResizeObserver(node.id))
+      scheduleDrawflowConnectionRefresh(null, { all: true })
+      if (duplicatedTargetId) syncSelectedNodeDom(duplicatedTargetId)
+    })
+
+    return true
+  }
+
+  // [WorkflowMarquee] Delete every node in the current selection set.
+  // When the selection is empty, fall back to deleting just the
+  // store-selected node so single-selection + Delete still works.
+  // The store's `deleteNode` already removes edges attached to the
+  // node, so calling it in a loop is enough — internal edges vanish
+  // when both endpoints are deleted, and any external edges to nodes
+  // outside the selection are dropped too.
+  const deleteSelectedNodes = () => {
+    const ids = new Set(multiSelectedNodeIdsRef.current)
+    const storeSelected = useWorkflowStore.getState().selectedNodeId
+    if (storeSelected) ids.add(storeSelected)
+
+    if (ids.size === 0) return false
+
+    const currentWorkflow = workflowRef.current
+    if (!currentWorkflow) return false
+
+    // Snapshot which nodes actually exist so we don't no-op a stale
+    // id from a previous selection.
+    const toDelete = currentWorkflow.nodes.filter((node) => ids.has(node.id))
+    if (toDelete.length === 0) return false
+
+    // Clear run-state refs first so the visual state doesn't show
+    // ghosts of nodes we're about to remove.
+    setNodeRunStates((prev) => {
+      const next: Record<string, NodeRunStatus> = { ...prev }
+      for (const node of toDelete) delete next[node.id]
+      return next
+    })
+    setActiveEdges({})
+    setNodeOutputs((prev) => {
+      const next: Record<string, unknown> = { ...prev }
+      for (const node of toDelete) delete next[node.id]
+      return next
+    })
+
+    // Clear selection state BEFORE deleting so Drawflow's
+    // nodeUnselected path doesn't re-add .selected for a node
+    // that's about to vanish.
+    setMultiSelectedNodeIds(null)
+    if (storeSelected) setSelectedNodeWithLog(null, 'delete:clear-multi')
+
+    // Close the inspector if it was open on one of the doomed nodes.
+    const inspectorId = inspectorNodeId
+    if (inspectorId && ids.has(inspectorId)) {
+      setInspectorNodeId(null)
+    }
+
+    // [WorkflowDelete] Single batched delete through the store. This
+    // pushes exactly ONE history entry for the whole multi-node
+    // gesture so Ctrl+Z restores every removed node + edge in one
+    // undo. The previous loop-over-deleteNode() implementation pushed
+    // one history entry per node and required N undos for N nodes.
+    deleteNodes(currentWorkflow.id, Array.from(ids))
+
+    requestAnimationFrame(() => {
+      // Force a connection pass because the store deletes edges
+      // synchronously but Drawflow's path DOM might still reference
+      // removed endpoints. The full-fingerprint refresh rebuilds
+      // every port → path mapping.
+      scheduleDrawflowConnectionRefresh(null, { all: true })
+      syncSelectedNodeDom(null)
+    })
+
+    return true
+  }
+
   const applyCanvasZoom = (nextZoom: number, anchor?: { x: number; y: number }) => {
     const editor = editorRef.current
     const canvas = canvasRef.current
@@ -4023,6 +4723,10 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const hydrateDrawflow = () => {
     const editor = editorRef.current
     if (!editor) return
+
+    // [GroupDrag] A hydrate during a group drag nukes every
+    // follower's `style.left/top` because the editor.import call
+    // rebuilds the DOM. Investigation log was removed.
 
     // [CanvasInvestigate] probe — fires every time a structural
     // signature change causes a full canvas re-import. Confirms
@@ -4070,6 +4774,11 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   useEffect(() => {
     if (!canvasRef.current) return
 
+    // [GroupDragInvestigate] probe-mounted. Fires once when the
+    // editor is created, gated by the same flag the user enables via
+    // localStorage / window flag. The previous round of investigation
+    // [GroupDrag] Mount probe was removed in the log-cleanup pass.
+
     const canvasEl = canvasRef.current
     canvasEl.innerHTML = ''
     const editor = new Drawflow(canvasEl) as DrawflowInstance
@@ -4091,6 +4800,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
 
     editor.on('nodeSelected', (id: string | number) => {
       const nodeId = String(id)
+      // [GroupDrag] drawflowNodeSelected probe was removed.
       // [WorkflowSelection] Stale-event guard. If a `clearCanvasSelection`
       // fired within the last 120ms, a synchronous re-fire of
       // `nodeSelected` from Drawflow's own click handler would
@@ -4113,6 +4823,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         selectionIntent: selectionMouseDownRef.current
       })
       const selectionIntent = selectionMouseDownRef.current
+      // [GroupDrag] drawflowNodeUnselected probe was removed.
       if (selectionIntent?.nodeId) {
         requestAnimationFrame(() => syncSelectedNodeDom(selectionIntent.nodeId))
         return
@@ -4141,6 +4852,9 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     // store receives ONE write per drag gesture — history + persist
     // each happen exactly once.
     editor.on('nodeMoved', (id: string | number) => {
+      // [GroupDrag] nodeMoved probes were removed in the log-cleanup
+      // pass. `canvasLog('nodeMoved', …)` still runs from the
+      // canvasInvestigate flag — see `src/lib/canvasInvestigate.ts`.
       if (suppressEdgeEventRef.current) return
       const node = editor.getNodeFromId(id)
       const nodeId = String(id)
@@ -4157,15 +4871,56 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         ticksSincePrev: prevTick.nodeId === nodeId ? Math.round(now - prevTick.lastTickAt) : -1,
         nodeCount: workflowRef.current?.nodes?.length ?? 0,
       })
-      // Transient only — Drawflow already moved the DOM. We just
-      // remember where to commit on mouseUp. No store write, no
-      // history, no `isDirty`, no `updatedAt`.
+
+      // [GroupDrag] Detect group drag start. With the mirror pattern,
+      // the actual drag is driven by `multiDragRef` (set on plain
+      // mousedown inside a multi-selected node). nodeMoved still
+      // fires for the leader as Drawflow moves it natively; we just
+      // prime the leader's pending entry here so mouseUp commits
+      // the bulk. nodeMoved for followers is a no-op because the
+      // follower DOM was set by the mirror handler, not by Drawflow.
+      const gd = groupDragRef.current
+      const md = multiDragRef.current
+      const isLeaderInMirror = !!(md && md.grabbedId === nodeId)
+      const isFollowerInMirror = !!(md && md.selectedIds.has(nodeId) && md.grabbedId !== nodeId)
+
+      if (isFollowerInMirror) {
+        // Follower mutation — already painted by the mirror handler.
+        // Drawflow's internal observer can re-emit a `nodeMoved` tick
+        // for the follower because we updated `pos_x/pos_y` via
+        // `applyDrawflowNodePosition` semantics. Do nothing — let
+        // the mirror keep owning these ids.
+        return
+      }
+
+      if (isLeaderInMirror) {
+        // Leader tick during a mirror drag. Just keep the pending
+        // entry fresh from Drawflow's authoritative `pos_x/pos_y`.
+        // Followers are NOT recomputed here — the mirror handler
+        // already set them from `(clientX - mouseStartX) / zoom`.
+        pendingDragPositionsRef.current.set(nodeId, {
+          x: node.pos_x,
+          y: node.pos_y
+        })
+        return
+      }
+
+      if (gd.active) {
+        // Legacy single-leader drag (mirror inactive). The
+        // activation block is intentionally minimal here — the
+        // prior nodeMoved-driven follower logic is removed per
+        // spec H. We still keep `gd.active` so the existing
+        // finishGroupDrag / mouseUp path stays consistent for
+        // any call sites that read it.
+        return
+      }
+
+      // Mirror inactive and `gd` not active — this is a plain
+      // single-node drag. Prime the leader's pending entry from
+      // Drawflow's authoritative position and refresh its
+      // connections. No store write, no history, no `isDirty`, no
+      // `updatedAt`.
       pendingDragPositionsRef.current.set(nodeId, { x: node.pos_x, y: node.pos_y })
-      // Lightweight per-node connection repaint — only the line
-      // endpoints touching this node. One rAF; one
-      // `editor.updateConnectionNodes(draggedId)` call. No
-      // applyPortAttributes / no attachNodeResizeObservers / no
-      // full canvas pass.
       lightweightDragConnectionRefresh(nodeId)
     })
 
@@ -4239,14 +4994,26 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       // gesture — one history push, one updatedAt bump, one
       // `isDirty` flip. From an undo/redo standpoint, the entire
       // gesture counts as one user action.
+      //
+      // [GroupDrag][mirror] When a multi-selection mirror drag is
+      // active, the capture-phase `finishMultiDragMirror(true)` has
+      // ALREADY drained the pending map and called
+      // `updateNodePositions` BEFORE this handler runs. So the
+      // pending map is empty here — the bulk commit below is a
+      // no-op for mirror drags. Single-node drags still flow
+      // through this path normally.
+      if (groupDragRef.current.active) {
+        finishGroupDrag({ commit: true, reason: 'mouseUp' })
+      }
       const pending = pendingDragPositionsRef.current
-      if (pending.size > 0) {
+      if (pending.size > 0 && !multiDragRef.current) {
         const positions: Record<string, { x: number; y: number }> = {}
         for (const [nodeId, position] of pending.entries()) {
           positions[nodeId] = position
         }
         pending.clear()
         const activeWorkflowId = useWorkflowStore.getState().activeWorkflowId
+        // [GroupDrag] commitPositions probe was removed.
         canvasLog('commitNodePositions', {
           count: Object.keys(positions).length,
           workflowId: activeWorkflowId,
@@ -4376,6 +5143,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       const canvasSurface = !nodeEl && Boolean(target.closest('.drawflow, .parent-drawflow'))
       const nodeId = nodeEl && !outputPort && !inputPort ? nodeEl.id.replace(/^node-/, '') : null
 
+      // [GroupDrag] nodePointerDown probe was removed in the
+      // log-cleanup pass.
       // [WorkflowSelection] Diagnostic log. Emits on EVERY mousedown
       // landing inside the canvas. Off by default; enable with
       // `localStorage.setItem('AI_FLOW_DEBUG','1')` to see whether
@@ -4408,7 +5177,361 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         clearOnUnselect: Boolean(outputPort || connectionPath || canvasSurface)
       }
 
+      // [GroupDrag][mirror] Plain mousedown over a node that is already
+      // in the multi-selection kicks off a mirror drag: Drawflow
+      // continues to drag the grabbed node natively, and we mirror
+      // every other selected node by the same viewport delta
+      // (divided by zoom) so the cluster moves as one. We do NOT
+      // stop propagation / preventDefault — the click must reach
+      // Drawflow's listener so its native node drag starts.
+      //
+      // Conditions:
+      //   - clicked a real node
+      //   - node is in the multi-selection set
+      //   - multi size >= 2 (otherwise single-node drag)
+      //   - not on a port / connection / control / pill / inline
+      //     editor / resize handle / node picker
+      //   - no Shift/Cmd (those modifiers mean toggle, not drag)
+      if (
+        nodeId &&
+        !outputPort &&
+        !inputPort &&
+        !connectionPath &&
+        !canvasSurface &&
+        !event.shiftKey &&
+        !event.metaKey
+      ) {
+        const onControl = !!target.closest(
+          'button, input, textarea, select, [role="button"], [data-node-action], .df-node-toolbar, .df-hover-toolbar, .df-node-pill-menu, .df-node-prompt-editor, .df-node-resize-handle, .df-node-settings-bar, .aiflow-node-picker'
+        )
+        if (!onControl) {
+          const multi = multiSelectedNodeIdsRef.current
+          if (multi.size >= 2 && multi.has(nodeId)) {
+            startMultiDragMirror(nodeId, event)
+          } else if (!multi.has(nodeId)) {
+            // Plain click on a non-multi-selected node — make sure no
+            // mirror is left dangling.
+            if (multiDragRef.current) {
+              finishMultiDragMirror(false)
+            }
+          }
+        }
+      } else if (!nodeId || outputPort || inputPort || connectionPath || canvasSurface) {
+        // Pointerdown on non-node surface (port / connection /
+        // canvas) clears any leftover mirror so a stray gesture
+        // cannot keep applying follower deltas.
+        if (multiDragRef.current) {
+          finishMultiDragMirror(false)
+        }
+      }
+
+      // ── Marquee selection start (Ctrl + drag on empty canvas) ─────
+      // Holding Ctrl and pressing on the empty canvas starts a
+      // marquee-selection drag. A simple click on empty canvas (no
+      // Ctrl) keeps the existing clearSelection path so the user can
+      // still wipe selection with one click.
+      //
+      // Behaviour:
+      //  - Live preview: while dragging, hit-test runs ~per-frame and
+      //    toggles `.selected` / `.conn-node-selected` on nodes whose
+      //    screen-space rect intersects the marquee. The user sees the
+      //    glow move in real time as the rectangle grows or shrinks.
+      //  - No anchor: Ctrl + drag is a NEW selection. Existing selected
+      //    nodes that fall outside the new rectangle lose their glow.
+      //  - Mouseup commits the preview set as the official multi-set.
+      //    We do not hit-test again — the user must see the same set
+      //    they were previewing when they released.
+      //  - No workflow store writes per frame. Only DOM class
+      //    toggles + an `editor.import`/`hydrateDrawflow`-free path.
+      // [GroupDrag] Multi-select modifier (Shift / Cmd on macOS) gates both
+      // the marquee start and the Shift+click toggle path. Ctrl is
+      // deliberately NOT used here — the OS / browser already claim it
+      // for copy / paste / right-click / refresh, so Ctrl grabs are
+      // unreliable and frequently blocked by other handlers.
+      if (!nodeId && canvasSurface && (event.shiftKey || event.metaKey) && !outputPort && !inputPort && !connectionPath) {
+        event.preventDefault()
+        event.stopPropagation()
+        event.stopImmediatePropagation()
+
+        // Drop the previous selection immediately so a shrinking marquee
+        // doesn't leave stale highlights on nodes that were in the old
+        // anchor set but are now outside the rectangle. We also wipe
+        // the DOM `.selected` class and `editor.node_selected` here —
+        // the first preview rAF would otherwise have to clean them up
+        // and the user would see a one-frame flash of stale glow.
+        //
+        // Capture the previous selection BEFORE we wipe it so a
+        // no-drag Ctrl+click (which the user spec defines as a no-op,
+        // not a clear) can restore it. This matches Figma / VS Code
+        // marquee semantics: dragging begins a new selection, but
+        // clicking without dragging is a no-op.
+        const previousMultiIds = new Set(multiSelectedNodeIdsRef.current)
+        const previouslySelectedId = useWorkflowStore.getState().selectedNodeId
+        if (previouslySelectedId) previousMultiIds.add(previouslySelectedId)
+
+        setMultiSelectedNodeIds(null)
+        setSelectedNodeWithLog(null, 'marquee:start')
+        setMarqueeRect(null)
+        marqueePreviewNodeIdsRef.current = new Set()
+        marqueePreviewCountRef.current = 0
+        setMarqueePreviewCount(0)
+        marqueeActiveRef.current = true
+        syncSelectedNodeDom(null)
+
+        const startClient = { x: event.clientX, y: event.clientY }
+        let lastRect: MarqueeRect = { left: startClient.x, top: startClient.y, width: 0, height: 0 }
+        let dragMoved = false
+
+        // Hit-test against node DOM rects in screen-space. Runs inside
+        // a single rAF so a fast 1kHz mousemove stream collapses to one
+        // mutation per frame. Both the marquee (in clientX/Y) and the
+        // node DOM rects (post-transform) live in screen-space, so a
+        // direct intersection test works without any pan/zoom math.
+        const runPreviewHitTest = () => {
+          marqueePreviewFrameRef.current = null
+          const rect = marqueeLastRectRef.current
+          if (!rect) return
+          const canvasEl = canvasRef.current
+          if (!canvasEl) return
+
+          const rectLeft = rect.left
+          const rectTop = rect.top
+          const rectRight = rect.left + rect.width
+          const rectBottom = rect.top + rect.height
+
+          const nextIds = new Set<string>()
+          canvasEl.querySelectorAll<HTMLElement>('.drawflow-node[id^="node-"]').forEach((el) => {
+            const nodeRect = el.getBoundingClientRect()
+            if (!nodeRect || nodeRect.width === 0 || nodeRect.height === 0) return
+            const intersects =
+              nodeRect.left <= rectRight &&
+              nodeRect.left + nodeRect.width >= rectLeft &&
+              nodeRect.top <= rectBottom &&
+              nodeRect.top + nodeRect.height >= rectTop
+            if (intersects) {
+              nextIds.add(toWorkflowNodeId(el.id))
+            }
+          })
+
+          const prevIds = marqueePreviewNodeIdsRef.current
+          // Early-out when the visible set did not change (e.g. the
+          // mouse moved inside the same hit region). This is the main
+          // perf guard — without it, every rAF would re-touch every
+          // `.selected` class.
+          if (prevIds.size === nextIds.size && Array.from(prevIds).every((id) => nextIds.has(id))) {
+            return
+          }
+          marqueePreviewNodeIdsRef.current = nextIds
+
+          syncSelectedNodeDomForIds(nextIds, { mutateEditor: false })
+          syncConnectionOverlaysForSelectedIds(nextIds)
+
+          const nextCount = nextIds.size
+          if (nextCount !== marqueePreviewCountRef.current) {
+            marqueePreviewCountRef.current = nextCount
+            setMarqueePreviewCount(nextCount)
+          }
+        }
+
+        const schedulePreviewHitTest = (rect: MarqueeRect) => {
+          marqueeLastRectRef.current = rect
+          if (marqueePreviewFrameRef.current != null) return
+          marqueePreviewFrameRef.current = requestAnimationFrame(runPreviewHitTest)
+        }
+
+        const updateRect = (moveEvent: MouseEvent) => {
+          const moved = Math.abs(moveEvent.clientX - startClient.x) > 3 || Math.abs(moveEvent.clientY - startClient.y) > 3
+          dragMoved = dragMoved || moved
+          const left = Math.min(startClient.x, moveEvent.clientX)
+          const top = Math.min(startClient.y, moveEvent.clientY)
+          const width = Math.abs(moveEvent.clientX - startClient.x)
+          const height = Math.abs(moveEvent.clientY - startClient.y)
+          lastRect = { left, top, width, height }
+          setMarqueeRect(lastRect)
+          schedulePreviewHitTest(lastRect)
+        }
+
+        // Centralized cleanup. Used by mouseup, escape, pointercancel,
+        // and window-blur. Removes all transient DOM glow + state.
+        const cleanupPreview = () => {
+          document.removeEventListener('mousemove', updateRect, true)
+          document.removeEventListener('mouseup', finish, true)
+          document.removeEventListener('keydown', onEscape, true)
+          window.removeEventListener('blur', onBlur)
+          window.removeEventListener('pointercancel', onPointerCancel, true)
+          if (marqueePreviewFrameRef.current != null) {
+            cancelAnimationFrame(marqueePreviewFrameRef.current)
+            marqueePreviewFrameRef.current = null
+          }
+          marqueeLastRectRef.current = null
+          marqueeActiveRef.current = false
+        }
+
+        const onEscape = (keyEvent: KeyboardEvent) => {
+          if (keyEvent.key !== 'Escape') return
+          keyEvent.preventDefault()
+          keyEvent.stopPropagation()
+          // Cancel: restore the previous committed selection (whatever
+          // was selected before this Ctrl+drag started). Without this
+          // the user would lose their selection if they accidentally
+          // pressed Escape mid-drag.
+          setMarqueeRect(null)
+          marqueePreviewNodeIdsRef.current = new Set()
+          marqueePreviewCountRef.current = 0
+          setMarqueePreviewCount(0)
+          syncSelectedNodeDom()
+          cleanupPreview()
+        }
+
+        const onBlur = () => {
+          // Window lost focus mid-drag (alt-tab, devtools, etc). The
+          // mouseup may never arrive on the document. Restore the
+          // previous selection and bail.
+          setMarqueeRect(null)
+          marqueePreviewNodeIdsRef.current = new Set()
+          marqueePreviewCountRef.current = 0
+          setMarqueePreviewCount(0)
+          syncSelectedNodeDom()
+          cleanupPreview()
+        }
+
+        const onPointerCancel = () => {
+          setMarqueeRect(null)
+          marqueePreviewNodeIdsRef.current = new Set()
+          marqueePreviewCountRef.current = 0
+          setMarqueePreviewCount(0)
+          syncSelectedNodeDom()
+          cleanupPreview()
+        }
+
+        const finish = (upEvent: MouseEvent) => {
+          cleanupPreview()
+
+          if (!dragMoved) {
+            // Undragged Ctrl+click on empty canvas is a no-op — the
+            // existing clear was already applied at marquee start, so
+            // we need to restore the previous selection here. This
+            // matches standard editor semantics: dragging begins a
+            // marquee, clicking without dragging does not.
+            setMarqueeRect(null)
+            marqueePreviewCountRef.current = 0
+            setMarqueePreviewCount(0)
+            setMultiSelectedNodeIds(previousMultiIds)
+            if (previousMultiIds.size === 1) {
+              const [onlyId] = previousMultiIds
+              if (onlyId) {
+                setSelectedNodeWithLog(onlyId, 'marquee:no-drag-single')
+                requestAnimationFrame(() => syncSelectedNodeDom(onlyId))
+              }
+            } else {
+              // Multi-set with 2+ items keeps the store's
+              // selectedNodeId clear so single-node Drawflow paths
+              // don't fight the multi-selection. When there's nothing
+              // to restore (previousMultiIds is empty), the call to
+              // setSelectedNodeWithLog(null, ...) is a no-op against
+              // an already-null store.
+              const restoreSingle = previousMultiIds.size === 0
+                ? null
+                : previouslySelectedId
+              setSelectedNodeWithLog(
+                restoreSingle,
+                previousMultiIds.size > 1
+                  ? `marquee:no-drag-multi-${previousMultiIds.size}`
+                  : 'marquee:no-drag-restore'
+              )
+              requestAnimationFrame(() => syncSelectedNodeDom(restoreSingle))
+            }
+            scheduleConnectionSync()
+            return
+          }
+
+          // Drain any pending rAF so the final preview set is in sync
+          // with what the user is seeing at mouseup. The committed set
+          // is the live preview set, NOT a fresh hit-test — this is
+          // the contract: "what you see when you release is what you
+          // get".
+          if (marqueePreviewFrameRef.current != null) {
+            cancelAnimationFrame(marqueePreviewFrameRef.current)
+            marqueePreviewFrameRef.current = null
+            runPreviewHitTest()
+          }
+
+          const ids = new Set(marqueePreviewNodeIdsRef.current)
+          setMarqueeRect(null)
+          marqueePreviewCountRef.current = 0
+          setMarqueePreviewCount(0)
+
+          setMultiSelectedNodeIds(ids)
+          if (ids.size === 1) {
+            const [onlyId] = ids
+            if (onlyId) {
+              setSelectedNodeWithLog(onlyId, 'marquee:committed-single')
+              requestAnimationFrame(() => syncSelectedNodeDom(onlyId))
+            }
+          } else if (ids.size === 0) {
+            setSelectedNodeWithLog(null, 'marquee:committed-empty')
+            requestAnimationFrame(() => syncSelectedNodeDom(null))
+          } else {
+            setSelectedNodeWithLog(null, `marquee:committed-multi:${ids.size}`)
+            requestAnimationFrame(() => syncSelectedNodeDom(null))
+          }
+          // [GroupDrag] multiSelectCommitted probe was removed.
+          scheduleConnectionSync()
+
+          // Suppress the synthetic click that fires immediately after
+          // mouseup — otherwise a click handler would re-clear our
+          // selection.
+          if (upEvent && typeof upEvent.preventDefault === 'function') {
+            upEvent.preventDefault()
+          }
+          const swallow = (ev: MouseEvent) => {
+            ev.stopPropagation()
+            ev.stopImmediatePropagation()
+            ev.preventDefault()
+            document.removeEventListener('click', swallow, true)
+          }
+          document.addEventListener('click', swallow, true)
+        }
+
+        document.addEventListener('mousemove', updateRect, true)
+        document.addEventListener('mouseup', finish, true)
+        document.addEventListener('keydown', onEscape, true)
+        window.addEventListener('blur', onBlur)
+        window.addEventListener('pointercancel', onPointerCancel, true)
+        return
+      }
+
       if (nodeId) {
+        // Shift + click on a node toggles it in the multi-selection set
+        // instead of replacing the selection. Plain click still
+        // replaces (single-selection behaviour). Meta/Cmd on macOS
+        // is the friendly alias.
+        if (event.shiftKey || event.metaKey) {
+          event.preventDefault()
+          // Suppress Drawflow's own `nodeSelected` re-fire for the
+          // next ~250ms. Without this, Drawflow's internal click
+          // handler would call `setSelectedNode(nodeId)` and our
+          // careful multi-selection bookkeeping would be overwritten
+          // by a stale single-node selection.
+          clearInFlightUntilRef.current = performance.now() + 250
+          const next = new Set(multiSelectedNodeIdsRef.current)
+          if (next.has(nodeId)) {
+            next.delete(nodeId)
+          } else {
+            next.add(nodeId)
+          }
+          setMultiSelectedNodeIds(next)
+          if (next.size === 1) {
+            const [onlyId] = next
+            setSelectedNodeWithLog(onlyId, 'shift-click:single-remaining')
+            requestAnimationFrame(() => syncSelectedNodeDom(onlyId))
+          } else {
+            setSelectedNodeWithLog(null, `shift-click:multi-${next.size}`)
+            requestAnimationFrame(() => syncSelectedNodeDom(null))
+          }
+          scheduleConnectionSync()
+          return
+        }
         setSelectedNodeWithLog(nodeId, 'canvas-mousedown:node')
         requestAnimationFrame(() => syncSelectedNodeDom(nodeId))
       } else if (canvasSurface || connectionPath) {
@@ -4436,11 +5559,11 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       // Skip when the click landed on any interactive element inside
       // a node. Without this guard, clicking node toolbar buttons or
       // inline editors would accidentally clear the selection.
-      if (
-        target.closest(
-          '.drawflow-node, .input, .output, .df-hover-toolbar, .df-node-toolbar, .df-node-settings-bar, .df-node-pill-menu, .df-node-prompt-editor, .aiflow-node-picker, button, [role="button"], input, textarea, select, [contenteditable="true"], [data-node-action]'
-        )
-      ) {
+      const insideNode = target.closest(
+        '.drawflow-node, .input, .output, .df-hover-toolbar, .df-node-toolbar, .df-node-settings-bar, .df-node-pill-menu, .df-node-prompt-editor, .aiflow-node-picker, button, [role="button"], input, textarea, select, [contenteditable="true"], [data-node-action]'
+      )
+      if (insideNode) {
+        // [GroupDrag] documentPointerDown.filtered probe was removed.
         return
       }
 
@@ -4492,6 +5615,11 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       const storeSelectedId = useWorkflowStore.getState().selectedNodeId
       if (!storeSelectedId && !hasSelectedNodeClass && !hasSelectedEdgeClass) return
 
+      // Drop any leftover mirror before clearing selection so the
+      // mirror's restored positions don't bleed into the cleared state.
+      if (multiDragRef.current) {
+        finishMultiDragMirror(false)
+      }
       clearCanvasSelection(`document-mousedown:${target.tagName.toLowerCase()}:${target.className?.split(/\s+/).slice(0, 2).join('.') || 'unknown'}`)
     }
 
@@ -4535,6 +5663,14 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       if (panActive) return
       if (isPanExcluded(event.target)) return
       if (!editor.precanvas) return
+
+      // [WorkflowMarquee] Shift + drag is reserved for marquee selection.
+      // Bail out so the marquee mousedown handler (registered on
+      // `mousedown` capture, which fires after `pointerdown`) can claim
+      // the gesture. Without this, the pan starts on pointerdown, the
+      // editor canvas pans ~1px before the marquee swallows the event,
+      // and the marquee feels laggy.
+      if (event.shiftKey || event.metaKey) return
 
       panActive = true
       panStartX = event.clientX
@@ -4801,6 +5937,9 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         closeNodePillMenu()
         deleteNode(nodeId)
         setInspectorNodeId((current) => (current === nodeId ? null : current))
+      } else if (action === 'duplicate') {
+        closeNodePillMenu()
+        duplicateNodeWithInputs(nodeId)
       } else if (action === 'run') {
         closeNodePillMenu()
         void runGenerateNodeWithInputs(nodeId).catch((error) => {
@@ -5131,6 +6270,35 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         cancelAnimationFrame(connectionRefreshFrameRef.current)
         connectionRefreshFrameRef.current = null
       }
+      // [GroupDrag][mirror] Cancel any in-flight mirror rAF and
+      // detach document-level mouse listeners registered by
+      // `attachMultiDragMirrorListeners`. We do NOT commit the
+      // pending positions here — an unmount mid-drag means the
+      // workflow tab is going away, so writing positions to the
+      // store would corrupt the user's view of the workflow when
+      // they reopen the editor. Pending positions are simply
+      // dropped; the next mount rehydrates from the store, which
+      // still holds the pre-drag positions.
+      if (multiDragFrameRef.current !== null) {
+        cancelAnimationFrame(multiDragFrameRef.current)
+        multiDragFrameRef.current = null
+      }
+      if (multiDragRef.current) {
+        groupDragMirrorLog('mirrorCleanupOnUnmount', {
+          grabbedId: multiDragRef.current.grabbedId,
+          moved: multiDragRef.current.moved,
+          pendingCount: pendingDragPositionsRef.current.size
+        })
+      }
+      detachMultiDragMirrorListeners()
+      multiDragRef.current = null
+      pendingDragPositionsRef.current.clear()
+      // Legacy group-drag frame cancel.
+      if (groupDragRef.current.frame !== null) {
+        cancelAnimationFrame(groupDragRef.current.frame)
+        groupDragRef.current.frame = null
+      }
+      groupDragRef.current.active = false
       disconnectNodeResizeObservers()
       canvasEl.removeEventListener('mousemove', syncOnPointerMove)
       canvasEl.removeEventListener('pointermove', syncOnPointerMove)
@@ -5211,10 +6379,15 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   // boundary during a drawflow tick.
   useEffect(() => {
     if (!editorRef.current) return
-    if (canvasDragInFlightRef.current.nodeId) {
+    const isDragging = !!canvasDragInFlightRef.current.nodeId
+    const groupDragActive = groupDragRef.current.active
+    const multiDragActive = !!multiDragRef.current
+    // [GroupDrag] positionSignatureEffect probe was removed.
+    if (canvasDragInFlightRef.current.nodeId || multiDragActive) {
       canvasLog('positionUndoRedoSyncSkippedDuringDrag', {
         positionSignature,
         activeNodeId: canvasDragInFlightRef.current.nodeId,
+        multiDragActive
       })
       return
     }
@@ -5237,6 +6410,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       isDragging: false,
       changedIds: changed.map((node) => node.id),
     })
+    // [GroupDrag] positionSignatureEffect.changedDuringGroupDrag
+    // probe was removed.
 
     for (const node of changed) {
       applyDrawflowNodePosition(node.id, node.position)
@@ -5255,51 +6430,177 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   }, [selectedNodeId])
 
   const copySelectedNode = () => {
+    // [WorkflowMarquee] Multi-selection takes priority. If the user
+    // has 2+ nodes selected via marquee or ctrl-click, copy the
+    // entire selected set + the internal edges between them. We do
+    // NOT use `buildWorkflowSliceForTarget` (which walks upstream
+    // ancestors) because multi-selection is intentionally a flat
+    // user-driven subset.
+    const currentWorkflow = workflowRef.current
+    if (!currentWorkflow) return false
+
+    const multiIds = multiSelectedNodeIdsRef.current
+    if (multiIds.size >= 2) {
+      const selectedNodes = currentWorkflow.nodes.filter((node) => multiIds.has(node.id))
+      if (selectedNodes.length === 0) return false
+
+      const internalEdges = currentWorkflow.edges.filter(
+        (edge) => multiIds.has(edge.source) && multiIds.has(edge.target)
+      )
+
+      // Anchor: prefer the store's selectedNodeId so paste lands
+      // near the same screen position the user saw when they hit
+      // copy. Fall back to the first node by canvas position so we
+      // always have a deterministic anchor.
+      const storeSelected = useWorkflowStore.getState().selectedNodeId
+      const anchor =
+        (storeSelected && selectedNodes.find((node) => node.id === storeSelected)) ||
+        [...selectedNodes].sort((a, b) => a.position.y - b.position.y || a.position.x - b.position.x)[0]
+      if (!anchor) return false
+
+      copiedNodeGroupRef.current = {
+        targetNodeId: anchor.id,
+        nodes: selectedNodes.map((node) => cloneDeep(node)),
+        edges: internalEdges.map((edge) => cloneDeep(edge))
+      }
+      return true
+    }
+
+    // Single-selection path (legacy). Walks upstream ancestors so
+    // duplicating / pasting a Generate node carries its Media +
+    // Prompt inputs.
     const nodeId = useWorkflowStore.getState().selectedNodeId
     if (!nodeId) return false
 
-    const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
-    if (!node) return false
+    const workflowSlice = buildWorkflowSliceForTarget(currentWorkflow, nodeId)
+    if (!workflowSlice || workflowSlice.nodes.length === 0) return false
 
-    copiedNodeRef.current = cloneDeep(node)
+    copiedNodeGroupRef.current = {
+      targetNodeId: nodeId,
+      nodes: workflowSlice.nodes.map((node) => cloneDeep(node)),
+      edges: workflowSlice.edges.map((edge) => cloneDeep(edge))
+    }
     return true
   }
 
   const pasteCopiedNode = () => {
-    const copiedNode = copiedNodeRef.current
+    const copiedGroup = copiedNodeGroupRef.current
     const currentWorkflow = workflowRef.current
-    if (!copiedNode || !currentWorkflow) return false
+    if (!copiedGroup || !currentWorkflow) return false
 
     const pointer = lastCanvasPointerRef.current || getCanvasCenterPoint()
-    const pastedNode: WorkflowNode = {
-      ...cloneDeep(copiedNode),
-      id: createId('node'),
-      position: {
-        x: Math.max(0, Math.round(pointer.x)),
-        y: Math.max(0, Math.round(pointer.y))
-      }
+    const copiedTarget = copiedGroup.nodes.find((node) => node.id === copiedGroup.targetNodeId) || copiedGroup.nodes[0]
+    if (!copiedTarget) return false
+
+    const offset = {
+      x: pointer.x - copiedTarget.position.x,
+      y: pointer.y - copiedTarget.position.y
+    }
+    const idMap = new Map<string, string>()
+    for (const node of copiedGroup.nodes) {
+      idMap.set(node.id, createId('node'))
     }
 
-    updateWorkflow(currentWorkflow.id, {
-      nodes: [...currentWorkflow.nodes, pastedNode]
-    })
-    setSelectedNode(pastedNode.id)
+    const pastedNodes: WorkflowNode[] = copiedGroup.nodes.map((node) => ({
+      ...cloneDeep(node),
+      id: idMap.get(node.id) || createId('node'),
+      position: {
+        x: Math.max(0, Math.round(node.position.x + offset.x)),
+        y: Math.max(0, Math.round(node.position.y + offset.y))
+      },
+      data: cloneDeep(node.data)
+    }))
 
-    requestAnimationFrame(() => {
-      attachNodeResizeObserver(pastedNode.id)
-      scheduleDrawflowConnectionRefresh(pastedNode.id)
-      syncSelectedNodeDom(pastedNode.id)
+    const pastedEdges: WorkflowEdge[] = copiedGroup.edges
+      .map((edge) => {
+        const source = idMap.get(edge.source)
+        const target = idMap.get(edge.target)
+        if (!source || !target) return null
+        return {
+          ...cloneDeep(edge),
+          id: createId('edge'),
+          source,
+          target
+        } satisfies WorkflowEdge
+      })
+      .filter((edge): edge is WorkflowEdge => Boolean(edge))
+
+    const pastedTargetId = idMap.get(copiedGroup.targetNodeId) || pastedNodes[0]?.id
+    updateWorkflow(currentWorkflow.id, {
+      nodes: [...currentWorkflow.nodes, ...pastedNodes],
+      edges: [...currentWorkflow.edges, ...pastedEdges]
     })
+
+    // Multi-select the pasted set so the user can immediately drag
+    // them together, hit Delete, or Ctrl+C them again. For a
+    // single-node paste, fall back to the legacy single-selection
+    // behaviour so the inspector / hover toolbar continue to work.
+    if (pastedNodes.length > 1) {
+      const pastedIds = pastedNodes.map((node) => node.id)
+      setMultiSelectedNodeIds(pastedIds)
+      if (pastedTargetId) {
+        setSelectedNode(pastedTargetId)
+      }
+      requestAnimationFrame(() => {
+        pastedNodes.forEach((node) => attachNodeResizeObserver(node.id))
+        scheduleDrawflowConnectionRefresh(null, { all: true })
+        if (pastedTargetId) {
+          syncSelectedNodeDom(pastedTargetId)
+        }
+      })
+    } else if (pastedTargetId) {
+      setSelectedNode(pastedTargetId)
+      requestAnimationFrame(() => {
+        pastedNodes.forEach((node) => attachNodeResizeObserver(node.id))
+        scheduleDrawflowConnectionRefresh(null, { all: true })
+        if (pastedTargetId) {
+          syncSelectedNodeDom(pastedTargetId)
+        }
+      })
+    }
 
     return true
   }
 
   useEffect(() => {
-    const handleUndoRedoShortcut = (event: KeyboardEvent) => {
-      if (!(event.ctrlKey || event.metaKey)) return
+    const handleCanvasShortcut = (event: KeyboardEvent) => {
+      // [GroupDrag][mirror] Escape during a mirror drag cancels the
+      // gesture and restores every follower to its pre-drag position.
+      // Runs BEFORE the marquee Escape branch so a mirror-drag
+      // Escape takes precedence.
+      if (event.key === 'Escape' && multiDragRef.current) {
+        event.preventDefault()
+        event.stopPropagation()
+        finishMultiDragMirror(false)
+        return
+      }
 
+      // Legacy group-drag Escape (single-node fallback path).
+      if (event.key === 'Escape' && groupDragRef.current.active) {
+        event.preventDefault()
+        event.stopPropagation()
+        cancelGroupDrag('Escape')
+        return
+      }
+
+      // Skip when typing in any form field — Delete in a textarea
+      // must not delete nodes, and Ctrl+C inside an input must not
+      // copy the workflow selection.
       const target = event.target as HTMLElement | null
       if (target?.closest('input, textarea, select, [contenteditable="true"]')) return
+
+      // [WorkflowMarquee] Delete / Backspace: remove the entire
+      // selection set (multi-selection or single). Guarded by
+      // !ctrlKey so it doesn't intercept Ctrl+Backspace (browser
+      // navigation in some platforms).
+      if ((event.key === 'Delete' || event.key === 'Backspace') && !event.ctrlKey && !event.metaKey) {
+        if (deleteSelectedNodes()) {
+          event.preventDefault()
+          return
+        }
+      }
+
+      if (!(event.ctrlKey || event.metaKey)) return
 
       const key = event.key.toLowerCase()
       if (key === 'c') {
@@ -5330,9 +6631,41 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       }
     }
 
-    window.addEventListener('keydown', handleUndoRedoShortcut)
-    return () => window.removeEventListener('keydown', handleUndoRedoShortcut)
-  }, [redoWorkflow, undoWorkflow, updateWorkflow, workflow.id])
+    window.addEventListener('keydown', handleCanvasShortcut)
+    return () => window.removeEventListener('keydown', handleCanvasShortcut)
+  }, [redoWorkflow, undoWorkflow, updateWorkflow, workflow.id, deleteSelectedNodes, copySelectedNode, pasteCopiedNode])
+
+  // [GroupDrag][mirror] Window-level cancel listeners. The mirror
+  // listener set has its own `blur` and `pointercancel` handlers
+  // (registered when the mirror starts), but we keep these here as
+  // a fallback for the legacy `gd.active` path and as a second
+  // line of defence if a mirror listener fails to fire.
+  useEffect(() => {
+    const handleWindowBlur = () => {
+      if (multiDragRef.current) {
+        finishMultiDragMirror(false)
+        return
+      }
+      if (groupDragRef.current.active) {
+        cancelGroupDrag('window-blur')
+      }
+    }
+    const handlePointerCancel = () => {
+      if (multiDragRef.current) {
+        finishMultiDragMirror(false)
+        return
+      }
+      if (groupDragRef.current.active) {
+        cancelGroupDrag('pointercancel')
+      }
+    }
+    window.addEventListener('blur', handleWindowBlur)
+    window.addEventListener('pointercancel', handlePointerCancel, true)
+    return () => {
+      window.removeEventListener('blur', handleWindowBlur)
+      window.removeEventListener('pointercancel', handlePointerCancel, true)
+    }
+  }, [])
 
   const handleAddNode = (type: FlowNodeType) => {
     const editor = editorRef.current
@@ -5797,6 +7130,50 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
           <div className="pointer-events-none absolute inset-0 opacity-[0.32] [background-image:radial-gradient(circle,rgba(255,255,255,0.12)_1px,transparent_1px)] [background-size:22px_22px]" />
           <div ref={canvasRef} className="ai-drawflow-canvas absolute inset-0" />
 
+          {/* Marquee selection rectangle. Positioned `absolute` inside
+              the editor root, with `left/top` translated from
+              viewport coords (clientX/Y) by subtracting the editor
+              root's bounding rect. The ref is read on render so it
+              is guaranteed non-null by the time the user has started
+              a marquee drag (which only happens after a click on the
+              editor root). */}
+          {marqueeRect && editorRootRef.current && (
+            <div
+              className="aiflow-marquee-rect pointer-events-none absolute z-50"
+              style={{
+                left: marqueeRect.left - editorRootRef.current.getBoundingClientRect().left,
+                top: marqueeRect.top - editorRootRef.current.getBoundingClientRect().top,
+                width: marqueeRect.width,
+                height: marqueeRect.height
+              }}
+            />
+          )}
+
+          {/* Selection count badge — appears when 2+ nodes are
+              selected so the user has a visible signal that they have
+              a multi-selection active (and not just a stray
+              .selected class on one node). During a marquee drag the
+              badge reads from the live preview set so the count moves
+              in lockstep with the rectangle. */}
+          {(() => {
+            const isPreviewing = marqueePreviewCount > 0 || marqueeRect !== null
+            const effectiveCount = isPreviewing ? marqueePreviewCount : multiSelectedNodeIds.length
+            if (effectiveCount <= 1) return null
+            if (!editorRootRef.current) return null
+            const label = isPreviewing ? `${effectiveCount} nodes in selection` : `${effectiveCount} nodes selected`
+            return (
+              <div
+                className="aiflow-selection-badge pointer-events-none absolute right-3 top-3 z-50"
+              >
+                <span className="aiflow-selection-badge-dot" />
+                {label}
+                <span className="aiflow-selection-badge-hint">
+                  {isPreviewing ? 'Release to confirm' : 'Delete to remove · Ctrl+C to copy'}
+                </span>
+              </div>
+            )
+          })()}
+
           <div className="aiflow-wf-toolbar">
             <button
               type="button"
@@ -6228,16 +7605,14 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
         }
         const newWc = countFrom(newVal)
         if (WORKFLOW_PERSIST_DEBUG()) {
-          console.log('[WorkflowPersist][storage.onChanged]', JSON.stringify({
+          // eslint-disable-next-line no-console
+          console.debug('[WorkflowPersist][storage.onChanged]', JSON.stringify({
             key: 'ai-flow-workflows',
             oldWorkflowCount: countFrom(oldVal),
             newWorkflowCount: newWc,
             oldActiveWorkflowId: activeFrom(oldVal),
             newActiveWorkflowId: activeFrom(newVal)
           }))
-          if (newWc === 0) {
-            console.trace('[WorkflowPersist][storage.onChanged:zero-workflows]')
-          }
         }
         hydrateFromStorage().catch(() => {})
       }
@@ -6297,7 +7672,8 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
     const hasHydrated = (useWorkflowStore as unknown as { persist?: { hasHydrated?: () => boolean } })
       .persist?.hasHydrated?.()
     if (WORKFLOW_PERSIST_DEBUG()) {
-      console.log('[WorkflowPersist][editorMount]', JSON.stringify({
+      // eslint-disable-next-line no-console
+      console.debug('[WorkflowPersist][editorMount]', JSON.stringify({
         workflowCount: workflows.length,
         activeWorkflowId,
         view,
@@ -6315,7 +7691,8 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
         ? localStorage.getItem('workflow.view')
         : null
       if (WORKFLOW_PERSIST_DEBUG()) {
-        console.log('[WorkflowPersist][viewMismatch]', JSON.stringify({
+        // eslint-disable-next-line no-console
+        console.debug('[WorkflowPersist][viewMismatch]', JSON.stringify({
           view,
           workflowCount: workflows.length,
           activeWorkflowId,
@@ -6363,7 +7740,8 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
       return String(a.id).localeCompare(String(b.id))
     })
     if (WORKFLOW_LIST_DEBUG()) {
-      console.log('[WorkflowList][renderOrder]', JSON.stringify({
+      // eslint-disable-next-line no-console
+      console.debug('[WorkflowList][renderOrder]', JSON.stringify({
         policy: 'createdAt-desc',
         search: workflowSearch,
         order: sorted.map((w) => ({
@@ -6374,7 +7752,8 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
           nodeCount: Array.isArray(w.nodes) ? w.nodes.length : 0
         }))
       }))
-      console.log('[WorkflowList][sortPolicy]', JSON.stringify({ policy: 'createdAt-desc' }))
+      // eslint-disable-next-line no-console
+      console.debug('[WorkflowList][sortPolicy]', JSON.stringify({ policy: 'createdAt-desc' }))
     }
     return sorted
   }, [workflows, workflowSearch])
