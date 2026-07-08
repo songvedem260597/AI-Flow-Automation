@@ -46,6 +46,54 @@ import { runPipeline, stopPipeline, pausePipeline, resumePipeline } from '@/pipe
 import type { PipelineCallbacks } from '@/pipeline'
 import { usePipelineStore } from '@/stores/pipelineStore'
 import { debugLog, debugWarn } from '@/lib/debug'
+
+/**
+ * [WorkflowRun][probe] Investigation-only source probe.
+ *
+ * Enabled by `localStorage.AI_FLOW_DEBUG_RUN_SOURCE === '1'`.
+ * Default verbosity is OFF — without the flag, this function
+ * returns synchronously and never touches `console`.
+ *
+ * The probe exists to answer "who called `runPipeline` even though
+ * the user did not click Run?" — see the ignoredDuplicate log
+ * investigation. Each call site declares its own label so we can
+ * tell toolbar-button / canvas-menu / single-node / dashboard-run
+ * / import-open / template-use / hydration apart in the console.
+ */
+const WORKFLOW_RUN_SOURCE_PROBE: boolean =
+  typeof localStorage !== 'undefined'
+  && localStorage.getItem('AI_FLOW_DEBUG_RUN_SOURCE') === '1'
+
+type RunSource =
+  | 'toolbar-button'
+  | 'single-node-canvas'
+  | 'dashboard-quick-run'
+  | 'runner-entry'
+  | 'unknown'
+
+const probeRunRequest = (source: RunSource, workflowId: string, extras: Record<string, unknown> = {}): void => {
+  if (!WORKFLOW_RUN_SOURCE_PROBE) return
+  // eslint-disable-next-line no-console
+  console.log('[WorkflowRun][request]', {
+    source,
+    workflowId,
+    activeWorkflowId: useWorkflowStore.getState().activeWorkflowId,
+    pipelineStoreIsRunning: usePipelineStore.getState().isRunning,
+    timestamp: Date.now(),
+    ...extras
+  })
+  // eslint-disable-next-line no-console
+  console.trace('[WorkflowRun][request.trace]', source)
+}
+
+const probeRunnerState = (
+  event: 'create' | 'enter-guard' | 'ignored-duplicate' | 'start' | 'finish' | 'error' | 'cancel' | 'cleanup',
+  payload: Record<string, unknown>
+): void => {
+  if (!WORKFLOW_RUN_SOURCE_PROBE) return
+  // eslint-disable-next-line no-console
+  console.log('[WorkflowRun][runnerState]', { event, ...payload })
+}
 import {
   saveAssetFromFile,
   saveAssetFromBlob,
@@ -5224,6 +5272,10 @@ const groupDragMirrorLog = (
     setActiveEdges({})
     setNodeOutputs({})
 
+    probeRunRequest('single-node-canvas', workflowSlice.id, {
+      targetNodeId: nodeId,
+      targetNodeType: targetNode.type
+    })
     await runPipeline(workflowSlice, pipelineCallbacksRef.current)
   }
 
@@ -7454,6 +7506,7 @@ const groupDragMirrorLog = (
     setActiveEdges({})
     setNodeOutputs({})
 
+    probeRunRequest('toolbar-button', workflow.id)
     await runPipeline(workflow, pipelineCallbacks)
   }
 
@@ -8869,6 +8922,7 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
     setActiveWorkflow(workflow.id)
     try {
       await openWorkflowEditorWindow(workflow)
+      probeRunRequest('dashboard-quick-run', workflow.id)
       await runPipeline(workflow)
     } catch (error) {
       window.alert(error instanceof Error ? error.message : 'Unable to run workflow.')

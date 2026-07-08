@@ -2641,6 +2641,24 @@ private isNonRetryableGenerateNode(node: WorkflowNode): boolean {
 
 let currentRunner: PipelineRunner | null = null
 
+/**
+ * [WorkflowRun][probe] Investigation-only runner-side probe.
+ * Mirrors the UI-side `probeRunRequest` helper. Enabled by
+ * `localStorage.AI_FLOW_DEBUG_RUN_SOURCE === '1'`. Default OFF.
+ */
+const WORKFLOW_RUN_SOURCE_PROBE: boolean =
+  typeof localStorage !== 'undefined'
+  && localStorage.getItem('AI_FLOW_DEBUG_RUN_SOURCE') === '1'
+
+const probeRunnerState = (
+  event: 'create' | 'enter-guard' | 'ignored-duplicate' | 'start' | 'finish' | 'error' | 'cancel' | 'cleanup',
+  payload: Record<string, unknown>
+): void => {
+  if (!WORKFLOW_RUN_SOURCE_PROBE) return
+  // eslint-disable-next-line no-console
+  console.log('[WorkflowRun][runnerState]', { event, ...payload })
+}
+
 export async function runPipeline(
   workflow: Workflow,
   callbacks: PipelineCallbacks = {}
@@ -2660,7 +2678,19 @@ export async function runPipeline(
   // Returning silently (instead of throwing) lets the caller's
   // `handleRun` finish without raising the "Unable to run workflow."
   // alert that double-clicks would otherwise surface.
+  probeRunnerState('enter-guard', {
+    workflowId: workflow.id,
+    workflowName: workflow.name,
+    previousRunnerTaskId: currentRunner?.taskId ?? null,
+    previousRunnerIsRunning: currentRunner?.isRunning ?? false
+  })
   if (currentRunner?.isRunning) {
+    probeRunnerState('ignored-duplicate', {
+      workflowId: workflow.id,
+      workflowName: workflow.name,
+      previousRunnerTaskId: currentRunner.taskId,
+      previousRunnerIsRunning: currentRunner.isRunning
+    })
     console.warn(`[WorkflowRun][ignoredDuplicate] ` + JSON.stringify({
       workflowRunId: currentRunner.taskId,
       workflowId: workflow.id,
@@ -2672,13 +2702,37 @@ export async function runPipeline(
   const pipelineStore = usePipelineStore.getState()
   const task = pipelineStore.createTask(workflow.id)
   currentRunner = new PipelineRunner(workflow, task.id, callbacks)
+  probeRunnerState('create', {
+    workflowId: workflow.id,
+    workflowName: workflow.name,
+    workflowRunId: task.id,
+    activeTaskId: pipelineStore.activeTaskId
+  })
   try {
     await currentRunner.run()
+    probeRunnerState('finish', {
+      workflowId: workflow.id,
+      workflowRunId: task.id
+    })
+  } catch (error) {
+    probeRunnerState('error', {
+      workflowId: workflow.id,
+      workflowRunId: task.id,
+      errorMessage: error instanceof Error ? error.message : String(error)
+    })
+    throw error
   } finally {
     // Clear the singleton so a follow-up run can start. Only the
     // runner that owns the slot may clear it — guards against
     // a stale `currentRunner` surviving across workflow swaps.
-    if (currentRunner && currentRunner.taskId === task.id) {
+    const isOwner = currentRunner && currentRunner.taskId === task.id
+    probeRunnerState('cleanup', {
+      workflowId: workflow.id,
+      workflowRunId: task.id,
+      isOwner,
+      clearedToNull: isOwner ? null : 'preserved'
+    })
+    if (isOwner) {
       currentRunner = null
     }
   }
