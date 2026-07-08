@@ -40,7 +40,8 @@ import {
   ZoomOut,
   Undo2,
   Redo2,
-  Settings2
+  Settings2,
+  HardDrive
 } from 'lucide-react'
 import { runPipeline, stopPipeline, pausePipeline, resumePipeline } from '@/pipeline'
 import type { PipelineCallbacks } from '@/pipeline'
@@ -110,6 +111,16 @@ import {
   importWorkflowAssetBundle,
   parseWorkflowAssetBundle
 } from '@/lib/assets/assetBundle'
+import {
+  listAssetUsage,
+  findOrphanAssets,
+  deleteAssetsById,
+  getAssetStorageEstimate,
+  isOrphanReportFresh,
+  RECENT_ASSET_GRACE_MS,
+  type AssetUsageReport,
+  type OrphanAssetReport
+} from '@/lib/assets/assetGc'
 import {
   applyNodePreviews,
   categorizeSavedTemplate,
@@ -617,6 +628,14 @@ function captureVideoPoster(videoSrc: string): Promise<{ width?: number; height?
   })
 }
 
+const WORKFLOW_REQUIRES_GENERATE_MESSAGE = 'Add an enabled Generate node before running.'
+
+const hasEnabledGenerateNode = (workflow: Pick<Workflow, 'nodes'>): boolean =>
+  workflow.nodes.some((node) => (
+    node.type === 'generate'
+    && (node.data as Record<string, unknown>).enabled !== false
+  ))
+
 const NODE_PICKER_ITEMS = NODE_CATEGORIES.flatMap((category) =>
   category.nodes.map((node) => ({
     ...node,
@@ -992,6 +1011,12 @@ const pickSafeMediaMetadata = (raw: Record<string, unknown>): Record<string, unk
   return out
 }
 
+const pickNodeEnabledState = (raw: Record<string, unknown>): Pick<FlowNodeData, 'enabled'> | Record<string, never> => {
+  if (raw.enabled === false) return { enabled: false }
+  if (raw.enabled === true) return { enabled: true }
+  return {}
+}
+
 /**
  * Safe Generate `_output` whitelist for plain JSON import. Mirrors
  * the persist-side `sanitizeGenerateOutput` contract — keep the
@@ -1105,10 +1130,12 @@ const pickSafeGenerateOutput = (raw: unknown): Record<string, unknown> | undefin
 function coerceNodeData(type: FlowNodeType, raw: Record<string, unknown>): FlowNodeData {
   const label = String(raw.label || raw.node_name || raw.name || type)
   const provider = coerceProvider(raw.provider || raw.gen_type || raw.model_provider)
+  const enabledState = pickNodeEnabledState(raw)
 
   if (type === 'prompt') {
     return {
       label,
+      ...enabledState,
       prompt: String(raw.prompt || raw.note_text || ''),
       provider,
       model: typeof raw.model === 'string' ? raw.model : undefined
@@ -1134,6 +1161,7 @@ function coerceNodeData(type: FlowNodeType, raw: Record<string, unknown>): FlowN
 
     return {
       label,
+      ...enabledState,
       mediaType,
       mediaUrl: typeof raw.mediaUrl === 'string' ? raw.mediaUrl : undefined,
       mediaData: typeof raw.mediaData === 'string' ? raw.mediaData : undefined,
@@ -1158,6 +1186,7 @@ function coerceNodeData(type: FlowNodeType, raw: Record<string, unknown>): FlowN
     const mediaType = String(raw.mediaType || raw.media_type || 'image').toLowerCase() === 'video' ? 'video' : 'image'
     const nodeData: Record<string, unknown> = {
       label,
+      ...enabledState,
       provider,
       model: typeof raw.model === 'string' ? raw.model : undefined,
       mediaType,
@@ -1186,6 +1215,7 @@ function coerceNodeData(type: FlowNodeType, raw: Record<string, unknown>): FlowN
     const seconds = Number(raw.delay_seconds || 0)
     return {
       label,
+      ...enabledState,
       duration: Number(raw.duration || (seconds > 0 ? seconds * 1000 : 1000))
     }
   }
@@ -1193,6 +1223,7 @@ function coerceNodeData(type: FlowNodeType, raw: Record<string, unknown>): FlowN
   if (type === 'download') {
     return {
       label,
+      ...enabledState,
       format: String(raw.format || 'png') as FlowNodeData['format'],
       autoDownload: raw.autoDownload !== false,
       filename: typeof raw.filename === 'string' ? raw.filename : undefined
@@ -1202,6 +1233,7 @@ function coerceNodeData(type: FlowNodeType, raw: Record<string, unknown>): FlowN
   if (type === 'wait') {
     return {
       label,
+      ...enabledState,
       condition: String(raw.condition || 'dom-change') as FlowNodeData['condition'],
       selector: typeof raw.selector === 'string' ? raw.selector : undefined,
       expectedText: typeof raw.expectedText === 'string' ? raw.expectedText : undefined,
@@ -1209,7 +1241,7 @@ function coerceNodeData(type: FlowNodeType, raw: Record<string, unknown>): FlowN
     } as FlowNodeData
   }
 
-  return { label } as FlowNodeData
+  return { label, ...enabledState } as FlowNodeData
 }
 
 function instantiateTemplate(template: WorkflowTemplate): Workflow {
@@ -2344,7 +2376,12 @@ function renderDrawflowNode(node: WorkflowNode) {
       <div class="df-node-header">
         <div class="df-node-icon ${meta.color}">${meta.icon}</div>
         <div class="df-node-title">${label}</div>
-        <button class="df-node-toggle ${enabled ? 'on' : 'off'}" title="${enabled ? 'Disable node' : 'Enable node'}">
+        <button
+          type="button"
+          class="df-node-toggle ${enabled ? 'on' : 'off'}"
+          title="${enabled ? 'Disable node' : 'Enable node'}"
+          aria-label="${enabled ? 'Disable node' : 'Enable node'}"
+        >
           <span class="df-node-toggle-track"><span class="df-node-toggle-thumb"></span></span>
         </button>
       </div>
@@ -3194,6 +3231,14 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   // ── Pipeline visual callbacks ─────────────────────────────────────────
   const pipelineCallbacks = useMemo(() => ({
     onNodeStart: (nodeId: string) => {
+      const enabledNodeIds = new Set(
+        (workflow.nodes || [])
+          .filter((node: WorkflowNode) => (node.data as Record<string, unknown>).enabled !== false)
+          .map((node: WorkflowNode) => node.id)
+      )
+      const enabledEdges = (workflow.edges || [])
+        .filter((edge: WorkflowEdge) => enabledNodeIds.has(edge.source) && enabledNodeIds.has(edge.target))
+
       debugLog('edgeFlow', '[EdgeFlowDebug][Editor] node start', {
         nodeId,
         activeIncomingEdges: (workflow.edges || [])
@@ -3226,7 +3271,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       // here — they will only light up when the NEXT node starts, at
       // which point the edge's target is the next node and it gets
       // activated as part of that next-node's incoming set.
-      const incoming = (workflow.edges || [])
+      const incoming = enabledEdges
         .filter((e: WorkflowEdge) => e.target === nodeId)
       if (incoming.length > 0) {
         setActiveEdges((prev) => {
@@ -5260,7 +5305,8 @@ const groupDragMirrorLog = (
   const runGenerateNodeWithInputs = async (nodeId: string) => {
     const currentWorkflow = workflowRef.current
     const targetNode = currentWorkflow.nodes.find((node) => node.id === nodeId)
-    if (!targetNode || targetNode.type !== 'generate') return
+    if (!targetNode) return
+    if (targetNode.type !== 'generate') return
     if (usePipelineStore.getState().isRunning) return
 
     const workflowSlice = buildWorkflowSliceForTarget(currentWorkflow, nodeId)
@@ -6667,7 +6713,7 @@ const groupDragMirrorLog = (
     }
     const stopNodePillDragStart = (event: MouseEvent) => {
       const target = event.target as HTMLElement | null
-      if (!target?.closest('.df-node-pill-trigger, .df-hover-btn, .df-node-prompt-editor, .df-node-image-preview-button')) return
+      if (!target?.closest('.df-node-pill-trigger, .df-hover-btn, .df-node-toggle, .df-node-prompt-editor, .df-node-image-preview-button')) return
       event.stopPropagation()
     }
     const handleNodePillClick = (event: MouseEvent) => {
@@ -6742,6 +6788,39 @@ const groupDragMirrorLog = (
         closeNodePillMenu()
         setInspectorNodeId(nodeId)
       }
+    }
+    const handleNodeToggleClick = (event: MouseEvent) => {
+      const button = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('.df-node-toggle')
+      if (!button) return
+
+      event.preventDefault()
+      event.stopPropagation()
+
+      const nodeEl = button.closest<HTMLElement>('.df-node[data-workflow-node-id]')
+      const nodeId = nodeEl?.dataset.workflowNodeId
+      if (!nodeId) return
+
+      const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
+      if (!node) return
+
+      const isEnabled = (node.data as Record<string, unknown>).enabled !== false
+      const nextEnabled = !isEnabled
+      const nextLabel = nextEnabled ? 'Disable node' : 'Enable node'
+
+      closeNodePillMenu()
+      updateNode(nodeId, { enabled: nextEnabled } as Partial<FlowNodeData>)
+
+      nodeEl.classList.toggle('df-node-disabled', !nextEnabled)
+      nodeEl.dataset.enabled = String(nextEnabled)
+      button.classList.toggle('on', nextEnabled)
+      button.classList.toggle('off', !nextEnabled)
+      button.title = nextLabel
+      button.setAttribute('aria-label', nextLabel)
+
+      requestAnimationFrame(() => {
+        rerenderDrawflowNode(nodeId)
+        syncSelectedNodeDom()
+      })
     }
     const handleImagePreviewClick = (event: MouseEvent) => {
       const target = event.target instanceof Element ? event.target : null
@@ -7043,6 +7122,7 @@ const groupDragMirrorLog = (
     canvasEl.addEventListener('dblclick', handleImageNodeUpload)
     canvasEl.addEventListener('click', handleNodePillClick)
     canvasEl.addEventListener('click', handleNodeToolbarClick)
+    canvasEl.addEventListener('click', handleNodeToggleClick)
     canvasEl.addEventListener('click', handleImagePreviewClick)
     canvasEl.addEventListener('click', handleOutputCarouselClick)
     canvasEl.addEventListener('click', handleOutputDownloadClick)
@@ -7107,6 +7187,7 @@ const groupDragMirrorLog = (
       canvasEl.removeEventListener('dblclick', handleImageNodeUpload)
       canvasEl.removeEventListener('click', handleNodePillClick)
       canvasEl.removeEventListener('click', handleNodeToolbarClick)
+      canvasEl.removeEventListener('click', handleNodeToggleClick)
       canvasEl.removeEventListener('click', handleImagePreviewClick)
       canvasEl.removeEventListener('dragstart', preventNativeMediaDrag, true)
       canvasEl.removeEventListener('load', handlePreviewMediaLoaded, true)
@@ -7493,6 +7574,11 @@ const groupDragMirrorLog = (
     if (isRunning) {
       if (isPaused) resumePipeline()
       else pausePipeline()
+      return
+    }
+
+    if (!hasEnabledGenerateNode(workflow)) {
+      flashTemplateToast('warning', WORKFLOW_REQUIRES_GENERATE_MESSAGE)
       return
     }
 
@@ -8517,6 +8603,295 @@ async function openWorkflowEditorWindow(workflow: Workflow) {
   })
 }
 
+// [AssetGC] Phase 5 — Asset Storage report modal.
+// Owned by WorkflowEditor; never touches Flow / ChatGPT / runner
+// paths. Shows:
+//   - Total / referenced / orphan counts and sizes.
+//   - Browser storage.estimate() usage + quota when available.
+//   - Top 5 largest assets by size.
+//   - A "Clean unused assets" CTA that opens a confirm dialog.
+// Confirm step is mandatory — never auto-deletes, never deletes
+// against a stale report (REPORT_STALE_MS in assetGc).
+interface AssetStorageModalProps {
+  report: AssetUsageReport | null
+  estimate: Awaited<ReturnType<typeof getAssetStorageEstimate>> | null
+  orphan: OrphanAssetReport | null
+  loading: boolean
+  error: string | null
+  confirmDelete: boolean
+  deleting: boolean
+  deleteSummary: { deleted: number; failed: number } | null
+  onRefresh: () => void
+  onRequestCleanup: () => void
+  onCancelCleanup: () => void
+  onConfirmCleanup: () => void
+  onClose: () => void
+}
+
+const formatBytes = (bytes: number): string => {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let value = bytes
+  let unitIndex = 0
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+  const decimals = value >= 100 || unitIndex === 0 ? 0 : value >= 10 ? 1 : 2
+  return `${value.toFixed(decimals)} ${units[unitIndex]}`
+}
+
+const formatPercent = (numerator: number, denominator: number): string => {
+  if (!denominator) return '0%'
+  const pct = Math.min(100, Math.max(0, (numerator / denominator) * 100))
+  return `${pct.toFixed(pct >= 10 ? 0 : 1)}%`
+}
+
+const AssetStorageModal: React.FC<AssetStorageModalProps> = ({
+  report,
+  estimate,
+  orphan,
+  loading,
+  error,
+  confirmDelete,
+  deleting,
+  deleteSummary,
+  onRefresh,
+  onRequestCleanup,
+  onCancelCleanup,
+  onConfirmCleanup,
+  onClose
+}) => {
+  const orphanRows = orphan?.cleanable ?? []
+  const orphanBytes = orphan?.cleanableBytes ?? 0
+  const recentGraceAssets = orphan?.recentGraceAssets ?? report?.recentGraceAssets ?? 0
+  const browserPct = estimate && estimate.browserQuotaBytes && estimate.browserQuotaBytes > 0
+    ? formatPercent(estimate.browserUsageBytes || 0, estimate.browserQuotaBytes)
+    : null
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="asset-storage-title"
+      className="workflow-confirm-overlay"
+      onClick={onClose}
+    >
+      <div
+        className="asset-storage-modal"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="asset-storage-header">
+          <div className="asset-storage-icon">
+            <HardDrive className="h-4 w-4" />
+          </div>
+          <div className="asset-storage-title-block">
+            <h2 id="asset-storage-title" className="asset-storage-title">
+              Asset storage
+            </h2>
+            <p className="asset-storage-subtitle">
+              IndexedDB assets uploaded with your workflows and generate outputs.
+            </p>
+          </div>
+          <button
+            type="button"
+            aria-label="Close"
+            onClick={onClose}
+            className="asset-storage-close"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="asset-storage-body">
+          {error && (
+            <div className="asset-storage-banner asset-storage-banner-error" role="alert">
+              <span>{error}</span>
+            </div>
+          )}
+          {deleteSummary && (
+            <div
+              className={
+                deleteSummary.failed > 0
+                  ? 'asset-storage-banner asset-storage-banner-warning'
+                  : 'asset-storage-banner asset-storage-banner-success'
+              }
+              role="status"
+            >
+              <span>
+                Deleted {deleteSummary.deleted} asset
+                {deleteSummary.deleted === 1 ? '' : 's'}
+                {deleteSummary.failed > 0
+                  ? `, ${deleteSummary.failed} failed`
+                  : ''}
+                .
+              </span>
+            </div>
+          )}
+
+          <div className="asset-storage-grid">
+            <div className="asset-storage-stat">
+              <span className="asset-storage-stat-label">Total assets</span>
+              <span className="asset-storage-stat-value">{report?.totalAssets ?? '—'}</span>
+              <span className="asset-storage-stat-sub">{formatBytes(report?.totalBytes ?? 0)}</span>
+            </div>
+            <div className="asset-storage-stat">
+              <span className="asset-storage-stat-label">Referenced</span>
+              <span className="asset-storage-stat-value">{report?.referencedAssets ?? '—'}</span>
+              <span className="asset-storage-stat-sub">{formatBytes(report?.referencedBytes ?? 0)}</span>
+            </div>
+            <div className="asset-storage-stat asset-storage-stat-orphan">
+              <span className="asset-storage-stat-label">Unused / orphan</span>
+              <span className="asset-storage-stat-value">{report?.orphanAssets ?? '—'}</span>
+              <span className="asset-storage-stat-sub">{formatBytes(report?.orphanBytes ?? 0)}</span>
+            </div>
+            <div className="asset-storage-stat">
+              <span className="asset-storage-stat-label">Recent grace</span>
+              <span className="asset-storage-stat-value">{recentGraceAssets}</span>
+              <span className="asset-storage-stat-sub">
+                {`assets <${Math.round(RECENT_ASSET_GRACE_MS / 60000)} min old`}
+              </span>
+            </div>
+          </div>
+
+          {estimate && (
+            <div className="asset-storage-section">
+              <div className="asset-storage-section-title">Browser storage</div>
+              {estimate.browserEstimateSupported ? (
+                <div className="asset-storage-bar-wrap">
+                  <div className="asset-storage-bar">
+                    <div
+                      className="asset-storage-bar-fill"
+                      style={{ width: browserPct || '0%' }}
+                    />
+                  </div>
+                  <div className="asset-storage-bar-text">
+                    {estimate.browserUsageBytes !== null
+                      ? `${formatBytes(estimate.browserUsageBytes)} used`
+                      : 'usage unavailable'}
+                    {estimate.browserQuotaBytes !== null && (
+                      <> &middot; quota {formatBytes(estimate.browserQuotaBytes)} ({browserPct})</>
+                    )}
+                    {' · '}
+                    IndexedDB assets {formatBytes(estimate.indexedDbBytes)} ({estimate.assetCount})
+                  </div>
+                </div>
+              ) : (
+                <div className="asset-storage-bar-text">
+                  Browser storage estimate is not available in this environment.
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="asset-storage-section">
+            <div className="asset-storage-section-title">Top largest assets</div>
+            {report && report.largestAssets.length > 0 ? (
+              <ul className="asset-storage-list">
+                {report.largestAssets.map((asset) => (
+                  <li key={asset.id} className="asset-storage-list-row">
+                    <span className="asset-storage-list-name">
+                      {asset.fileName || asset.id}
+                    </span>
+                    <span className="asset-storage-list-meta">
+                      {asset.kind} &middot; {asset.source} &middot; {asset.mimeType || 'unknown'}
+                    </span>
+                    <span className="asset-storage-list-size">{formatBytes(asset.size)}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <div className="asset-storage-empty">No assets yet.</div>
+            )}
+          </div>
+        </div>
+
+        <div className="asset-storage-footer">
+          <button
+            type="button"
+            className="asset-storage-btn asset-storage-btn-ghost"
+            onClick={onRefresh}
+            disabled={loading || deleting}
+          >
+            {loading ? 'Refreshing…' : 'Refresh'}
+          </button>
+          <button
+            type="button"
+            className="asset-storage-btn asset-storage-btn-danger"
+            onClick={onRequestCleanup}
+            disabled={
+              loading
+              || deleting
+              || !report
+              || (report.orphanAssets <= 0 && (orphan?.cleanable.length ?? 0) === 0)
+            }
+          >
+            Clean unused assets
+          </button>
+          <button
+            type="button"
+            className="asset-storage-btn"
+            onClick={onClose}
+          >
+            Close
+          </button>
+        </div>
+
+        {confirmDelete && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="asset-storage-confirm-title"
+            className="workflow-confirm-overlay"
+            onClick={() => {
+              if (!deleting) onCancelCleanup()
+            }}
+          >
+            <div
+              className="workflow-confirm-modal"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="workflow-confirm-icon">
+                <Trash2 className="h-4 w-4" />
+              </div>
+              <div className="workflow-confirm-body">
+                <h3 id="asset-storage-confirm-title" className="workflow-confirm-title">
+                  {orphanRows.length > 0
+                    ? `Delete ${orphanRows.length} unused asset${orphanRows.length === 1 ? '' : 's'} and free ${formatBytes(orphanBytes)}?`
+                    : 'No unused assets to delete.'}
+                </h3>
+                <p className="workflow-confirm-desc">
+                  This action cannot be undone. Assets referenced by any workflow, template,
+                  or pending editor payload are kept.
+                </p>
+              </div>
+              <div className="workflow-confirm-actions">
+                <button
+                  type="button"
+                  className="workflow-confirm-cancel"
+                  onClick={onCancelCleanup}
+                  disabled={deleting}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="workflow-confirm-delete"
+                  onClick={onConfirmCleanup}
+                  disabled={deleting || orphanRows.length === 0}
+                >
+                  <Trash2 className="h-4 w-4" />
+                  {deleting ? 'Deleting…' : 'Delete'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, onToggleSidebar }) => {
   const workflows = useWorkflowStore((s) => s.workflows)
   const activeWorkflowId = useWorkflowStore((s) => s.activeWorkflowId)
@@ -8543,6 +8918,121 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   const [renameDraft, setRenameDraft] = useState('')
   const renameInputRef = useRef<HTMLInputElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  // [AssetGC] Phase 5 — Asset Storage modal. Self-contained:
+  // owns its loading / report / confirm-delete state, never touches
+  // workflow store mutations. The button lives next to "Import" on
+  // the dashboard toolbar so the affordance is discoverable but
+  // doesn't get in the way of the canvas / templates flows.
+  const [storageModalOpen, setStorageModalOpen] = useState(false)
+  const [storageReport, setStorageReport] = useState<AssetUsageReport | null>(null)
+  const [storageEstimate, setStorageEstimate] = useState<Awaited<ReturnType<typeof getAssetStorageEstimate>> | null>(null)
+  const [storageLoading, setStorageLoading] = useState(false)
+  const [storageOrphan, setStorageOrphan] = useState<OrphanAssetReport | null>(null)
+  const [storageConfirmDelete, setStorageConfirmDelete] = useState(false)
+  const [storageDeleting, setStorageDeleting] = useState(false)
+  const [storageDeleteSummary, setStorageDeleteSummary] = useState<{ deleted: number; failed: number } | null>(null)
+  const [storageError, setStorageError] = useState<string | null>(null)
+  const storageDeleteTimersRef = useRef<ReturnType<typeof setTimeout>[]>([])
+  const closeStorageModal = useCallback(() => {
+    for (const timer of storageDeleteTimersRef.current) clearTimeout(timer)
+    storageDeleteTimersRef.current = []
+    setStorageModalOpen(false)
+    setStorageReport(null)
+    setStorageEstimate(null)
+    setStorageOrphan(null)
+    setStorageConfirmDelete(false)
+    setStorageDeleting(false)
+    setStorageDeleteSummary(null)
+    setStorageError(null)
+    setStorageLoading(false)
+  }, [])
+
+  const refreshStorageReport = useCallback(async () => {
+    setStorageLoading(true)
+    setStorageError(null)
+    try {
+      const [usage, estimate] = await Promise.all([
+        listAssetUsage(),
+        getAssetStorageEstimate()
+      ])
+      setStorageReport(usage)
+      setStorageEstimate(estimate)
+      setStorageOrphan(null)
+      setStorageConfirmDelete(false)
+      setStorageDeleteSummary(null)
+    } catch (err) {
+      setStorageError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setStorageLoading(false)
+    }
+  }, [])
+
+  const beginStorageCleanup = useCallback(async () => {
+    // Re-run orphan detection at the moment the user opens the
+    // confirm dialog so a stale report (older than 30 s) cannot
+    // be used to delete an asset that just got referenced.
+    if (storageOrphan && !isOrphanReportFresh(storageOrphan)) {
+      try {
+        const next = await findOrphanAssets()
+        setStorageOrphan(next)
+      } catch {
+        // Refresh failed — keep the existing report, the confirm
+        // step will reject the deletion if the rows are still
+        // there but the count no longer matches.
+      }
+    }
+    setStorageConfirmDelete(true)
+  }, [storageOrphan])
+
+  const cancelStorageCleanup = useCallback(() => {
+    setStorageConfirmDelete(false)
+  }, [])
+
+  const confirmStorageCleanup = useCallback(async () => {
+    if (!storageOrphan || storageOrphan.cleanable.length === 0) {
+      setStorageConfirmDelete(false)
+      return
+    }
+    if (!isOrphanReportFresh(storageOrphan)) {
+      // The pre-delete safety net — never delete against a stale
+      // report. Re-run detection and let the user try again.
+      try {
+        const next = await findOrphanAssets()
+        setStorageOrphan(next)
+      } catch (err) {
+        setStorageError(err instanceof Error ? err.message : String(err))
+      }
+      setStorageConfirmDelete(false)
+      return
+    }
+    setStorageDeleting(true)
+    setStorageError(null)
+    try {
+      const ids = storageOrphan.cleanable.map((row) => row.id)
+      const result = await deleteAssetsById(ids)
+      setStorageDeleteSummary({ deleted: result.deleted, failed: result.failed.length })
+      if (result.failed.length > 0) {
+        // eslint-disable-next-line no-console
+        console.warn('[AssetGC] cleanup partial', JSON.stringify({
+          deleted: result.deleted,
+          failed: result.failed
+        }))
+      }
+      // Refresh the report so the UI shows the post-delete state.
+      const [usage, estimate] = await Promise.all([
+        listAssetUsage(),
+        getAssetStorageEstimate()
+      ])
+      setStorageReport(usage)
+      setStorageEstimate(estimate)
+      setStorageOrphan(null)
+    } catch (err) {
+      setStorageError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setStorageDeleting(false)
+      setStorageConfirmDelete(false)
+    }
+  }, [storageOrphan])
 
   const refreshSavedTemplates = useCallback(async () => {
     try {
@@ -8920,6 +9410,10 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
 
   const handleRunWorkflow = async (workflow: Workflow) => {
     setActiveWorkflow(workflow.id)
+    if (!hasEnabledGenerateNode(workflow)) {
+      window.alert(WORKFLOW_REQUIRES_GENERATE_MESSAGE)
+      return
+    }
     try {
       await openWorkflowEditorWindow(workflow)
       probeRunRequest('dashboard-quick-run', workflow.id)
@@ -8987,6 +9481,17 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
         </div>
 
         <div className="flex items-center gap-2">
+          <button
+            type="button"
+            title="Asset storage"
+            onClick={() => {
+              setStorageModalOpen(true)
+              void refreshStorageReport()
+            }}
+            className="flex h-9 w-9 items-center justify-center rounded-lg bg-[#1A1A1A] text-white/55 transition-colors hover:bg-white/[0.06] hover:text-white"
+          >
+            <HardDrive className="h-4 w-4" />
+          </button>
           <button
             type="button"
             title="Import workflow"
@@ -9519,6 +10024,23 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
             </div>
           </div>
         </div>
+      )}
+      {storageModalOpen && (
+        <AssetStorageModal
+          report={storageReport}
+          estimate={storageEstimate}
+          orphan={storageOrphan}
+          loading={storageLoading}
+          error={storageError}
+          confirmDelete={storageConfirmDelete}
+          deleting={storageDeleting}
+          deleteSummary={storageDeleteSummary}
+          onRefresh={() => void refreshStorageReport()}
+          onRequestCleanup={() => void beginStorageCleanup()}
+          onCancelCleanup={cancelStorageCleanup}
+          onConfirmCleanup={() => void confirmStorageCleanup()}
+          onClose={closeStorageModal}
+        />
       )}
     </div>
   )

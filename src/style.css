@@ -2621,6 +2621,314 @@ button.df-node-tag {
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
+/* ── Asset storage modal (Phase 5) ──────────────────────────── */
+/* Larger dialog than `.workflow-confirm-modal`: the storage
+ * report needs a stat grid + sectioned lists. Reuses
+ * `.workflow-confirm-overlay` for the scrim so it stacks the
+ * confirm-cleanup sub-dialog correctly (the sub-dialog also
+ * uses `.workflow-confirm-overlay`). */
+.asset-storage-modal {
+  width: min(560px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+  background: var(--bg-card);
+  border: 1px solid rgba(124, 92, 255, 0.35);
+  border-radius: 12px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
+  color: var(--text-primary);
+  display: flex;
+  flex-direction: column;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  animation: workflow-confirm-pop 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+  overflow: hidden;
+}
+
+.asset-storage-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.asset-storage-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: rgba(124, 92, 255, 0.12);
+  border: 1px solid rgba(124, 92, 255, 0.35);
+  color: #B8A8FF;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.asset-storage-title-block {
+  flex: 1;
+  min-width: 0;
+}
+
+.asset-storage-title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+  line-height: 1.2;
+}
+
+.asset-storage-subtitle {
+  margin: 2px 0 0;
+  font-size: 10.5px;
+  color: var(--text-secondary);
+  line-height: 1.35;
+}
+
+.asset-storage-close {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  flex-shrink: 0;
+}
+
+.asset-storage-close:hover {
+  background: var(--bg-card-hover);
+  border-color: rgba(255, 255, 255, 0.16);
+  color: var(--text-primary);
+}
+
+.asset-storage-body {
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+.asset-storage-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+}
+
+.asset-storage-stat {
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.02);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.asset-storage-stat-orphan {
+  border-color: rgba(245, 158, 11, 0.45);
+  background: rgba(245, 158, 11, 0.06);
+}
+
+.asset-storage-stat-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.asset-storage-stat-value {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+
+.asset-storage-stat-sub {
+  font-size: 10.5px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.asset-storage-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.asset-storage-section-title {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.asset-storage-bar-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.asset-storage-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+
+.asset-storage-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #7C5CFF, #B8A8FF);
+  border-radius: 999px;
+  transition: width 0.25s ease;
+}
+
+.asset-storage-bar-text {
+  font-size: 10.5px;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.asset-storage-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.asset-storage-list-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    "name size"
+    "meta meta";
+  padding: 6px 10px;
+  gap: 2px 8px;
+  border-bottom: 1px solid var(--border-color);
+  font-size: 11px;
+}
+
+.asset-storage-list-row:last-child {
+  border-bottom: none;
+}
+
+.asset-storage-list-name {
+  grid-area: name;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.asset-storage-list-meta {
+  grid-area: meta;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.asset-storage-list-size {
+  grid-area: size;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  font-size: 10.5px;
+  align-self: center;
+}
+
+.asset-storage-empty {
+  border: 1px dashed var(--border-color);
+  border-radius: 8px;
+  padding: 12px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.asset-storage-banner {
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.asset-storage-banner-error {
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  color: #fca5a5;
+}
+
+.asset-storage-banner-warning {
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  color: #fbbf24;
+}
+
+.asset-storage-banner-success {
+  background: rgba(16, 185, 129, 0.1);
+  border: 1px solid rgba(16, 185, 129, 0.4);
+  color: #6ee7b7;
+}
+
+.asset-storage-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.asset-storage-btn {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 8px;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.asset-storage-btn:hover:not(:disabled) {
+  background: var(--bg-card-hover);
+  border-color: rgba(255, 255, 255, 0.16);
+  color: var(--text-primary);
+}
+
+.asset-storage-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.asset-storage-btn-ghost {
+  margin-right: auto;
+}
+
+.asset-storage-btn-danger {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+
+.asset-storage-btn-danger:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
 /* ── Marquee selection rectangle (workflow editor) ─────────── */
 /* Drawn while the user holds Ctrl and drags on the empty canvas.
    Positioned absolutely inside the editor root; left/top are

@@ -317,8 +317,9 @@ export class PipelineRunner {
   }
 
   private detectProvider(): AIProvider {
-    const generateNode = this.workflow.nodes.find((node) => node.type === 'generate')
-    const promptNode = this.workflow.nodes.find((node) => node.type === 'prompt')
+    const nodes = this.getEnabledNodes()
+    const generateNode = nodes.find((node) => node.type === 'generate')
+    const promptNode = nodes.find((node) => node.type === 'prompt')
     const providerNode = generateNode || promptNode
 
     if (providerNode) {
@@ -340,12 +341,12 @@ export class PipelineRunner {
 
   /** Returns all edge IDs that carry data INTO a node (incoming edges). */
   private getIncomingEdgeIds(nodeId: string): string[] {
-    return this.workflow.edges.filter((e) => e.target === nodeId).map((e) => e.id)
+    return this.getEnabledEdges().filter((e) => e.target === nodeId).map((e) => e.id)
   }
 
   /** Returns all edge IDs that carry data OUT OF a node (outgoing edges). */
   private getOutgoingEdgeIds(nodeId: string): string[] {
-    return this.workflow.edges.filter((e) => e.source === nodeId).map((e) => e.id)
+    return this.getEnabledEdges().filter((e) => e.source === nodeId).map((e) => e.id)
   }
 
   private emitStart(nodeId: string, nodeType: string) {
@@ -366,7 +367,7 @@ export class PipelineRunner {
     })
     debugLog('glow', '[GlowDebug][Runner] start', { nodeId })
     try { this.callbacks.onNodeStart?.(nodeId, nodeType) } catch {}
-    for (const edge of this.workflow.edges.filter((e) => e.target === nodeId)) {
+    for (const edge of this.getEnabledEdges().filter((e) => e.target === nodeId)) {
       debugLog('edgeFlow', '[EdgeFlowDebug][Runner] edge active', {
         runningNodeId: nodeId,
         edgeId: edge.id,
@@ -396,7 +397,7 @@ export class PipelineRunner {
     })
     debugLog('glow', '[GlowDebug][Runner] complete', { nodeId, output })
     try { this.callbacks.onNodeComplete?.(nodeId, output) } catch {}
-    for (const edge of this.workflow.edges.filter((e) => e.target === nodeId)) {
+    for (const edge of this.getEnabledEdges().filter((e) => e.target === nodeId)) {
       debugLog('edgeFlow', '[EdgeFlowDebug][Runner] edge inactive', {
         runningNodeId: nodeId,
         edgeId: edge.id,
@@ -417,7 +418,7 @@ export class PipelineRunner {
     // and outgoing of the failed node. The editor's onEdgeInactive
     // short-circuits on already-inactive edges so the duplicate work
     // is harmless.
-    for (const edge of this.workflow.edges.filter((e) => e.target === nodeId)) {
+    for (const edge of this.getEnabledEdges().filter((e) => e.target === nodeId)) {
       debugLog('edgeFlow', '[EdgeFlowDebug][Runner] edge inactive (failure cleanup)', {
         runningNodeId: nodeId,
         edgeId: edge.id,
@@ -428,7 +429,7 @@ export class PipelineRunner {
       debugLog('glow', '[GlowDebug][Runner] edgeInactive', { edgeId: edge.id, source: edge.source, target: edge.target })
       try { this.callbacks.onEdgeInactive?.(edge.id) } catch {}
     }
-    for (const edge of this.workflow.edges.filter((e) => e.source === nodeId)) {
+    for (const edge of this.getEnabledEdges().filter((e) => e.source === nodeId)) {
       debugLog('edgeFlow', '[EdgeFlowDebug][Runner] edge inactive (failure cleanup)', {
         runningNodeId: nodeId,
         edgeId: edge.id,

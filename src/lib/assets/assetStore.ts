@@ -238,3 +238,33 @@ export const deleteAsset = async (id: string): Promise<void> => {
     // Best-effort. Caller does not depend on delete success.
   }
 }
+
+/**
+ * [AssetGC] List every record in the asset store. Phase 5 GC
+ * needs the full table to compute orphan / referenced sets and
+ * total bytes — getAsset() only resolves a single id.
+ *
+ * Records are returned in `createdAt` ASC order so the report is
+ * stable across renders. Blob contents are NOT included — callers
+ * that need bytes call getAssetBlob(id).
+ */
+export const listAssets = async (): Promise<AssetRecord[]> => {
+  try {
+    const db = await openAssetDB()
+    return await new Promise<AssetRecord[]>((resolve, reject) => {
+      const tx = db.transaction(ASSET_STORE, 'readonly')
+      const store = tx.objectStore(ASSET_STORE)
+      const req = store.getAll()
+      req.onsuccess = () => {
+        const records = Array.isArray(req.result) ? (req.result as AssetRecord[]) : []
+        records.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))
+        resolve(records)
+      }
+      req.onerror = () => reject(req.error || new Error('Failed to list assets'))
+    })
+  } catch {
+    // IndexedDB not available → empty inventory. GC report falls
+    // back to 0 assets so the UI stays usable.
+    return []
+  }
+}

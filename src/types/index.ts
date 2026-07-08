@@ -42,6 +42,7 @@ export interface BaseNodeData {
   label: string
   description?: string
   provider?: AIProvider
+  enabled?: boolean
   [key: string]: unknown
 }
 
