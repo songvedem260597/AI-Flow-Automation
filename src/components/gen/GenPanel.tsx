@@ -358,15 +358,15 @@ export const GenPanel: React.FC<{
     : FLOW_VIDEO_DURATIONS
 
   // Flow Video input mode — Khung hình / Thành phần. Google Flow only.
-  // Empty string = legacy behavior (do not touch the Flow tab; rely on
-  // Flow's current default which is 'ingredient'). The dropdown visually
-  // shows the empty selection as "Thành phần" (Flow's default) so the
-  // user has a working baseline; user must explicitly pick to switch.
-  // The persisted sentinel '' is intentional — never write a default
-  // value on mount, so existing Gen-tab users keep their current
-  // behavior until they opt in.
+  // Default is 'frame' (Khung hình) so new Gen-tab users start with the
+  // option we want visible first. Empty string '' stays as the legacy
+  // sentinel meaning "do not touch the Flow tab — rely on whatever Flow
+  // currently shows" and is only reachable by users who had it persisted
+  // before this default flipped. `usePersistedState` reads existing
+  // localStorage first, so existing users (persisted '' or any value
+  // they picked) keep their behavior — only fresh installs get 'frame'.
   type FlowVideoMode = 'frame' | 'ingredient'
-  const [flowVideoMode, setFlowVideoMode] = usePersistedState<'' | FlowVideoMode>('genpanel.flowVideoMode', '')
+  const [flowVideoMode, setFlowVideoMode] = usePersistedState<'' | FlowVideoMode>('genpanel.flowVideoMode', 'frame')
 
   const [aspectRatio, setAspectRatio] = usePersistedState<AspectRatio>('genpanel.aspectRatio', '16:9')
   const [quantity, setQuantity] = usePersistedState<number>('genpanel.quantity', 1)
@@ -1497,14 +1497,14 @@ const handleGenerate = useCallback(async () => {
               />
             )}
 
-            {/* Video mode — Google Flow Video only ("Khung hình" / "Thành phần") */}
+            {/* Video mode — Google Flow Video only ("Khung hình" / "Thành phần"). Default visual is "Khung hình". */}
             {activeProvider === 'flow' && mode === 'video' && (
               <CompactDropdown
-                value={flowVideoMode || 'ingredient'}
+                value={flowVideoMode || 'frame'}
                 onChange={(value) => setFlowVideoMode(value === 'ingredient' || value === 'frame' ? value : '')}
                 options={[
-                  { value: 'ingredient', label: 'Thành phần' },
-                  { value: 'frame', label: 'Khung hình' }
+                  { value: 'frame', label: 'Khung hình' },
+                  { value: 'ingredient', label: 'Thành phần' }
                 ]}
               />
             )}
