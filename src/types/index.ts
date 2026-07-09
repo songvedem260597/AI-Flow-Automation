@@ -46,6 +46,19 @@ export interface BaseNodeData {
   [key: string]: unknown
 }
 
+/**
+ * Google Flow Video input mode. Maps to the in-popup segmented control
+ * labelled "Khung hình" / "Thành phần" in the Flow UI.
+ *
+ * - `'frame'`      → "Khung hình" (Frames). Trigger id suffix: VIDEO_FRAMES.
+ * - `'ingredient'` → "Thành phần" (References). Trigger id suffix: VIDEO_REFERENCES.
+ *
+ * Google Flow only. Ignored for ChatGPT and for mediaType='image'.
+ * `undefined` preserves the legacy behavior (do not touch the tab — Flow's
+ * current default is 'ingredient').
+ */
+export type FlowVideoMode = 'frame' | 'ingredient'
+
 export interface PromptNodeData extends BaseNodeData {
   prompt: string
   variables?: Record<string, string>
@@ -74,6 +87,19 @@ export interface GenerateNodeData extends BaseNodeData {
   provider: AIProvider
   model?: string
   mediaType?: 'image' | 'video'
+  /**
+   * Google Flow only — selects between "Khung hình" / "Thành phần"
+   * (VIDEO_FRAMES / VIDEO_REFERENCES) inside the Video settings popup.
+   *
+   * Only honored when `mediaType === 'video'`. For image mode or
+   * non-google-flow providers, this field is stripped during sanitize
+   * and never sent over the boundary. `undefined` means "do not touch
+   * the tab" — Flow keeps its current selection (which is 'ingredient'
+   * by default as of 2026-07-10). Migration note: existing workflows
+   * without this field keep their pre-existing behavior; explicit
+   * selection is required to override the Flow default.
+   */
+  flowVideoMode?: FlowVideoMode
   aspectRatio?: '1:1' | '16:9' | '9:16' | '4:3' | '3:4' | 'custom'
   videoDuration?: string
   quantity?: number

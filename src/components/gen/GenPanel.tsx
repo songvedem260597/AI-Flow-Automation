@@ -357,6 +357,17 @@ export const GenPanel: React.FC<{
     ? OMNI_FLASH_VIDEO_DURATIONS
     : FLOW_VIDEO_DURATIONS
 
+  // Flow Video input mode — Khung hình / Thành phần. Google Flow only.
+  // Empty string = legacy behavior (do not touch the Flow tab; rely on
+  // Flow's current default which is 'ingredient'). The dropdown visually
+  // shows the empty selection as "Thành phần" (Flow's default) so the
+  // user has a working baseline; user must explicitly pick to switch.
+  // The persisted sentinel '' is intentional — never write a default
+  // value on mount, so existing Gen-tab users keep their current
+  // behavior until they opt in.
+  type FlowVideoMode = 'frame' | 'ingredient'
+  const [flowVideoMode, setFlowVideoMode] = usePersistedState<'' | FlowVideoMode>('genpanel.flowVideoMode', '')
+
   const [aspectRatio, setAspectRatio] = usePersistedState<AspectRatio>('genpanel.aspectRatio', '16:9')
   const [quantity, setQuantity] = usePersistedState<number>('genpanel.quantity', 1)
   const [styleId, setStyleId] = usePersistedState<string>('genpanel.styleId', '')
@@ -424,7 +435,7 @@ export const GenPanel: React.FC<{
   const lastRenderLogRef = useRef<string>('')
   useEffect(() => {
     const snapshot = JSON.stringify({
-      mode, imageModel, videoModel, aspectRatio, quantity, videoDuration,
+      mode, imageModel, videoModel, aspectRatio, quantity, videoDuration, flowVideoMode,
     })
     if (snapshot !== lastRenderLogRef.current) {
       lastRenderLogRef.current = snapshot
@@ -438,9 +449,10 @@ export const GenPanel: React.FC<{
         aspectRatio,
         quantity,
         videoDuration,
+        flowVideoMode,
       }, null, 2))
     }
-  }, [mode, imageModel, videoModel, aspectRatio, quantity, videoDuration])
+  }, [mode, imageModel, videoModel, aspectRatio, quantity, videoDuration, flowVideoMode])
 
   const prompts = prompt.split(/\n\n+/).map((p) => p.trim()).filter(Boolean)
   const promptWordCount = prompt.trim().split(/\s+/).filter(Boolean).length
@@ -690,6 +702,11 @@ interface FlowPayload {
   fileNameMap: Record<string, string>
   // frameFileIds: only used in Video Frames mode. fileIds must be empty for Frames path.
   frameFileIds?: { frame1?: string; frame2?: string }
+  // Google Flow Video only — selects "Khung hình" / "Thành phần" in the
+  // settings popup. Distinct from `frameFileIds` (which targets the
+  // legacy Frames code path); flowVideoMode covers the unified control
+  // Flow shipped 2026-Q3. omit (undefined) to keep legacy behavior.
+  flowVideoMode?: 'frame' | 'ingredient'
   // pendingFiles: REMOVED — resolved to tileIds in GenPanel before RUN_FLOW_PROMPT
   autoDownload: boolean
   outputFolder: string
@@ -782,6 +799,12 @@ function buildGenerationPayload(
     fileIds: resolvedFileIds,
     fileNameMap: resolvedFileNameMap,
     frameFileIds: effectiveFrameFileIds,
+    // Google Flow Video only — Forward flowVideoMode only when the user
+    // explicitly picked a value AND we're in the right mode. Empty
+    // string from persisted state means "legacy / do not touch".
+    flowVideoMode: isVideoMode && (flowVideoMode === 'frame' || flowVideoMode === 'ingredient')
+      ? flowVideoMode
+      : undefined,
     autoDownload: autoDownload,
     outputFolder: subFolder,
     resolution: downloadRes,
@@ -1471,6 +1494,18 @@ const handleGenerate = useCallback(async () => {
                 value={activeModel}
                 onChange={setActiveModel}
                 options={activeModelOptions.map((m) => ({ value: m.value, label: m.label }))}
+              />
+            )}
+
+            {/* Video mode — Google Flow Video only ("Khung hình" / "Thành phần") */}
+            {activeProvider === 'flow' && mode === 'video' && (
+              <CompactDropdown
+                value={flowVideoMode || 'ingredient'}
+                onChange={(value) => setFlowVideoMode(value === 'ingredient' || value === 'frame' ? value : '')}
+                options={[
+                  { value: 'ingredient', label: 'Thành phần' },
+                  { value: 'frame', label: 'Khung hình' }
+                ]}
               />
             )}
 

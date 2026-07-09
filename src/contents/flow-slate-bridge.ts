@@ -57,7 +57,8 @@
   // Build time marker — single source of truth for cache-busting verification
   // Bump this every time you make a runtime change so the Flow page console
   // verification (window.__FLOW_BRIDGE_BUILD_TIME__) matches the running bundle.
-  var FLOW_BRIDGE_BUILD_TIME = "2026-07-07 00:50:00"
+  // 2026-07-10 05:55:00 — added Flow Video input mode (Khung hình / Thành phần).
+  var FLOW_BRIDGE_BUILD_TIME = "2026-07-10 05:55:00"
   bridgeLog('[Bridge] BUILD_TIME ' + FLOW_BRIDGE_BUILD_TIME + ' instance=' + BRIDGE_INSTANCE_ID)
   ;(window as Record<string, unknown>).__FLOW_BRIDGE_BUILD_TIME__ = FLOW_BRIDGE_BUILD_TIME
 
@@ -210,14 +211,25 @@
         actual: current?.duration || '',
         match: !isVideo || !target.duration || current?.duration === target.duration,
       },
+      videoMode: {
+        target: target.flowVideoMode || null,
+        actual: current?.videoMode || null,
+        // Only checked when the caller asked for a videoMode. When
+        // target.flowVideoMode is undefined/empty, we don't fail the
+        // verify — this preserves legacy behavior of "leave the tab
+        // alone" without tripping the verify gate.
+        match: !target.flowVideoMode
+          || !isVideo
+          || target.flowVideoMode === current?.videoMode,
+      },
     }
     return {
-      ok: diff.model.match && diff.ratio.match && diff.quantity.match && diff.duration.match,
+      ok: diff.model.match && diff.ratio.match && diff.quantity.match && diff.duration.match && diff.videoMode.match,
       diff: diff,
     }
   }
 
-  function readFlowSettingsSnapshot(settingsBtn?: Element | null | undefined) {
+  function readFlowSettingsSnapshot(settingsBtn?: Element | null | undefined, panel?: Element | null | undefined) {
     var btn = settingsBtn || (typeof getFlowSettingsButton === 'function' ? getFlowSettingsButton() : null)
     if (!btn) return null
     var allText = String(btn.textContent ?? '').trim()
@@ -249,12 +261,25 @@
         model = text.replace(/^[\u{1F000}-\u{1FFFF}]\s*/u, '').trim()
       }
     }
+    // Video input mode (Khung hình / Thành phần) — only visible inside
+    // the open settings popup. We accept an optional `panel` arg so
+    // post-apply verify can capture the tab state when the popup is
+    // still open. When the popup is closed or omitted, return null
+    // and downstream compareFlowSettings treats this as a no-op (the
+    // caller-specific VIDEO_REFERENCES / VIDEO_FRAMES tabs are never
+    // visible from the summary button alone).
+    var videoMode: 'frame' | 'ingredient' | null = null
+    if (panel) {
+      var activeMode = readActiveVideoMode(panel)
+      videoMode = activeMode
+    }
     return {
       mode: mode,
       model: model,
       duration: duration,
       ratioIcon: ratioIcon,
       quantity: quantity,
+      videoMode: videoMode,
       rawText: allText,
     }
   }
@@ -3340,6 +3365,16 @@
     var rawFrameFileIds = payload?.frameFileIds as { frame1?: string; frame2?: string } | null | undefined
     var hasFrameFileIds = rawFrameFileIds && (rawFrameFileIds.frame1 || rawFrameFileIds.frame2)
 
+    // Google Flow Video only — "Khung hình" / "Thành phần" segmented
+    // control inside the settings popup. undefined means "do not
+    // touch" (legacy workflows rely on Flow's current default which
+    // is 'ingredient'). Invalid values are dropped.
+    var rawFlowVideoMode = payload?.flowVideoMode
+    var flowVideoMode: 'frame' | 'ingredient' | undefined =
+      rawFlowVideoMode === 'frame' || rawFlowVideoMode === 'ingredient'
+        ? (rawFlowVideoMode as 'frame' | 'ingredient')
+        : undefined
+
     return {
       mode: mode,
       model: safeText(payload?.model || payload?.modelName),
@@ -3353,6 +3388,8 @@
       frameFileIds: hasFrameFileIds ? rawFrameFileIds : undefined,
       // isFrames is ONLY true when frameFileIds is present — never from ref count
       isFrames: !!hasFrameFileIds,
+      // Google Flow Video input mode (Khung hình / Thành phần)
+      flowVideoMode: flowVideoMode,
     }
   }
 
@@ -4698,6 +4735,149 @@
     return { success: true }
   }
 
+  // ────────────────────────────────────────────────────────────────────
+  // selectVideoMode — Google Flow Video input mode
+  // ("Khung hình" / "Thành phần") segmented control.
+  //
+  // DOM probe 2026-07-10 confirmed:
+  //   - frame      → button[role="tab"][id$="-trigger-VIDEO_FRAMES"]
+  //   - ingredient → button[role="tab"][id$="-trigger-VIDEO_REFERENCES"]
+  //   - active state: data-state="active" on the chosen tab
+  //
+  // Only call this when the caller passed a non-undefined
+  // flowVideoMode. When the field is undefined, callers MUST skip
+  // this entirely (legacy behavior: do not touch the tab).
+  // ────────────────────────────────────────────────────────────────────
+  var VIDEO_MODE_TRIGGER_SUFFIX: Record<string, string> = {
+    frame: 'VIDEO_FRAMES',
+    ingredient: 'VIDEO_REFERENCES',
+  }
+  // Text-only fallback needles, ordered by reliability (VN > EN UI).
+  var VIDEO_MODE_TEXT_NEEDLES: Record<string, RegExp[]> = {
+    frame: [
+      /khung\s*h[ìi]nh/i,
+      /\bvideo\s*frames?\b/i,
+      /\bfirst\s*frame\b/i,
+      /\bkey\s*frame\b/i,
+      /\bframe\b/i,
+    ],
+    ingredient: [
+      /th[àa]nh\s*ph[ầa]n/i,
+      /\bvideo\s*references?\b/i,
+      /\bingredients?\b/i,
+      /\bcomponents?\b/i,
+      /\breferences?\b/i,
+    ],
+  }
+
+  function readActiveVideoMode(panel: Element | null | undefined): 'frame' | 'ingredient' | null {
+    if (!panel) return null
+    try {
+      var frameBtn = panel.querySelector('button[role="tab"][id$="-trigger-VIDEO_FRAMES"]') as HTMLElement | null
+      if (frameBtn && frameBtn.getAttribute('data-state') === 'active') return 'frame'
+      var ingBtn = panel.querySelector('button[role="tab"][id$="-trigger-VIDEO_REFERENCES"]') as HTMLElement | null
+      if (ingBtn && ingBtn.getAttribute('data-state') === 'active') return 'ingredient'
+    } catch (_) {}
+    return null
+  }
+
+  async function selectVideoMode(panel: Element, targetVideoMode: 'frame' | 'ingredient'): Promise<Record<string, unknown>> {
+    bridgeLog('[Bridge][rs] select video mode START', targetVideoMode)
+
+    // Already-active short-circuit. Don't click (clicking an active tab
+    // sometimes toggles off in Radix implementations, which would
+    // collapse the panel — never worth the risk).
+    var currentActive = readActiveVideoMode(panel)
+    if (currentActive === targetVideoMode) {
+      bridgeLog('[Bridge][rs] select video mode ALREADY_ACTIVE', targetVideoMode)
+      return { success: true, method: 'alreadyActive', clickedText: targetVideoMode }
+    }
+
+    var targetBtn: HTMLElement | null = null
+    var clickedText = ''
+    var method = ''
+
+    // Strategy A — primary selector (id suffix from upstream probe).
+    var suffix = VIDEO_MODE_TRIGGER_SUFFIX[targetVideoMode]
+    if (suffix) {
+      targetBtn = panel.querySelector(
+        'button[role="tab"][id$="-trigger-' + suffix + '"]'
+      ) as HTMLElement | null
+      if (targetBtn) {
+        clickedText = safeText(targetBtn.textContent)
+        method = 'id:' + suffix
+      }
+    }
+
+    // Strategy B — text-fallback within the panel's role=tab buttons.
+    // Some Flow builds expose the same control without a deterministic
+    // id suffix; locate by accessible name text. We restrict the
+    // search to role="tab" so we don't accidentally click an unrelated
+    // "thành phần" sidebar token (negTexts in findSubmitButton).
+    if (!targetBtn) {
+      var needles = VIDEO_MODE_TEXT_NEEDLES[targetVideoMode] || []
+      var tabBtns = Array.from(
+        panel.querySelectorAll('button[role="tab"], button[role="button"], button')
+      ) as HTMLElement[]
+      for (var tbi = 0; tbi < tabBtns.length && !targetBtn; tbi++) {
+        var tb = tabBtns[tbi]
+        var ariaName = safeLower(tb.getAttribute('aria-label') || tb.getAttribute('title') || '')
+        var tbText = safeLower(tb.textContent || '')
+        for (var ni = 0; ni < needles.length; ni++) {
+          var needle = needles[ni]
+          if (needle.test(tbText) || needle.test(ariaName)) {
+            // Exclude the *other* mode's id to avoid picking the
+            // wrong chip when text is shared.
+            var otherSuffix = targetVideoMode === 'frame' ? 'VIDEO_REFERENCES' : 'VIDEO_FRAMES'
+            if (tb.id && tb.id.indexOf(otherSuffix) !== -1) continue
+            // Skip buttons already covered by primary strategy (avoid
+            // double-pick in mixed-id builds).
+            targetBtn = tb
+            clickedText = safeText(tb.textContent)
+            method = 'text-fallback'
+            break
+          }
+        }
+      }
+    }
+
+    if (!targetBtn) {
+      bridgeLog('[Bridge][rs] select video mode TAB_NOT_FOUND', targetVideoMode)
+      return {
+        success: false,
+        error: 'FLOW_VIDEO_MODE_TAB_NOT_FOUND',
+        details: { target: targetVideoMode, panelTag: (panel as HTMLElement).tagName || '' },
+      }
+    }
+
+    dispatchFullClick(targetBtn)
+    // Give Flow a beat to flip data-state="active" — observed settle
+    // window 60-220ms in lab probe; sleep(350) keeps us safely past
+    // the worst observed latency without making apply() feel sluggish.
+    await sleep(350)
+
+    // Verify activation immediately to avoid stacking a click that
+    // silently no-op'd. Active check uses the same selectors
+    // (data-state="active" on the chosen tab).
+    var afterActive = readActiveVideoMode(panel)
+    if (afterActive !== targetVideoMode) {
+      bridgeWarn('[Bridge][rs] select video mode ACTIVE_CHECK_FAILED', {
+        target: targetVideoMode,
+        actual: afterActive,
+        method: method,
+        clickedText: clickedText,
+      })
+      return {
+        success: false,
+        error: 'FLOW_VIDEO_MODE_NOT_ACTIVE_AFTER_CLICK',
+        details: { target: targetVideoMode, actual: afterActive, method: method, clickedText: clickedText },
+      }
+    }
+
+    bridgeLog('[Bridge][rs] select video mode SUCCESS', { target: targetVideoMode, method: method, clickedText: clickedText })
+    return { success: true, method: method, clickedText: clickedText, current: afterActive }
+  }
+
   async function selectRatio(panel: Element, targetRatio: string): Promise<Record<string, unknown>> {
     bridgeLog('[Bridge][rs] select ratio START', targetRatio)
 
@@ -5213,8 +5393,45 @@
         return { success: false, error: 'FLOW_SETTINGS_PANEL_NOT_FOUND' }
       }
 
+      // ── Step 4b: Google Flow Video input mode (only when caller
+      //    asked). Selects Khung hình (VIDEO_FRAMES) or Thành phần
+      //    (VIDEO_REFERENCES) before model/ratio/qty/duration so the
+      //    panel settles on the right input mode and the model chip
+      //    list reflects the correct set of allowed options.
+      //    Legacy workflows that omit flowVideoMode take the existing
+      //    path (Flow keeps its current default).
+      if (isVideo && (target.flowVideoMode === 'frame' || target.flowVideoMode === 'ingredient')) {
+        bridgeLog('[Bridge][rs] select video mode START', target.flowVideoMode)
+        console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_VIDEO_MODE_RESULT', JSON.stringify({
+          targetVideoMode: target.flowVideoMode,
+        }))
+        var videoModeResult = await selectVideoMode(activePanel, target.flowVideoMode)
+        console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_VIDEO_MODE_DONE', JSON.stringify({
+          targetVideoMode: target.flowVideoMode,
+          success: !!videoModeResult.success,
+          method: (videoModeResult as Record<string, unknown>).method || '',
+          error: (videoModeResult as Record<string, unknown>).error || '',
+          clickedText: (videoModeResult as Record<string, unknown>).clickedText || '',
+        }))
+        if (!videoModeResult.success) {
+          return videoModeResult
+        }
+
+        // Rescope after videoMode click — switching segmented control
+        // can re-mount the chip rows for ratio/qty/duration in some
+        // Flow builds.
+        activePanel = getActiveFlowSettingsPanel()
+        if (!activePanel || activePanel === document) {
+          return { success: false, error: 'FLOW_SETTINGS_PANEL_NOT_FOUND' }
+        }
+      }
+
       // ── Steps 5-8: Branch on mode ─────────────────────────────────
-      // VIDEO order: mode → model → ratio → quantity → duration
+      // VIDEO order: mode → [videoMode] → model → ratio → quantity → duration
+      //   videoMode only appears when caller passed a non-undefined
+      //   flowVideoMode. Legacy workflows (undefined) use the prior
+      //   5-step chain; behavior is unchanged for them.
+      //
       //   Rationale: duration was previously placed after model, but in
       //   practice ratio/quantity changes can re-render the duration row
       //   and Flow can normalize duration back to the model default. By
@@ -5225,10 +5442,13 @@
       //
       // IMAGE order: ratio → quantity → model (unchanged — image
       //   models don't reset duration/quantity the same way).
+      var videoHasVideoMode = isVideo && (target.flowVideoMode === 'frame' || target.flowVideoMode === 'ingredient')
       console.log('[FlowTrace][Bridge] APPLY_SETTINGS_ORDER', JSON.stringify({
         mode: target.mode,
         order: isVideo
-          ? ['mode', 'model', 'ratio', 'quantity', 'duration']
+          ? (videoHasVideoMode
+              ? ['mode', 'videoMode', 'model', 'ratio', 'quantity', 'duration']
+              : ['mode', 'model', 'ratio', 'quantity', 'duration'])
           : ['mode', 'ratio', 'quantity', 'model'],
       }))
 
@@ -5388,7 +5608,13 @@
 
       // ── Step 10: Close settings panel before returning ─────────
       var freshSettingsBtn = (typeof getFlowSettingsButton === 'function' ? getFlowSettingsButton() : null) || settingsBtn
-      var afterSnapshot = readFlowSettingsSnapshot(freshSettingsBtn)
+      // Capture videoMode from the still-open panel (popup is closed
+      // AFTER this snapshot — see closeFlowSettingsPanelWithEscape()).
+      // For legacy callers where flowVideoMode was undefined, this
+      // snapshot still records the current state but compare
+      // ignores it (no mismatch gate).
+      var verifyPanel = getActiveFlowSettingsPanel()
+      var afterSnapshot = readFlowSettingsSnapshot(freshSettingsBtn, verifyPanel)
       var afterCompare = compareFlowSettings(target, afterSnapshot)
       console.log('[FlowTrace][Bridge] APPLY_SETTINGS_STEP_VERIFY_1', JSON.stringify({
         mode: target.mode,
@@ -5396,6 +5622,8 @@
         actualDuration: (afterSnapshot as Record<string, unknown>)?.duration || '',
         targetQuantity: target.quantity,
         actualQuantity: (afterSnapshot as Record<string, unknown>)?.quantity ?? null,
+        targetVideoMode: target.flowVideoMode || null,
+        actualVideoMode: (afterSnapshot as Record<string, unknown>)?.videoMode || null,
         ok: afterCompare.ok,
       }))
       if (afterCompare.ok) {
@@ -5419,6 +5647,11 @@
       // so quantity goes first in the retry order only when it was
       // the failing field — when duration alone fails we just
       // re-click duration.
+      //
+      // videoMode mismatch is NOT retried here — it would require
+      // clicking the segmented control again and Flow's chip-row
+      // re-render semantics for the inputs are risky enough that
+      // we hard-stop below (same class as mode/ratio mismatch).
       var videoMismatchFixed = false
       if (isVideo && !afterCompare.ok) {
         var diffDuration = !(afterCompare.diff as Record<string, unknown>).duration
@@ -5429,12 +5662,26 @@
           || (afterCompare.diff as Record<string, { match: boolean }>).mode.match === false
         var diffRatio = !(afterCompare.diff as Record<string, unknown>).ratio
           || (afterCompare.diff as Record<string, { match: boolean }>).ratio.match === false
+        // videoMode mismatch is HARD when the caller asked for a
+        // specific value. When target.flowVideoMode is undefined
+        // (legacy), diffVideoMode stays false and the verify gate
+        // skipped it via compareFlowSettings.match=true.
+        var diffVideoMode = target.flowVideoMode === 'frame' || target.flowVideoMode === 'ingredient'
+          ? (!(afterCompare.diff as Record<string, unknown>).videoMode
+              || (afterCompare.diff as Record<string, { match: boolean }>).videoMode.match === false)
+          : false
 
-        // Mode / ratio mismatches are HARD — no retry can fix them.
-        if (diffMode || diffRatio) {
-          bridgeWarn('[Bridge][settings verify] mode/ratio mismatch — NO retry (hard stop)', {
+        // Mode / ratio / videoMode mismatches are HARD — no retry can
+        // fix them. Re-clicking the segmented control can re-mount
+        // chip rows in unpredictable ways; safer to surface the
+        // mismatch to the user than silently flip into the wrong mode.
+        if (diffMode || diffRatio || diffVideoMode) {
+          bridgeWarn('[Bridge][settings verify] mode/ratio/videoMode mismatch — NO retry (hard stop)', {
             diffMode: diffMode,
             diffRatio: diffRatio,
+            diffVideoMode: diffVideoMode,
+            targetVideoMode: target.flowVideoMode || null,
+            actualVideoMode: (afterSnapshot as Record<string, unknown>)?.videoMode || null,
           })
         } else if (diffDuration || diffQuantity) {
           console.log('[FlowTrace][Bridge] APPLY_SETTINGS_RETRY', JSON.stringify({

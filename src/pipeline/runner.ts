@@ -1684,6 +1684,15 @@ private isNonRetryableGenerateNode(node: WorkflowNode): boolean {
     // sanitizeGenerateDataPatch, so this should always be one of
     // the three valid values when the provider is `google-flow`.
     const resolution = String(asString(data.resolution) || '1k').toLowerCase()
+    // Google Flow Video only — "Khung hình" / "Thành phần". Forward
+    // only when the field is set to a valid value and we're in video
+    // mode; legacy workflows without it pass undefined → bridge skips
+    // the segmented-control click (Flow keeps its current default).
+    const rawFlowVideoMode = asString(data.flowVideoMode)
+    const flowVideoMode: 'frame' | 'ingredient' | undefined =
+      mediaType === 'video' && (rawFlowVideoMode === 'frame' || rawFlowVideoMode === 'ingredient')
+        ? rawFlowVideoMode
+        : undefined
     const payload = {
       tabId: flowTabId,
       prompt,
@@ -1697,6 +1706,7 @@ private isNonRetryableGenerateNode(node: WorkflowNode): boolean {
       fileIds,
       referenceImages: fileIds,
       fileNameMap,
+      flowVideoMode,
       autoDownload: shouldAutoDownload,
       outputFolder: FLOW_OUTPUT_FOLDER,
       resolution,
@@ -1747,6 +1757,12 @@ private isNonRetryableGenerateNode(node: WorkflowNode): boolean {
       mediaType,
       quantity,
       fileIdsCount: fileIds.length,
+      // Google Flow Video only — "Khung hình" / "Thành phần". Null
+      // for legacy / image mode. Single-line log key; preserves the
+      // existing JSON.stringify shape so log scrapers stay stable.
+      // `provider: 'google-flow'` is hardcoded above so the gate
+      // collapses to `mediaType === 'video'`.
+      flowVideoMode: mediaType === 'video' ? (flowVideoMode ?? null) : null,
     }))
 
     const response = await this.sendRuntimeMessage({

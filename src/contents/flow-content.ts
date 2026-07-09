@@ -606,6 +606,7 @@ async function runFlowPrompt(payload: {
     videoResolution: payload.videoResolution || '',
     fileIdsCount: (payload.fileIds || []).length,
     frameFileIds: payload.frameFileIds ? { hasFrame1: !!payload.frameFileIds.frame1, hasFrame2: !!payload.frameFileIds.frame2 } : null,
+    flowVideoMode: payload.flowVideoMode || null,
     focusTab: !!payload.focusTab,
     promptLen: payload.prompt?.length || 0,
     url: window.location.href,
@@ -639,6 +640,7 @@ async function runFlowPrompt(payload: {
     ratio: payload.aspectRatio,
     quantity: payload.quantity,
     duration: payload.duration || '',
+    flowVideoMode: payload.flowVideoMode || null,
     autoDownload: !!payload.autoDownload,
     outputFolder: payload.outputFolder || '',
     fileIdsCount: (payload.fileIds || []).length,
@@ -647,7 +649,7 @@ async function runFlowPrompt(payload: {
     flag_DISABLE_settings_automation_is_debug_only: true,
   }))
   flowTrace('Content', 'STEP_1_2_APPLY_SETTINGS_START', {
-    target: { mode: payload.mode, model: payload.model, aspectRatio: payload.aspectRatio, quantity: payload.quantity, duration: payload.duration || '' },
+    target: { mode: payload.mode, model: payload.model, aspectRatio: payload.aspectRatio, quantity: payload.quantity, duration: payload.duration || '', flowVideoMode: payload.flowVideoMode || null },
   })
   let settingsResult: Record<string, unknown>
   try {
@@ -728,13 +730,14 @@ async function runFlowPrompt(payload: {
     // practice (the image apply order is stable).
     var isVerifyMismatch = settingsError.includes('FLOW_SETTINGS_VERIFY_MISMATCH')
     var mismatchDetails = (settingsResult as Record<string, unknown>)?.details as Record<string, unknown> | undefined
-    var mismatchCompare = mismatchDetails?.compare as { diff?: { mode?: { match?: boolean }; ratio?: { match?: boolean }; model?: { match?: boolean }; duration?: { match?: boolean }; quantity?: { match?: boolean } } } | undefined
+    var mismatchCompare = mismatchDetails?.compare as { diff?: { mode?: { match?: boolean }; ratio?: { match?: boolean }; model?: { match?: boolean }; duration?: { match?: boolean }; quantity?: { match?: boolean }; videoMode?: { match?: boolean } } } | undefined
     var isHardStop = false
     var hardStopReason = ''
     if (isVerifyMismatch && mismatchCompare?.diff) {
       var d = mismatchCompare.diff
       if (d.mode?.match === false) { isHardStop = true; hardStopReason = 'mode mismatch' }
       else if (d.ratio?.match === false) { isHardStop = true; hardStopReason = 'ratio mismatch' }
+      else if (d.videoMode?.match === false) { isHardStop = true; hardStopReason = 'video mode mismatch' }
       else if (payload.mode === 'video' && d.duration?.match === false) { isHardStop = true; hardStopReason = 'video duration mismatch' }
       else if (payload.mode === 'video' && d.quantity?.match === false) { isHardStop = true; hardStopReason = 'video quantity mismatch' }
       else if (payload.mode === 'image' && d.model?.match === false) { isHardStop = true; hardStopReason = 'image model mismatch' }
@@ -3258,6 +3261,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         ((rawPayload.settings as Record<string, unknown>)?.duration as string) ||
         ''
     )
+    // Google Flow Video only — "Khung hình" / "Thành phần".
+    // Read from payload.flowVideoMode (canonical) or settings.flowVideoMode
+    // (legacy alias from older callers). Invalid values are dropped so the
+    // bridge can detect "do not touch" via undefined. Setting flowVideoMode
+    // does NOT toggle isFrames — isFrames is only true when frameFileIds
+    // is present, per the legacy contract.
+    var rawFlowVideoMode = rawPayload.flowVideoMode
+    if (typeof rawFlowVideoMode !== 'string') {
+      rawFlowVideoMode = (rawPayload.settings as Record<string, unknown>)?.flowVideoMode as string | undefined
+    }
+    var normalizedFlowVideoMode: 'frame' | 'ingredient' | undefined =
+      rawFlowVideoMode === 'frame' || rawFlowVideoMode === 'ingredient'
+        ? (rawFlowVideoMode as 'frame' | 'ingredient')
+        : undefined
     // isFrames is ONLY true when frameFileIds is present.
     // NEVER infer from referenceImages.length or fileIds.length.
     const rawFrameFileIds = (rawPayload.frameFileIds as { frame1?: string; frame2?: string } | null | undefined)
@@ -3273,6 +3290,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       frameFileIds: normalizedFrameFileIds,
       // isFrames is derived from frameFileIds presence — the ONLY correct source of truth
       isFrames: !!normalizedFrameFileIds,
+      // Google Flow Video only. Forward only when valid; the bridge treats
+      // undefined as "do not touch the segmented control". Do NOT couple
+      // this with isFrames — that would conflict with the legacy Frames path.
+      flowVideoMode: normalizedFlowVideoMode,
     }
     settingsDebug('[FlowContent][REFS_NORMALIZED]', JSON.stringify({
       mode: settingsPayload.mode,
@@ -3282,6 +3303,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       hasUploadKeys: ((rawPayload.fileIds as string[]) || []).some((id: string) => id.startsWith('upload_')),
       frameFileIds: normalizedFrameFileIds,
       isFrames: settingsPayload.isFrames,
+      flowVideoMode: normalizedFlowVideoMode,
     }, null, 2))
     settingsDebug('[FlowContent][APPLY_SETTINGS_TARGET]', JSON.stringify(settingsPayload, null, 2))
 
@@ -3299,6 +3321,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       fileIds: (rawPayload.fileIds as string[]) || [],
       fileNameMap: (rawPayload.fileNameMap as Record<string, string>) || {},
       frameFileIds: settingsPayload.frameFileIds,
+      // Google Flow Video only — "Khung hình" / "Thành phần". undefined means
+      // "do not touch"; bridge skips the segmented-control click and Flow
+      // keeps its current default (currently 'ingredient').
+      flowVideoMode: settingsPayload.flowVideoMode,
       autoDownload: (rawPayload.autoDownload as boolean) ?? false,
       outputFolder: (rawPayload.outputFolder as string) || (rawPayload.subFolder as string) || '',
       resolution: (rawPayload.resolution as string) || (rawPayload.downloadRes as string) || '1k',

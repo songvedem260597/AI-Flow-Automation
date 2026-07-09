@@ -5,7 +5,7 @@ import { autoUpdate, computePosition, flip, offset, shift } from '@floating-ui/d
 import { useWorkflowStore } from '@/stores/workflowStore'
 import { canvasLog } from '@/lib/canvasInvestigate'
 import { cn, usePersistedState } from '@/lib/utils'
-import type { AIProvider, FlowNodeData, FlowNodeType, Workflow, WorkflowEdge, WorkflowNode } from '@/types'
+import type { AIProvider, FlowNodeData, FlowNodeType, FlowVideoMode, Workflow, WorkflowEdge, WorkflowNode } from '@/types'
 import {
   ArrowLeft,
   Check,
@@ -254,6 +254,14 @@ const GENERATE_MEDIA_TYPE_OPTIONS = [
   { value: 'image', label: 'Image' },
   { value: 'video', label: 'Video' }
 ]
+// Google Flow Video only — maps to the in-popup "Khung hình / Thành phần"
+// segmented control (trigger id suffixes VIDEO_FRAMES / VIDEO_REFERENCES).
+// Flow's current default is 'ingredient'; ordering here mirrors that.
+const FLOW_VIDEO_MODE_OPTIONS: Array<{ value: FlowVideoMode; label: string }> = [
+  { value: 'ingredient', label: 'Thành phần' },
+  { value: 'frame', label: 'Khung hình' }
+]
+const FLOW_VIDEO_MODE_VALUES = FLOW_VIDEO_MODE_OPTIONS.map((opt) => opt.value)
 const GENERATE_QUANTITY_OPTIONS: Array<{ value: string; label: string }> = [
   { value: '1', label: 'x1' },
   { value: '2', label: 'x2' },
@@ -289,7 +297,7 @@ const IMAGE_ASPECT_RATIO_VALUES = {
 type GenerateMediaType = 'image' | 'video'
 type MediaNodeType = 'image' | 'video'
 type ImageAspectRatioOption = keyof typeof IMAGE_ASPECT_RATIO_VALUES
-type NodePillField = 'provider' | 'aspectRatio' | 'mediaType' | 'model' | 'videoDuration' | 'quantity' | 'resolution'
+type NodePillField = 'provider' | 'aspectRatio' | 'mediaType' | 'model' | 'videoDuration' | 'quantity' | 'resolution' | 'flowVideoMode'
 
 interface NodePillOption {
   value: string
@@ -435,6 +443,23 @@ function sanitizeGenerateDataPatch(currentData: Record<string, unknown>, patch: 
     sanitized.resolution = undefined
   }
 
+  // flowVideoMode — Google Flow Video only. Strip when provider is not
+  // google-flow or when the active mediaType isn't video. Persisted
+  // only when the user explicitly sets it via the pill, so legacy
+  // workflows without the field keep their pre-existing behavior
+  // (Flow's current default is 'ingredient'). This rule must NOT
+  // synthesize a default value on every patch — the runtime "do not
+  // touch the Flow tab" branch in selectVideoMode is what guarantees
+  // legacy compatibility.
+  if (provider === 'google-flow' && mediaType === 'video') {
+    const candidate = next.flowVideoMode
+    sanitized.flowVideoMode = candidate !== undefined && FLOW_VIDEO_MODE_VALUES.includes(candidate as FlowVideoMode)
+      ? (candidate as FlowVideoMode)
+      : undefined
+  } else {
+    sanitized.flowVideoMode = undefined
+  }
+
   return sanitized
 }
 
@@ -445,6 +470,7 @@ function getPillOptions(field: NodePillField, data: Record<string, unknown> = {}
   if (field === 'videoDuration') return normalizePillOptions(getGenerateVideoDurationOptions(data))
   if (field === 'quantity') return normalizePillOptions(GENERATE_QUANTITY_OPTIONS)
   if (field === 'resolution') return normalizePillOptions(GENERATE_RESOLUTION_OPTIONS)
+  if (field === 'flowVideoMode') return normalizePillOptions(FLOW_VIDEO_MODE_OPTIONS)
   return normalizePillOptions(
     data && Object.keys(data).length > 0 ? getGenerateAspectRatioOptions(data) : ASPECT_RATIO_OPTIONS
   )
@@ -457,6 +483,7 @@ function pillFieldLabel(field: NodePillField) {
   if (field === 'videoDuration') return 'Duration'
   if (field === 'quantity') return 'Quantity'
   if (field === 'resolution') return 'Resolution'
+  if (field === 'flowVideoMode') return 'Chế độ video'
   return 'Aspect ratio'
 }
 
@@ -2562,6 +2589,13 @@ function renderDrawflowNode(node: WorkflowNode) {
         <div class="df-node-settings-bar df-node-settings-bar-overlay">
           ${renderPillTrigger('provider', String(generateData.provider || 'chatgpt'), PROVIDER_OPTIONS)}
           ${supportsVideo ? renderPillTrigger('mediaType', mediaType, GENERATE_MEDIA_TYPE_OPTIONS) : ''}
+          ${isGoogleFlow && mediaType === 'video'
+            ? renderPillTrigger(
+                'flowVideoMode',
+                String(generateData.flowVideoMode || ''),
+                FLOW_VIDEO_MODE_OPTIONS
+              )
+            : ''}
           ${modelOptions.length ? renderPillTrigger('model', generateModel, modelOptions) : ''}
           ${mediaType === 'video' ? renderPillTrigger('videoDuration', generateDuration, durationOptions) : ''}
           ${renderPillTrigger('aspectRatio', generateAspectRatio, ratioOptions)}
