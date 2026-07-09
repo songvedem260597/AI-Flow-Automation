@@ -59,6 +59,35 @@ reference/
 *.tsbuildinfo
 .playwright-mcp/
 .pw-chatgpt-profile/
+.pw-templates-profile/
 artifacts/
 build_log.txt
 diagnostic-upload.js
+
+# Playwright / E2E incidental output dirs
+test-results/
+playwright-report/
+playwright/.cache/
+
+# E2E test infrastructure — local-only. The masonry layout fix
+# does NOT depend on these scripts running in CI, and the
+# fixtures are user-provided 3rd-party content (images / videos).
+# Keep the `tests/fixtures/**/.gitkeep` + README so the directory
+# structure survives cloning, but block the actual test runner
+# + binary fixtures.
+scripts/e2e-*.mjs
+tests/fixtures/**/*
+!tests/fixtures/**/.gitkeep
+!tests/fixtures/**/README.md
+# Explicit binary blocks inside fixture dirs (more specific,
+# beats the broad re-include above if any pattern slips through).
+tests/fixtures/**/*.png
+tests/fixtures/**/*.jpg
+tests/fixtures/**/*.jpeg
+tests/fixtures/**/*.webp
+tests/fixtures/**/*.gif
+tests/fixtures/**/*.avif
+tests/fixtures/**/*.mp4
+tests/fixtures/**/*.webm
+tests/fixtures/**/*.mov
+tests/fixtures/**/*.mkv

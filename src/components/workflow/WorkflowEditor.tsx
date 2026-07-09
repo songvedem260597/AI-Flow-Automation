@@ -629,12 +629,47 @@ function captureVideoPoster(videoSrc: string): Promise<{ width?: number; height?
 }
 
 const WORKFLOW_REQUIRES_GENERATE_MESSAGE = 'Add an enabled Generate node before running.'
+const WORKFLOW_REQUIRES_PROMPT_MESSAGE = 'Connect an enabled Prompt node or add prompt text before running.'
 
-const hasEnabledGenerateNode = (workflow: Pick<Workflow, 'nodes'>): boolean =>
-  workflow.nodes.some((node) => (
+const readNodePromptText = (node: WorkflowNode): string => {
+  const data = (node.data || {}) as Record<string, unknown>
+  return typeof data.prompt === 'string' ? data.prompt.trim() : ''
+}
+
+const getWorkflowRunWarning = (workflow: Pick<Workflow, 'nodes' | 'edges'>, targetGenerateNodeId?: string): string | null => {
+  const enabledNodes = workflow.nodes.filter((node) => (node.data as Record<string, unknown>).enabled !== false)
+  const enabledNodeIds = new Set(enabledNodes.map((node) => node.id))
+  const enabledEdges = workflow.edges.filter((edge) => enabledNodeIds.has(edge.source) && enabledNodeIds.has(edge.target))
+  const enabledNodeMap = new Map(enabledNodes.map((node) => [node.id, node]))
+  const generateNodes = enabledNodes.filter((node) => (
     node.type === 'generate'
-    && (node.data as Record<string, unknown>).enabled !== false
+    && (!targetGenerateNodeId || node.id === targetGenerateNodeId)
   ))
+
+  if (generateNodes.length === 0) return WORKFLOW_REQUIRES_GENERATE_MESSAGE
+
+  const canProduceText = (nodeId: string, seen = new Set<string>()): boolean => {
+    if (seen.has(nodeId)) return false
+    seen.add(nodeId)
+    const node = enabledNodeMap.get(nodeId)
+    if (!node) return false
+    if (readNodePromptText(node)) return true
+    if (node.type !== 'prompt') return false
+    return enabledEdges
+      .filter((edge) => edge.target === nodeId)
+      .some((edge) => canProduceText(edge.source, seen))
+  }
+
+  const missingPromptNode = generateNodes.find((node) => {
+    if (readNodePromptText(node)) return false
+    return !enabledEdges
+      .filter((edge) => edge.target === node.id)
+      .some((edge) => canProduceText(edge.source))
+  })
+
+  if (missingPromptNode) return WORKFLOW_REQUIRES_PROMPT_MESSAGE
+  return null
+}
 
 const NODE_PICKER_ITEMS = NODE_CATEGORIES.flatMap((category) =>
   category.nodes.map((node) => ({
@@ -676,6 +711,60 @@ interface WorkflowTemplate {
    *  leave this undefined. The Templates tab renders it as a 240px
    *  cover image when present. */
   thumbnail?: string
+}
+
+type TemplateMediaFilter = 'All' | 'Image' | 'Video'
+
+const TEMPLATE_MEDIA_FILTERS: TemplateMediaFilter[] = ['All', 'Image', 'Video']
+
+function getTemplateTagCount(template: WorkflowTemplate, mediaType: 'image' | 'video'): number | null {
+  const pattern = mediaType === 'image'
+    ? /^(\d+)\s+images?$/i
+    : /^(\d+)\s+videos?$/i
+  for (const tag of template.tags) {
+    const match = String(tag).trim().match(pattern)
+    if (match) return Number(match[1]) || 0
+  }
+  return null
+}
+
+function templateHasVideoMedia(template: WorkflowTemplate): boolean {
+  const explicitVideoCount = getTemplateTagCount(template, 'video')
+  if (explicitVideoCount !== null) return explicitVideoCount > 0
+  return template.tags.some((tag) => String(tag).toLowerCase() === 'video')
+    || template.nodes.some((node) => {
+      const data = (node.data || {}) as Record<string, unknown>
+      const mediaType = String(data.mediaType || '').toLowerCase()
+      const mimeType = String(data.mediaMimeType || data.mimeType || '').toLowerCase()
+      return mediaType === 'video'
+        || mimeType.startsWith('video/')
+        || typeof data.videoUrl === 'string' && data.videoUrl.trim().length > 0
+        || typeof data.templateVideoPoster === 'string' && data.templateVideoPoster.trim().length > 0
+        || typeof data.posterAssetId === 'string' && data.posterAssetId.trim().length > 0
+    })
+}
+
+function templateHasImageMedia(template: WorkflowTemplate): boolean {
+  const explicitImageCount = getTemplateTagCount(template, 'image')
+  if (explicitImageCount !== null && explicitImageCount > 0) return true
+  if (template.category === 'Image' || template.tags.some((tag) => String(tag).toLowerCase() === 'image')) return true
+  return template.nodes.some((node) => {
+    const data = (node.data || {}) as Record<string, unknown>
+    const mediaType = String(data.mediaType || '').toLowerCase()
+    const mimeType = String(data.mediaMimeType || data.mimeType || '').toLowerCase()
+    if (mediaType === 'video' || mimeType.startsWith('video/')) return false
+    return node.type === 'generate'
+      || node.type === 'image'
+      || typeof data.imageUrl === 'string' && data.imageUrl.trim().length > 0
+      || typeof data.templateImagePreview === 'string' && data.templateImagePreview.trim().length > 0
+      || typeof data.imageAssetId === 'string' && data.imageAssetId.trim().length > 0
+  })
+}
+
+function templateMatchesMediaFilter(template: WorkflowTemplate, filter: TemplateMediaFilter): boolean {
+  if (filter === 'All') return true
+  if (filter === 'Video') return templateHasVideoMedia(template)
+  return templateHasImageMedia(template)
 }
 
 const BUILT_IN_TEMPLATES: WorkflowTemplate[] = [
@@ -1371,6 +1460,118 @@ function instantiateUserTemplate(template: UserWorkflowTemplate): Workflow {
   }
 }
 
+function getUserTemplateMediaTags(nodes: WorkflowNode[]): string[] {
+  let imageCount = 0
+  let videoCount = 0
+  const seenOutputKeys = new Set<string>()
+
+  const stringValue = (value: unknown): string => {
+    return typeof value === 'string' ? value.trim() : ''
+  }
+
+  const firstStringValue = (...values: unknown[]): string => {
+    for (const value of values) {
+      const text = stringValue(value)
+      if (text) return text
+    }
+    return ''
+  }
+
+  const isVideoOutput = (record: Record<string, unknown>): boolean => {
+    const mediaType = firstStringValue(record.mediaType, record.type).toLowerCase()
+    const mimeType = firstStringValue(record.mediaMimeType, record.mimeType).toLowerCase()
+    if (mediaType === 'video') return true
+    if (mediaType === 'image') return false
+    if (mimeType.startsWith('video/')) return true
+    const url = firstStringValue(record.videoUrl, record.url, record.mediaUrl, record.imageUrl)
+    return Boolean(stringValue(record.videoPoster))
+      || Boolean(stringValue(record.templateVideoPoster))
+      || Boolean(stringValue(record.posterAssetId))
+      || /\.(mp4|mov|webm|m4v)(\?|$)/i.test(url)
+      || url.toLowerCase().includes('video')
+  }
+
+  const countMediaRecord = (record: Record<string, unknown>, requireOutputAvailable: boolean): void => {
+    if (requireOutputAvailable && record.outputAvailable === false) return
+    const outputKey = firstStringValue(
+      record.assetId,
+      record.mediaAssetId,
+      record.imageAssetId,
+      record.videoUrl,
+      record.imageUrl,
+      record.mediaUrl,
+      record.url,
+      record.videoData,
+      record.imageData,
+      record.mediaData,
+      record.templateImagePreview,
+      record.templateVideoPoster,
+      record.posterAssetId,
+      record.thumbnailAssetId
+    )
+    if (!outputKey) return
+    if (outputKey && seenOutputKeys.has(outputKey)) return
+    if (outputKey) seenOutputKeys.add(outputKey)
+    if (isVideoOutput(record)) {
+      videoCount += 1
+    } else {
+      imageCount += 1
+    }
+  }
+
+  const countOutputRecord = (raw: unknown): void => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return
+    const record = raw as Record<string, unknown>
+    countMediaRecord(record, true)
+  }
+
+  const countOutputContainer = (container: unknown): void => {
+    if (!Array.isArray(container)) return
+    for (const raw of container) countOutputRecord(raw)
+  }
+
+  const countFlatImageUrls = (container: unknown): void => {
+    if (!Array.isArray(container)) return
+    for (const value of container) {
+      if (typeof value !== 'string') continue
+      const outputKey = value.trim()
+      if (!outputKey || seenOutputKeys.has(outputKey)) continue
+      seenOutputKeys.add(outputKey)
+      if (/\.(mp4|mov|webm|m4v)(\?|$)/i.test(outputKey) || outputKey.toLowerCase().includes('video')) {
+        videoCount += 1
+      } else {
+        imageCount += 1
+      }
+    }
+  }
+
+  for (const node of nodes) {
+    const data = (node.data && typeof node.data === 'object'
+      ? (node.data as Record<string, unknown>)
+      : {}) as Record<string, unknown>
+
+    if (node.type === 'image') {
+      countMediaRecord(data, false)
+      continue
+    }
+
+    if (node.type !== 'generate') continue
+    const output = data._output && typeof data._output === 'object'
+      ? (data._output as Record<string, unknown>)
+      : null
+
+    countOutputContainer(output?.outputs)
+    countOutputContainer(data.outputs)
+    countFlatImageUrls(output?.imageUrls)
+    countFlatImageUrls(data.imageUrls)
+  }
+
+  return [
+    `${imageCount} image${imageCount === 1 ? '' : 's'}`,
+    `${videoCount} video${videoCount === 1 ? '' : 's'}`
+  ]
+}
+
 /**
  * [WorkflowTemplate] Adapter that lifts a UserWorkflowTemplate into
  * the card-render shape that built-in templates already use. The
@@ -1395,7 +1596,7 @@ function userTemplateToCardShape(template: UserWorkflowTemplate): WorkflowTempla
     description: template.description || `Saved template — ${template.nodeCount} nodes / ${template.edgeCount} edges`,
     category: categorizeSavedTemplate(template.workflow),
     accent: 'sky',
-    tags: ['Saved'],
+    tags: getUserTemplateMediaTags(template.workflow.nodes),
     nodes: template.workflow.nodes,
     edges: template.workflow.edges,
     source: 'user',
@@ -5311,6 +5512,11 @@ const groupDragMirrorLog = (
 
     const workflowSlice = buildWorkflowSliceForTarget(currentWorkflow, nodeId)
     if (!workflowSlice) return
+    const runWarning = getWorkflowRunWarning(workflowSlice, nodeId)
+    if (runWarning) {
+      flashTemplateToast('warning', runWarning)
+      return
+    }
 
     closeNodePillMenu()
     clearAllRunDomClasses()
@@ -7577,8 +7783,9 @@ const groupDragMirrorLog = (
       return
     }
 
-    if (!hasEnabledGenerateNode(workflow)) {
-      flashTemplateToast('warning', WORKFLOW_REQUIRES_GENERATE_MESSAGE)
+    const runWarning = getWorkflowRunWarning(workflow)
+    if (runWarning) {
+      flashTemplateToast('warning', runWarning)
       return
     }
 
@@ -9212,18 +9419,16 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
     })
   }, [savedAsCards, savedTemplates])
 
-  const templateCategories = useMemo(() => {
-    const builtIn = new Set(BUILT_IN_TEMPLATES.map((template) => template.category))
-    const saved = new Set(savedAsCards.map((template) => template.category))
-    return ['All', ...Array.from(new Set([...builtIn, ...saved]))]
-  }, [savedAsCards])
   const combinedTemplates = useMemo<WorkflowTemplate[]>(
     () => [...sortedSavedCards, ...BUILT_IN_TEMPLATES],
     [sortedSavedCards]
   )
-  const filteredTemplates = templateCategory === 'All'
+  const normalizedTemplateCategory: TemplateMediaFilter = TEMPLATE_MEDIA_FILTERS.includes(templateCategory as TemplateMediaFilter)
+    ? templateCategory as TemplateMediaFilter
+    : 'All'
+  const filteredTemplates = normalizedTemplateCategory === 'All'
     ? combinedTemplates
-    : combinedTemplates.filter((template) => template.category === templateCategory)
+    : combinedTemplates.filter((template) => templateMatchesMediaFilter(template, normalizedTemplateCategory))
   // [WorkflowList] Stable ordering policy — sort by `createdAt` desc (with id
   // tie-break). The Zustand `workflows` array is kept in insertion order; the
   // dashboard renders a derived `[...filtered]` snapshot here. This means
@@ -9410,8 +9615,9 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
 
   const handleRunWorkflow = async (workflow: Workflow) => {
     setActiveWorkflow(workflow.id)
-    if (!hasEnabledGenerateNode(workflow)) {
-      window.alert(WORKFLOW_REQUIRES_GENERATE_MESSAGE)
+    const runWarning = getWorkflowRunWarning(workflow)
+    if (runWarning) {
+      window.alert(runWarning)
       return
     }
     try {
@@ -9515,14 +9721,14 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-hidden p-4">
           <div className="flex items-center gap-3">
             <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
-              {templateCategories.map((category) => (
+              {TEMPLATE_MEDIA_FILTERS.map((category) => (
                 <button
                   type="button"
                   key={category}
                   onClick={() => setTemplateCategory(category)}
                   className={cn(
                     'h-8 shrink-0 rounded-lg px-3 text-[11px] font-medium transition-colors',
-                    templateCategory === category
+                    normalizedTemplateCategory === category
                       ? 'bg-[#7C5CFF]/15 text-[#B8A8FF]'
                       : 'bg-white/[0.04] text-white/45 hover:bg-white/[0.07] hover:text-white/75'
                   )}
@@ -9533,64 +9739,94 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
             </div>
           </div>
 
-          <div className="grid min-h-0 flex-1 grid-cols-[repeat(auto-fit,minmax(240px,1fr))] gap-3 overflow-y-auto pr-1">
-            {filteredTemplates.map((template) => {
-              const colors = NODE_COLORS[template.accent]
-              const isUserTemplate = template.source === 'user'
-              const hasCover = Boolean(template.thumbnail)
-              // [WorkflowTemplate] Two card shapes share one grid
-              // cell.
-              // - hasCover: content-flow layout, no `min-h-*`,
-              //   footer is `static mt-1 gap-2` and stays flush
-              //   below the tags. Cover image lives flush to the
-              //   card top (card has `overflow-hidden`). Built-in
-              //   text-only behaviour is intentionally NOT
-              //   affected — that layout still relies on the
-              //   `min-h-[190px]` + footer `mt-auto pt-4` pair.
-              // - !hasCover: original equal-height grid cell —
-              //   identical behaviour, identical class strings,
-              //   identical render output. Both branches share the
-              //   same cover div and inner-block markup when a
-              //   thumbnail exists.
-              const cardClass = hasCover
-                ? cn(
-                    'flex flex-col overflow-hidden rounded-lg border bg-[#171717] transition-colors hover:border-white/15',
-                    colors.border,
-                    'border-l-2 border-white/[0.06]'
-                  )
-                : cn(
-                    'flex min-h-[190px] flex-col overflow-hidden rounded-lg border bg-[#171717] p-4 transition-colors hover:border-white/15',
-                    colors.border,
-                    'border-l-2 border-white/[0.06]'
-                  )
-              const footerClass = hasCover
-                ? 'mt-1 flex items-center justify-between gap-2'
-                : 'mt-auto flex items-center justify-between pt-4'
+          {/* [WorkflowTemplate] Outer scroll container owns the
+              vertical scroll only. `overflow-x-hidden` guards
+              against the inner masonry overflowing horizontally
+              (CSS columns flow rightward by default, so any width
+              slip would otherwise produce a horizontal scrollbar).
+              `min-w-0` lets the flex item shrink to fit the column,
+              since `flex-1` alone has `min-width: auto` which would
+              otherwise keep it at content-min and overflow. */}
+          <div className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden pr-1">
+            {/* [WorkflowTemplate] Inner masonry container. It does
+                NOT own the scroll — its height grows with content.
+                CSS columns only balance correctly when the element
+                can grow vertically; if we put `columns-*` on the
+                same element that has a constrained height, the
+                browser fragments content into new columns to fit
+                the fixed height (the horizontal-flow bug). Keeping
+                columns on an auto-height inner div makes the
+                content flow top-to-bottom and let the OUTER
+                container handle vertical scrolling. */}
+            <div className="templates-masonry">
+              {filteredTemplates.map((template) => {
+                const colors = NODE_COLORS[template.accent]
+                const isUserTemplate = template.source === 'user'
+                const hasCover = Boolean(template.thumbnail)
+              // [WorkflowTemplate] Two card shapes share one column.
+              // - hasCover: <img className="block w-full h-auto"> at
+              //   the top — intrinsic ratio, no fixed container, no
+              //   object-cover. Title / category / description
+              //   overlay the cover (gradient + absolute bottom).
+              //   Body below is just tags + footer.
+              // - !hasCover: no hero placeholder — the body is the
+              //   whole card (header + description + tags + footer).
+              //
+              // The container uses CSS columns (masonry-style): tall
+              // portrait cards no longer stretch their grid row, so
+              // built-in text-only cards flow into the gap-free
+              // columns instead of being dragged into a ragged
+              // grid.
+              //
+              // Architecture: two layers.
+              //   - OUTER: scroll container with `flex-1`,
+              //     `overflow-y-auto`, `overflow-x-hidden`. It owns
+              //     vertical scrolling and blocks any horizontal
+              //     spill.
+              //   - INNER: auto-height `.templates-masonry` div with
+              //     `column-count: 1/2/3/4`. CSS columns only
+              //     balance correctly when the element can grow
+              //     vertically — putting `columns-*` on the same
+              //     element that has a constrained height (the
+              //     outer scroll container) would force content to
+              //     fragment into extra columns to fit the fixed
+              //     height. Keeping it on the auto-height inner
+              //     div makes content flow top-to-bottom and lets
+              //     the outer handle vertical scrolling.
+              //
+              // Each card is wrapped in a `.template-masonry-item`
+              // div carrying `break-inside-avoid` + `margin-bottom:
+              // 12px`. That keeps cards atomic across columns and
+              // gives a uniform vertical gap.
+              //
+              // `min-w-0` on the outer lets the flex item shrink
+              // below its content-min width — without it, the
+              // flex item has `min-width: auto` and would refuse
+              // to shrink, which previously manifested as a
+              // horizontal scrollbar at narrow viewports.
+              const cardClass = cn(
+                // [WorkflowTemplate] `w-full` keeps the card
+                // filling its column width. The `mb-3` and
+                // `break-inside-avoid` masonry glue lives on the
+                // outer wrapper (`.template-masonry-item`) so the
+                // spacing and break avoidance are independent of
+                // the card's own visual style. The wrapper is
+                // what CSS columns see; the card root just
+                // renders the visual.
+                'flex w-full flex-col overflow-hidden rounded-lg border bg-[#171717] transition-colors hover:border-white/15',
+                colors.border,
+                'border-l-2 border-white/[0.06]'
+              )
+              const footerClass = 'mt-1 flex items-center justify-between gap-2'
               return (
                 <div
                   key={template.id}
-                  className={cardClass}
+                  className="template-masonry-item mb-3 break-inside-avoid"
                 >
-                  {/* [WorkflowTemplate] Thumbnail cover. Sits flush
-                      at the card top — `overflow-hidden` on the
-                      card root clips the cover into the card's
-                      rounded corners. Description is `line-clamp-2`
-                      so a long template description cannot blow
-                      the card back out to tall heights. The cover
-                      is rendered inside the `hasCover` branch
-                      below, with title / category / description as
-                      an inset overlay so it matches the spec
-                      layout. The legacy standalone cover div
-                      used to live here — it's gone now. */}
-                  {/* [WorkflowTemplate] Cover cards wrap the rest
-                      of the body in a single padding block so the
-                      `mt-1` on the footer pins it just below the
-                      tags instead of filling the leftover vertical
-                      space. Text-only cards render the body flat
-                      like before, no wrapper div, so the original
-                      min-h + mt-auto behaviour is preserved
-                      pixel-for-pixel. */}
-                  {hasCover ? (
+                  <div
+                    className={cardClass}
+                  >
+{hasCover ? (
                     <>
                       {/* [WorkflowTemplate] Cover image with title /
                           category badge / saved-description rendered
@@ -9600,12 +9836,25 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                           JPEG. Tags + footer live below the cover
                           (not floating on the image) so the
                           action row stays crisp on the dark card
-                          background. */}
-                      <div className="relative aspect-video h-full overflow-hidden border-b border-white/[0.06] bg-[#111]">
+                          background.
+
+                          The cover sizes itself from the
+                          thumbnail's intrinsic ratio: the `<img>`
+                          is `w-full h-auto` (no `aspect-video`,
+                          no `object-cover`, no `max-height`) so a
+                          9:16 portrait renders as a 9:16 cover and
+                          a 16:9 landscape renders as a 16:9 cover.
+                          `aspect-video` and `object-cover` were
+                          cropping portrait thumbnails because they
+                          forced the container to a fixed 16:9 frame
+                          regardless of the source image. With
+                          intrinsic sizing, every thumbnail renders
+                          full-frame with no letterboxing or crop. */}
+                      <div className="relative w-full overflow-hidden border-b border-white/[0.06] bg-[#111]">
                         <img
                           src={template.thumbnail}
                           alt={`${template.name} preview`}
-                          className="h-full w-full object-cover"
+                          className="block h-auto w-full"
                           draggable={false}
                         />
                         <div
@@ -9674,67 +9923,83 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                     </>
                   ) : (
                     <>
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-2">
-                            <Sparkles className={cn('h-4 w-4', colors.text)} />
-                            <h3 className="truncate text-[12px] font-medium text-white/80">{template.name}</h3>
+                      {/* [WorkflowTemplate] Text-only card for
+                          templates with no thumbnail (built-ins,
+                          plus saved templates whose source nodes
+                          could not be resolved). No hero placeholder
+                          — the body wraps directly to a compact
+                          padded block so the card height is driven
+                          by content (header + description + tags +
+                          footer). The Sparkles accent sits inline
+                          with the title instead of inside a giant
+                          empty block. */}
+                      <div className="flex flex-col gap-3 p-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <Sparkles className={cn('h-4 w-4', colors.text)} />
+                              <h3 className="truncate text-[12px] font-medium text-white/80">{template.name}</h3>
+                            </div>
+                            <p className="mt-1 line-clamp-2 text-[11px] leading-[18px] text-white/40">{template.description}</p>
                           </div>
-                          <p className="mt-1 line-clamp-2 text-[11px] leading-[18px] text-white/40">{template.description}</p>
-                        </div>
-                        <span className="rounded-md bg-white/[0.05] px-2 py-1 text-[10px] font-medium text-white/40">
-                          {template.category}
-                        </span>
-                      </div>
-
-                      <div className="mt-4 flex flex-wrap gap-1.5">
-                        {template.tags.map((tag) => (
-                          <span key={tag} className="rounded-md bg-white/[0.05] px-2 py-1 text-[10px] text-white/35">
-                            {tag}
-                          </span>
-                        ))}
-                      </div>
-
-                      <div className={footerClass}>
-                        <div className="flex items-center gap-3 text-[11px] text-white/30">
-                          <span className="inline-flex items-center gap-1">
-                            <WorkflowIcon className="h-3 w-3" aria-hidden="true" />
-                            {template.nodes.length} nodes
-                          </span>
-                          <span className="inline-flex items-center gap-1">
-                            <Zap className="h-3 w-3" aria-hidden="true" />
-                            {template.edges.length} links
+                          <span className="rounded-md bg-white/[0.05] px-2 py-1 text-[10px] font-medium text-white/40">
+                            {template.category}
                           </span>
                         </div>
-                        <div className="flex items-center gap-1.5">
-                          {isUserTemplate && (
+
+                        {template.tags.length > 0 && (
+                          <div className="flex flex-wrap gap-1.5">
+                            {template.tags.map((tag) => (
+                              <span key={tag} className="rounded-md bg-white/[0.05] px-2 py-1 text-[10px] text-white/35">
+                                {tag}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+
+                        <div className={footerClass}>
+                          <div className="flex items-center gap-3 text-[11px] text-white/30">
+                            <span className="inline-flex items-center gap-1">
+                              <WorkflowIcon className="h-3 w-3" aria-hidden="true" />
+                              {template.nodes.length} nodes
+                            </span>
+                            <span className="inline-flex items-center gap-1">
+                              <Zap className="h-3 w-3" aria-hidden="true" />
+                              {template.edges.length} links
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            {isUserTemplate && (
+                              <button
+                                type="button"
+                                title="Delete template"
+                                onClick={() => {
+                                  const saved = savedTemplates.find((t) => t.id === template.id)
+                                  if (saved) setDeleteConfirmTemplate(saved)
+                                }}
+                                className="flex h-8 w-8 items-center justify-center rounded-lg text-white/35 transition-colors hover:bg-rose-500/15 hover:text-rose-200"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            )}
                             <button
                               type="button"
-                              title="Delete template"
-                              onClick={() => {
-                                const saved = savedTemplates.find((t) => t.id === template.id)
-                                if (saved) setDeleteConfirmTemplate(saved)
-                              }}
-                              className="flex h-8 w-8 items-center justify-center rounded-lg text-white/35 transition-colors hover:bg-rose-500/15 hover:text-rose-200"
+                              onClick={() => handleUseTemplate(template)}
+                              className="flex h-8 items-center gap-1.5 rounded-lg bg-[#7C5CFF]/15 px-3 text-[11px] font-medium text-[#B8A8FF] transition-colors hover:bg-[#7C5CFF]/25"
                             >
-                              <Trash2 className="h-3.5 w-3.5" />
+                              <Play className="h-3.5 w-3.5" />
+                              Use
                             </button>
-                          )}
-                          <button
-                            type="button"
-                            onClick={() => handleUseTemplate(template)}
-                            className="flex h-8 items-center gap-1.5 rounded-lg bg-[#7C5CFF]/15 px-3 text-[11px] font-medium text-[#B8A8FF] transition-colors hover:bg-[#7C5CFF]/25"
-                          >
-                            <Play className="h-3.5 w-3.5" />
-                            Use
-                          </button>
+                          </div>
                         </div>
                       </div>
                     </>
                   )}
+                  </div>
                 </div>
               )
             })}
+            </div>
           </div>
         </div>
       )}

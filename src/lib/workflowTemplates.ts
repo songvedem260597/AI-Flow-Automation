@@ -48,16 +48,17 @@
  * resolution. The whole point is quota safety.
  */
 import type { Workflow, WorkflowNode, WorkflowEdge } from '@/types'
+import { getAsset } from '@/lib/assets/assetStore'
 
 const TEMPLATE_STORAGE_KEY = 'ai-flow-workflow-templates'
 
-const THUMBNAIL_MAX_WIDTH = 320
-const THUMBNAIL_MAX_HEIGHT = 180
-const THUMBNAIL_QUALITY = 0.75
+const THUMBNAIL_MAX_WIDTH = 720
+const THUMBNAIL_MAX_HEIGHT = 720
+const THUMBNAIL_QUALITY = 0.82
 const THUMBNAIL_TIMEOUT_MS = 6000
 
 // [WorkflowTemplate] Per-node preview caps. We keep this looser
-// than the card thumbnail (1024 vs 320) because the preview has to
+// than the card thumbnail (1024 vs 720) because the preview has to
 // survive a 100% zoom on the canvas. JPEG q=0.75 stays the same.
 // Worst-case 1024×1024 JPEG ≈ ~120 KB; 3-4 image-bearing nodes
 // still stay well under the chrome.storage.local per-entry quota.
@@ -122,6 +123,56 @@ const URL_FIELDS_IN_OUTPUT = new Set([
   'thumbnailUrl',
   'poster'
 ])
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+
+const ASSET_IMAGE_POINTER_FIELDS = [
+  'assetId',
+  'mediaAssetId',
+  'imageAssetId',
+  'thumbnailAssetId',
+  'templateAssetId'
+]
+
+const ASSET_POSTER_POINTER_FIELDS = [
+  'posterAssetId',
+  'thumbnailAssetId',
+  'templateAssetId'
+]
+
+async function readImageAssetDataUrl(assetId: unknown): Promise<string> {
+  if (typeof assetId !== 'string' || !assetId.startsWith('asset_')) return ''
+  try {
+    const asset = await getAsset(assetId)
+    if (!asset) return ''
+    const mimeType = asset.mimeType || asset.blob.type || ''
+    if (asset.kind === 'video') return ''
+    if (mimeType && !mimeType.startsWith('image/')) return ''
+    return await blobToDataUrl(asset.blob)
+  } catch {
+    return ''
+  }
+}
+
+async function firstImageAssetDataUrl(
+  record: Record<string, unknown>,
+  fields: readonly string[]
+): Promise<string> {
+  for (const field of fields) {
+    const dataUrl = await readImageAssetDataUrl(record[field])
+    if (dataUrl) return dataUrl
+  }
+  return ''
+}
+
+function readFirstStringField(record: Record<string, unknown>, fields: readonly string[]): string {
+  for (const field of fields) {
+    const value = record[field]
+    if (typeof value === 'string' && value.length > 0) return value
+  }
+  return ''
+}
 
 export interface UserWorkflowTemplate {
   id: string
@@ -219,6 +270,76 @@ function pickCandidateImageUrl(node: WorkflowNode): string {
     if (typeof c === 'string' && c.length > 0) return c
   }
   return ''
+}
+
+async function pickCandidateImageUrlWithAssets(node: WorkflowNode): Promise<string> {
+  const data = isRecord(node.data) ? node.data : {}
+  const nodeType = String(node.type || '')
+
+  if (nodeType === 'image') {
+    const mediaType = String(data.mediaType || '').toLowerCase()
+    if (mediaType === 'video') {
+      const posterAsset = await firstImageAssetDataUrl(data, ASSET_POSTER_POINTER_FIELDS)
+      if (posterAsset) return posterAsset
+      const poster = readFirstStringField(data, ['templateVideoPoster', 'videoPoster', 'mediaPoster', 'thumbnailUrl', 'poster'])
+      if (poster) return poster
+      return pickCandidateImageUrl(node)
+    }
+    const asset = await firstImageAssetDataUrl(data, ASSET_IMAGE_POINTER_FIELDS)
+    if (asset) return asset
+    return pickCandidateImageUrl(node)
+  }
+
+  if (nodeType === 'generate') {
+    const outputContainers: unknown[] = [
+      data.outputs,
+      isRecord(data._output) ? data._output.outputs : undefined
+    ]
+    for (const container of outputContainers) {
+      if (!Array.isArray(container)) continue
+      for (const raw of container) {
+        if (!isRecord(raw)) continue
+        if (raw.outputAvailable === false) continue
+        const mediaType = String(raw.mediaType || '').toLowerCase()
+        if (mediaType === 'video') {
+          const posterAsset = await firstImageAssetDataUrl(raw, ASSET_POSTER_POINTER_FIELDS)
+          if (posterAsset) return posterAsset
+          const poster = readFirstStringField(raw, ['thumbnailUrl', 'poster', 'imageUrl', 'mediaUrl', 'url'])
+          if (poster) return poster
+          continue
+        }
+        const asset = await firstImageAssetDataUrl(raw, ASSET_IMAGE_POINTER_FIELDS)
+        if (asset) return asset
+        for (const field of URL_FIELDS_IN_OUTPUT) {
+          const v = raw[field]
+          if (typeof v === 'string' && v.length > 0) return v
+        }
+      }
+    }
+
+    for (const flatImages of [
+      data.imageUrls,
+      isRecord(data._output) ? data._output.imageUrls : undefined
+    ]) {
+      if (!Array.isArray(flatImages)) continue
+      for (const v of flatImages) {
+        if (typeof v === 'string' && v.length > 0) return v
+      }
+    }
+
+    const dataPosterAsset = await firstImageAssetDataUrl(data, ASSET_POSTER_POINTER_FIELDS)
+    if (dataPosterAsset) return dataPosterAsset
+    const outputRecord = isRecord(data._output) ? data._output : undefined
+    if (outputRecord) {
+      const outputPosterAsset = await firstImageAssetDataUrl(outputRecord, ASSET_POSTER_POINTER_FIELDS)
+      if (outputPosterAsset) return outputPosterAsset
+    }
+    return pickCandidateImageUrl(node)
+  }
+
+  const asset = await firstImageAssetDataUrl(data, ASSET_IMAGE_POINTER_FIELDS)
+  if (asset) return asset
+  return pickCandidateImageUrl(node)
 }
 
 /**
@@ -366,6 +487,61 @@ function pickImageNodePreviewSource(node: WorkflowNode): { kind: 'image' | 'vide
   return null
 }
 
+async function pickImageNodePreviewSourceWithAssets(
+  node: WorkflowNode
+): Promise<{ kind: 'image' | 'video'; url: string } | null> {
+  const data = isRecord(node.data) ? node.data : {}
+  const explicitMediaType = String(data.mediaType || '').toLowerCase()
+  const nodeType = String(node.type || '')
+
+  if (nodeType === 'generate') {
+    const outputContainers: unknown[] = [
+      data.outputs,
+      isRecord(data._output) ? data._output.outputs : undefined
+    ]
+    for (const container of outputContainers) {
+      if (!Array.isArray(container)) continue
+      for (const raw of container) {
+        if (!isRecord(raw)) continue
+        if (raw.outputAvailable === false) continue
+        const mediaType = String(raw.mediaType || '').toLowerCase()
+        if (mediaType === 'video') {
+          const posterAsset = await firstImageAssetDataUrl(raw, ASSET_POSTER_POINTER_FIELDS)
+          if (posterAsset) return { kind: 'video', url: posterAsset }
+          const poster = readFirstStringField(raw, ['thumbnailUrl', 'poster', 'imageUrl', 'mediaUrl', 'url'])
+          if (poster) return { kind: 'video', url: poster }
+          continue
+        }
+        const asset = await firstImageAssetDataUrl(raw, ASSET_IMAGE_POINTER_FIELDS)
+        if (asset) return { kind: 'image', url: asset }
+        for (const field of URL_FIELDS_IN_OUTPUT) {
+          const v = raw[field]
+          if (typeof v === 'string' && v.length > 0) {
+            return { kind: mediaType === 'video' ? 'video' : 'image', url: v }
+          }
+        }
+      }
+    }
+  }
+
+  if (nodeType === 'image') {
+    if (explicitMediaType === 'video') {
+      const posterAsset = await firstImageAssetDataUrl(data, ASSET_POSTER_POINTER_FIELDS)
+      if (posterAsset) return { kind: 'video', url: posterAsset }
+      const poster = readFirstStringField(data, ['templateVideoPoster', 'videoPoster', 'mediaPoster', 'thumbnailUrl', 'poster'])
+      if (poster) return { kind: 'video', url: poster }
+      return pickImageNodePreviewSource(node)
+    }
+    const asset = await firstImageAssetDataUrl(data, ASSET_IMAGE_POINTER_FIELDS)
+    if (asset) return { kind: 'image', url: asset }
+    return pickImageNodePreviewSource(node)
+  }
+
+  const asset = await firstImageAssetDataUrl(data, ASSET_IMAGE_POINTER_FIELDS)
+  if (asset) return { kind: 'image', url: asset }
+  return pickImageNodePreviewSource(node)
+}
+
 /**
  * [WorkflowTemplate] Downscale an arbitrary source URL into a JPEG
  * data URL sized into PREVIEW_MAX_SIDE × PREVIEW_MAX_SIDE. Mirrors
@@ -455,7 +631,7 @@ export async function extractImageNodePreviews(
   const out = new Map<string, { dataUrl: string; kind: 'image' | 'video' }>()
   let totalBytes = 0
   for (const node of workflow.nodes) {
-    const source = pickImageNodePreviewSource(node)
+    const source = await pickImageNodePreviewSourceWithAssets(node)
     if (!source) continue
     const dataUrl = await urlToPreviewDataUrl(source.url)
     if (!dataUrl) continue
@@ -529,7 +705,7 @@ export async function extractWorkflowThumbnailWithSource(
     ...workflow.nodes.filter((n) => n.type !== 'image' && n.type !== 'generate')
   ]
   for (const node of orderedNodes) {
-    const candidate = pickCandidateImageUrl(node)
+    const candidate = await pickCandidateImageUrlWithAssets(node)
     if (!candidate) continue
     const dataUrl = await urlToResizedDataUrl(candidate)
     if (dataUrl) return { dataUrl, sourceNodeId: node.id }
@@ -803,6 +979,15 @@ export function onWorkflowTemplatesChanged(
 
 export const WORKFLOW_TEMPLATE_STORAGE_KEY = TEMPLATE_STORAGE_KEY
 
+function readTemplateNodePreview(node: WorkflowNode): string {
+  const data = isRecord(node.data) ? node.data : {}
+  const inline = data.templateImagePreview
+  if (typeof inline === 'string' && inline.trim().length > 0) return inline
+  const poster = data.templateVideoPoster
+  if (typeof poster === 'string' && poster.trim().length > 0) return poster
+  return ''
+}
+
 /**
  * [WorkflowTemplate] Card-cover thumbnail resolver. Walks the
  * stored template in this order and returns the first non-empty
@@ -829,19 +1014,23 @@ export const WORKFLOW_TEMPLATE_STORAGE_KEY = TEMPLATE_STORAGE_KEY
  * the Templates tab then renders the regular text-only card.
  */
 export function resolveTemplateCardThumbnail(
-  template: Pick<UserWorkflowTemplate, 'thumbnail' | 'workflow'>
+  template: Pick<UserWorkflowTemplate, 'thumbnail' | 'thumbnailSourceNodeId' | 'workflow'>
 ): string | undefined {
-  const direct = template.thumbnail
-  if (typeof direct === 'string' && direct.trim().length > 0) return direct
+  if (template.thumbnailSourceNodeId) {
+    const sourceNode = template.workflow.nodes.find((node) => node.id === template.thumbnailSourceNodeId)
+    if (sourceNode) {
+      const sourcePreview = readTemplateNodePreview(sourceNode)
+      if (sourcePreview) return sourcePreview
+    }
+  }
 
   for (const node of template.workflow.nodes) {
-    const data = node.data as Record<string, unknown>
-    if (!data || typeof data !== 'object') continue
-    const inline = data.templateImagePreview
-    if (typeof inline === 'string' && inline.trim().length > 0) return inline
-    const poster = data.templateVideoPoster
-    if (typeof poster === 'string' && poster.trim().length > 0) return poster
+    const preview = readTemplateNodePreview(node)
+    if (preview) return preview
   }
+
+  const direct = template.thumbnail
+  if (typeof direct === 'string' && direct.trim().length > 0) return direct
 
   // [WorkflowTemplate] URL paste fallback — only accept
   // URLs that survive a tab swap. `blob:` and `data:` URLs are

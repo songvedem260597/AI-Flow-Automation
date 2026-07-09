@@ -2982,3 +2982,38 @@ button.df-node-tag {
   border-left: 1px solid rgba(255, 255, 255, 0.08);
   margin-left: 2px;
 }
+
+@layer components {
+  /* [WorkflowTemplate] Masonry container — CSS columns flow into
+   * auto-height. The OUTER scroll container handles overflow-y.
+   * Without this split, putting columns-* on a flex-1 element
+   * fragments content rightward instead of letting the column
+   * stack grow downward. */
+  .templates-masonry {
+    column-count: 1;
+    column-gap: 12px;
+    width: 100%;
+  }
+  @media (min-width: 640px) {
+    .templates-masonry { column-count: 2; }
+  }
+  @media (min-width: 1024px) {
+    .templates-masonry { column-count: 3; }
+  }
+  @media (min-width: 1536px) {
+    .templates-masonry { column-count: 4; }
+  }
+
+  /* Each card sits in its own .template-masonry-item wrapper so
+   * break-inside-avoid and the inter-card margin are independent
+   * of the card's own visual styling. width: 100% makes the
+   * wrapper fill its column track. */
+  .template-masonry-item {
+    break-inside: avoid;
+    margin-bottom: 12px;
+    width: 100%;
+  }
+  .template-masonry-item > * {
+    width: 100%;
+  }
+}

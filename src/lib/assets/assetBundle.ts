@@ -98,6 +98,8 @@ export interface ImportBundleResult {
 const isRecord = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v)
 
+const MAX_ASSET_SCAN_DEPTH = 64
+
 /**
  * Walk the workflow looking for every `asset_<id>` pointer. Limit
  * the recursion depth so a malicious / huge nested array cannot
@@ -105,20 +107,21 @@ const isRecord = (v: unknown): v is Record<string, unknown> =>
  */
 const collectWorkflowAssetIds = (workflow: Workflow): string[] => {
   const ids = new Set<string>()
-  const stack: unknown[] = []
-  let depth = 0
+  const stack: Array<{ value: unknown; depth: number }> = []
 
-  if (Array.isArray(workflow.nodes)) stack.push(...workflow.nodes)
+  if (Array.isArray(workflow.nodes)) stack.push({ value: workflow.nodes, depth: 0 })
   // Edges can theoretically carry media paths one day — scan
   // them too, but they're typically empty.
-  if (Array.isArray(workflow.edges)) stack.push(...workflow.edges)
+  if (Array.isArray(workflow.edges)) stack.push({ value: workflow.edges, depth: 0 })
 
-  while (stack.length && depth < 64) {
-    depth += 1
-    const current = stack.pop()
+  while (stack.length) {
+    const { value: current, depth } = stack.pop()!
+    if (depth > MAX_ASSET_SCAN_DEPTH) continue
     if (!current || typeof current !== 'object') continue
     if (Array.isArray(current)) {
-      stack.push(...current)
+      for (const value of current) {
+        stack.push({ value, depth: depth + 1 })
+      }
       continue
     }
     const record = current as Record<string, unknown>
@@ -131,7 +134,7 @@ const collectWorkflowAssetIds = (workflow: Workflow): string[] => {
       // those are media URLs (http(s)/blob:/data:) and the renderer
       // falls back to them if the asset pointer is missing.
       if (value && typeof value === 'object') {
-        stack.push(value)
+        stack.push({ value, depth: depth + 1 })
       }
     }
   }
