@@ -8,7 +8,10 @@
     "build": "node prebuild.js && plasmo build && node postbuild.js",
     "package": "node prebuild.js && plasmo package && node postbuild.js",
     "test:e2e:chatgpt": "node scripts/e2e-chatgpt-extension.mjs",
-    "test:e2e:chatgpt:interactive": "node scripts/e2e-chatgpt-extension.mjs --interactive"
+    "test:e2e:chatgpt:interactive": "node scripts/e2e-chatgpt-extension.mjs --interactive",
+    "test:e2e:templates": "node scripts/e2e-template-layout.mjs --non-interactive",
+    "test:e2e:templates:existing": "node scripts/e2e-template-layout.mjs --use-existing-storage --non-interactive",
+    "test:e2e:templates:1229": "node scripts/e2e-template-layout.mjs --use-existing-storage --non-interactive --viewport=1229x768,1229x900,1229x1080"
   },
   "dependencies": {
     "@floating-ui/dom": "^1.7.6",

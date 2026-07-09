@@ -768,6 +768,33 @@ function templateMatchesMediaFilter(template: WorkflowTemplate, filter: Template
   return templateHasImageMedia(template) && !templateHasVideoMedia(template)
 }
 
+// [WorkflowTemplate] JS-masonry constants. The card width target is
+// shared between the runtime ResizeObserver (which decides how many
+// columns to render) and the e2e test (which asserts the column
+// count for a given viewport). Keep these in sync if either side
+// changes.
+const MIN_TEMPLATE_CARD_WIDTH = 240
+const TEMPLATE_CARD_GAP = 12
+const MAX_TEMPLATE_COLUMNS = 4
+
+// [WorkflowTemplate] Round-robin distribution. We do NOT use
+// shortest-column here because that would need a pre-measured
+// height estimate per card; without one, shortest-column is no
+// better than round-robin and round-robin is fully predictable
+// (card[0] -> column[0]). The critical property is: when
+// `templates.length <= columnCount`, every card lands in its own
+// column and no column is left empty — the bug CSS columns
+// `column-fill: balance` produced at viewport 1229 (3 saved cards
+// collapsed into 2 visual columns with ≈258px of dead right area).
+function distributeTemplatesIntoColumns<T>(templates: T[], columnCount: number): T[][] {
+  const cols = Math.max(1, columnCount)
+  const out: T[][] = Array.from({ length: cols }, () => [])
+  templates.forEach((tpl, i) => {
+    out[i % cols].push(tpl)
+  })
+  return out
+}
+
 const BUILT_IN_TEMPLATES: WorkflowTemplate[] = [
   {
     id: 'flow-image-basic',
@@ -9114,6 +9141,41 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   const [view, setView] = usePersistedState<WorkflowShellView>('workflow.view', workflows.length > 0 ? 'workflows' : 'templates')
   const [templateCategory, setTemplateCategory] = usePersistedState<string>('workflow.templateCategory', 'All')
   const [workflowSearch, setWorkflowSearch] = useState('')
+  // [WorkflowTemplate] JS masonry: ref to the templates scroll
+  // container (the OUTER element that owns `overflow-y-auto`).
+  // We measure this container's clientWidth to decide the
+  // flex-column count. The container itself becomes a vertical
+  // scroll viewport; the JS masonry flex row lives INSIDE it.
+  const templatesScrollRef = useRef<HTMLDivElement | null>(null)
+  const [templateColumnCount, setTemplateColumnCount] = useState<number>(1)
+  // [WorkflowTemplate] ResizeObserver drives
+  // `templateColumnCount`. We measure on every layout-affecting
+  // change (panel resize, side-panel open/close, viewport drag)
+  // so the flex row updates without a page reload. The observer
+  // is attached only while the Templates view is mounted, so
+  // flipping to the Workflows tab tears it down and avoids the
+  // observer leak that would otherwise fire on Workflow-canvas
+  // resizes.
+  useEffect(() => {
+    if (view !== 'templates') return
+    const el = templatesScrollRef.current
+    if (!el) return
+    const compute = () => {
+      const w = el.clientWidth
+      const n = Math.max(
+        1,
+        Math.min(
+          MAX_TEMPLATE_COLUMNS,
+          Math.floor((w + TEMPLATE_CARD_GAP) / (MIN_TEMPLATE_CARD_WIDTH + TEMPLATE_CARD_GAP))
+        )
+      )
+      setTemplateColumnCount((prev) => (prev === n ? prev : n))
+    }
+    compute()
+    const ro = new ResizeObserver(() => compute())
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [view])
   // [WorkflowEditor] Clear multi-select when leaving the Workflows
   // view. Selection is meaningful only inside the list UI; carrying
   // it across view changes would select stale ids and surprise the
@@ -9500,6 +9562,15 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   const filteredTemplates = normalizedTemplateCategory === 'All'
     ? combinedTemplates
     : combinedTemplates.filter((template) => templateMatchesMediaFilter(template, normalizedTemplateCategory))
+  // [WorkflowTemplate] Distribute filtered templates into N columns
+  // for the JS masonry. Round-robin so a card count `<= columnCount`
+  // guarantees every column gets exactly one card (no empty column).
+  // Memoized on the same inputs as the rendered list so re-renders
+  // that don't change the list or column count skip the work.
+  const templateColumns = useMemo(
+    () => distributeTemplatesIntoColumns(filteredTemplates, templateColumnCount),
+    [filteredTemplates, templateColumnCount]
+  )
   // [WorkflowList] Stable ordering policy — sort by `createdAt` desc (with id
   // tie-break). The Zustand `workflows` array is kept in insertion order; the
   // dashboard renders a derived `[...filtered]` snapshot here. This means
@@ -9894,28 +9965,36 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
 
           {/* [WorkflowTemplate] Outer scroll container owns the
               vertical scroll only. `overflow-x-hidden` guards
-              against the inner masonry overflowing horizontally
-              (CSS columns flow rightward by default, so any width
-              slip would otherwise produce a horizontal scrollbar).
+              against any inner element overflowing horizontally.
               `min-w-0` lets the flex item shrink to fit the column,
               since `flex-1` alone has `min-width: auto` which would
-              otherwise keep it at content-min and overflow. */}
-          <div className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden pr-1">
-            {/* [WorkflowTemplate] Inner masonry container. It does
-                NOT own the scroll — its height grows with content.
-                CSS columns only balance correctly when the element
-                can grow vertically; if we put `columns-*` on the
-                same element that has a constrained height, the
-                browser fragments content into new columns to fit
-                the fixed height (the horizontal-flow bug). Keeping
-                columns on an auto-height inner div makes the
-                content flow top-to-bottom and let the OUTER
-                container handle vertical scrolling. */}
+              otherwise keep it at content-min and overflow.
+              `templatesScrollRef` is observed by a ResizeObserver
+              that drives `templateColumnCount` for the JS masonry
+              below. */}
+          <div
+            ref={templatesScrollRef}
+            className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden pr-1"
+          >
+            {/* [WorkflowTemplate] Inner JS masonry — a flex row of N
+                equal-width columns. Each column stacks cards top-to-
+                bottom. This replaced the previous CSS-columns
+                implementation because `column-fill: balance` left
+                columns empty when card count < `column-count` (e.g.
+                3 saved cards at 1229px collapsed into 2 columns with
+                column 3 unused → ≈258px dead right area). Round-robin
+                distribution guarantees every column gets at least one
+                card whenever the count permits it. */}
             <div className="templates-masonry">
-              {filteredTemplates.map((template) => {
-                const colors = NODE_COLORS[template.accent]
-                const isUserTemplate = template.source === 'user'
-                const hasCover = Boolean(template.thumbnail)
+              {templateColumns.map((column, columnIndex) => (
+                <div
+                  key={`templates-col-${columnIndex}`}
+                  className="templates-masonry-column"
+                >
+                  {column.map((template) => {
+                    const colors = NODE_COLORS[template.accent]
+                    const isUserTemplate = template.source === 'user'
+                    const hasCover = Boolean(template.thumbnail)
               // [WorkflowTemplate] Two card shapes share one column.
               // - hasCover: <img className="block w-full h-auto"> at
               //   the top — intrinsic ratio, no fixed container, no
@@ -9974,7 +10053,7 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
               return (
                 <div
                   key={template.id}
-                  className="template-masonry-item mb-3 break-inside-avoid"
+                  className="flex w-full"
                 >
                   <div
                     className={cardClass}
@@ -10156,6 +10235,8 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                 </div>
               )
             })}
+                </div>
+              ))}
             </div>
           </div>
         </div>
