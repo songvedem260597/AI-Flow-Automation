@@ -9,6 +9,7 @@ import type { AIProvider, FlowNodeData, FlowNodeType, Workflow, WorkflowEdge, Wo
 import {
   ArrowLeft,
   Check,
+  CheckSquare,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -764,7 +765,7 @@ function templateHasImageMedia(template: WorkflowTemplate): boolean {
 function templateMatchesMediaFilter(template: WorkflowTemplate, filter: TemplateMediaFilter): boolean {
   if (filter === 'All') return true
   if (filter === 'Video') return templateHasVideoMedia(template)
-  return templateHasImageMedia(template)
+  return templateHasImageMedia(template) && !templateHasVideoMedia(template)
 }
 
 const BUILT_IN_TEMPLATES: WorkflowTemplate[] = [
@@ -9113,6 +9114,19 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   const [view, setView] = usePersistedState<WorkflowShellView>('workflow.view', workflows.length > 0 ? 'workflows' : 'templates')
   const [templateCategory, setTemplateCategory] = usePersistedState<string>('workflow.templateCategory', 'All')
   const [workflowSearch, setWorkflowSearch] = useState('')
+  // [WorkflowEditor] Clear multi-select when leaving the Workflows
+  // view. Selection is meaningful only inside the list UI; carrying
+  // it across view changes would select stale ids and surprise the
+  // user when they return. We track the previous view in a ref
+  // (transition detector) so this fires only on actual view
+  // changes, not on every selection mutation while staying on the
+  // same view.
+  const previousViewRef = useRef<WorkflowShellView>(view)
+  useEffect(() => {
+    if (previousViewRef.current === view) return
+    previousViewRef.current = view
+    if (view !== 'workflows') setSelectedWorkflowIds([])
+  }, [view])
   // [WorkflowTemplate] Saved templates pulled from
   // chrome.storage.local `ai-flow-workflow-templates`. Refreshed on
   // mount, on chrome.storage.onChanged, and on tab-focus inside the
@@ -9121,6 +9135,19 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   const [savedTemplates, setSavedTemplates] = useState<UserWorkflowTemplate[]>([])
   const [deleteConfirmTemplate, setDeleteConfirmTemplate] = useState<UserWorkflowTemplate | null>(null)
   const [deleteConfirmWorkflow, setDeleteConfirmWorkflow] = useState<Workflow | null>(null)
+  // [WorkflowEditor] Multi-select for bulk delete. Array (not Set)
+  // so the state is serializable / debuggable. Holds the IDs of
+  // currently selected workflow cards. Selection is local UI state
+  // (not persisted): it must reset when the user leaves the
+  // Workflows view or switches tabs.
+  const [selectedWorkflowIds, setSelectedWorkflowIds] = useState<string[]>([])
+  const [bulkDeleteConfirmOpen, setBulkDeleteConfirmOpen] = useState(false)
+  // [EscapeRef] Ref-mirror for `clearWorkflowSelection` so the
+  // Escape keydown handler (declared higher in the component,
+  // before the multi-select handlers exist) can always read the
+  // latest callback. The ref is kept current by a sibling effect
+  // below.
+  const clearSelectionRef = useRef<(() => void) | null>(null)
   const [renameWorkflow, setRenameWorkflow] = useState<Workflow | null>(null)
   const [renameDraft, setRenameDraft] = useState('')
   const renameInputRef = useRef<HTMLInputElement>(null)
@@ -9316,27 +9343,71 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   }, [hydrateFromStorage])
 
   useEffect(() => {
-    if (!deleteConfirmWorkflow && !renameWorkflow && !deleteConfirmTemplate) return
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
+      if (event.key !== 'Escape') return
+      // [WorkflowEditor] Escape precedence: most-specific modal
+      // wins, then the bare selection. A top-level Escape with
+      // no modal open deselects the multi-selected cards.
+      if (renameWorkflow) {
         event.stopPropagation()
-        if (renameWorkflow) {
-          handleCancelRenameWorkflow()
-        } else if (deleteConfirmTemplate) {
-          setDeleteConfirmTemplate(null)
-        } else if (deleteConfirmWorkflow) {
-          setDeleteConfirmWorkflow(null)
-        }
-      } else if (event.key === 'Enter' && renameWorkflow) {
-        const target = event.target as HTMLElement | null
-        if (target && target.tagName === 'TEXTAREA') return
-        event.preventDefault()
-        handleConfirmRenameWorkflow()
+        handleCancelRenameWorkflow()
+      } else if (deleteConfirmTemplate) {
+        event.stopPropagation()
+        setDeleteConfirmTemplate(null)
+      } else if (deleteConfirmWorkflow) {
+        event.stopPropagation()
+        setDeleteConfirmWorkflow(null)
+      } else if (bulkDeleteConfirmOpen) {
+        event.stopPropagation()
+        // Bulk delete Escape — close the modal without
+        // deleting. The selection is preserved so the user can
+        // keep working without re-selecting after cancelling.
+        setBulkDeleteConfirmOpen(false)
+      } else if (
+        selectedWorkflowIds.length > 0
+        && view === 'workflows'
+        && !renameWorkflow
+        && !deleteConfirmTemplate
+        && !deleteConfirmWorkflow
+      ) {
+        // [WorkflowEditor] Top-level Escape clears the multi-
+        // selection when no modal is open. Matches the
+        // Gmail / Inbox convention: pressing Escape in a list
+        // view with items selected deselects instead of going
+        // back / closing anything.
+        event.stopPropagation()
+        // [EscapeRef] `clearWorkflowSelection` is declared
+        // further down in this component (after this effect).
+        // We read from a ref that mirrors the callback so the
+        // effect can stay positioned above the handler block.
+        clearSelectionRef.current?.()
       }
     }
-    document.addEventListener('keydown', handleKeyDown, true)
-    return () => document.removeEventListener('keydown', handleKeyDown, true)
-  }, [deleteConfirmWorkflow, deleteConfirmTemplate, renameWorkflow, renameDraft])
+    const handleEnter = (event: KeyboardEvent) => {
+      if (event.key !== 'Enter' || !renameWorkflow) return
+      const target = event.target as HTMLElement | null
+      if (target && target.tagName === 'TEXTAREA') return
+      event.preventDefault()
+      handleConfirmRenameWorkflow()
+    }
+    const onKey = (event: KeyboardEvent) => {
+      handleKeyDown(event)
+      handleEnter(event)
+    }
+    document.addEventListener('keydown', onKey, true)
+    return () => document.removeEventListener('keydown', onKey, true)
+  }, [
+    deleteConfirmWorkflow,
+    deleteConfirmTemplate,
+    renameWorkflow,
+    renameDraft,
+    bulkDeleteConfirmOpen,
+    selectedWorkflowIds.length,
+    view,
+    // `clearWorkflowSelection` is read via `clearSelectionRef`
+    // above, so it doesn't belong in deps. The ref is kept
+    // up-to-date in a sibling effect.
+  ])
 
   useEffect(() => {
     if (!renameWorkflow) return
@@ -9563,6 +9634,88 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
       setView('workflows')
     }
   }
+
+  // [WorkflowEditor] Multi-select handlers. Pure local state
+  // mutations; never touch `deleteWorkflow` here — that happens
+  // only after the bulk delete confirm modal is acknowledged.
+  // Order is irrelevant for correctness, so we keep insertion
+  // order to make DevTools snapshots readable.
+  const toggleSelectWorkflow = useCallback((id: string) => {
+    setSelectedWorkflowIds((prev) => {
+      if (prev.includes(id)) return prev.filter((x) => x !== id)
+      return [...prev, id]
+    })
+  }, [])
+
+  const clearWorkflowSelection = useCallback(() => {
+    setSelectedWorkflowIds([])
+  }, [])
+  // [EscapeRef] Keep the forward-declared ref pointing at the
+  // latest callback so the keyboard handler (declared earlier in
+  // this component) always reads the current closure.
+  useEffect(() => {
+    clearSelectionRef.current = clearWorkflowSelection
+  }, [clearWorkflowSelection])
+
+  // [WorkflowEditor] "Select all" acts only on currently filtered
+  // workflows. The user sees a list filtered by search; selecting
+  // items hidden behind a search filter would be surprising, so
+  // we constrain the operation to the visible set. If every
+  // visible item is already selected, the second click clears
+  // the entire selection (not just the visible subset — clearing
+  // only the visible subset is rarely what the user wants).
+  const toggleSelectAllVisible = useCallback((visibleIds: string[]) => {
+    if (visibleIds.length === 0) return
+    setSelectedWorkflowIds((prev) => {
+      const prevSet = new Set(prev)
+      const allVisibleSelected = visibleIds.every((id) => prevSet.has(id))
+      if (allVisibleSelected) {
+        // Drop only the visible ids from the selection — preserve
+        // any selection entries that don't correspond to currently
+        // visible workflows (keeps behavior predictable even when
+        // the user has a multi-search-history edge case).
+        const visibleSet = new Set(visibleIds)
+        return prev.filter((id) => !visibleSet.has(id))
+      }
+      // Add all visible ids (idempotent against any prior partial
+      // overlap).
+      const next = [...prev]
+      const nextSet = new Set(prev)
+      for (const id of visibleIds) {
+        if (!nextSet.has(id)) {
+          next.push(id)
+          nextSet.add(id)
+        }
+      }
+      return next
+    })
+  }, [])
+
+  // [WorkflowEditor] Bulk delete request. Opens the confirm
+  // modal — does NOT delete anything yet. The actual delete fires
+  // from `handleConfirmBulkDelete` after the user clicks "Delete"
+  // in the modal. We deliberately gate the destructive action
+  // here so a stray "Select all + Delete" is always reversible.
+  const handleBulkDeleteRequest = useCallback(() => {
+    if (selectedWorkflowIds.length === 0) return
+    setBulkDeleteConfirmOpen(true)
+  }, [selectedWorkflowIds])
+
+  const handleConfirmBulkDelete = useCallback(() => {
+    // Snapshot ids before closing the modal — `selectedWorkflowIds`
+    // mutates during the per-id `deleteWorkflow` calls (which
+    // bumps workflow store and triggers re-renders) and we want
+    // to delete exactly the ids the user confirmed, no more.
+    const idsToDelete = selectedWorkflowIds.slice()
+    const wasActiveSelected = activeWorkflowId !== null
+      && idsToDelete.includes(activeWorkflowId)
+    setBulkDeleteConfirmOpen(false)
+    setSelectedWorkflowIds([])
+    for (const id of idsToDelete) {
+      deleteWorkflow(id)
+    }
+    if (wasActiveSelected) setView('workflows')
+  }, [selectedWorkflowIds, deleteWorkflow, activeWorkflowId])
 
   const handleImportWorkflow = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
@@ -9813,7 +9966,7 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                 // the card's own visual style. The wrapper is
                 // what CSS columns see; the card root just
                 // renders the visual.
-                'flex w-full flex-col overflow-hidden rounded-lg border bg-[#171717] transition-colors hover:border-white/15',
+                'flex w-full flex-col overflow-hidden rounded-lg border border-white/[0.06] bg-[#171717] transition-colors hover:border-[#7C5CFF]/55',
                 colors.border,
                 'border-l-2 border-white/[0.06]'
               )
@@ -9825,6 +9978,10 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                 >
                   <div
                     className={cardClass}
+                    onDoubleClick={(event) => {
+                      if ((event.target as HTMLElement).closest('button')) return
+                      handleUseTemplate(template)
+                    }}
                   >
 {hasCover ? (
                     <>
@@ -10016,15 +10173,90 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                 className="h-9 w-full rounded-lg border border-white/[0.06] bg-[#171717] pl-9 pr-3 text-[11px] text-white/65 outline-none transition-colors placeholder:text-white/20 focus:border-white/15"
               />
             </div>
-            <button
-              type="button"
-              title="Import workflow"
-              onClick={() => fileInputRef.current?.click()}
-              className="flex h-9 w-9 items-center justify-center rounded-lg bg-[#1A1A1A] text-white/55 transition-colors hover:bg-white/[0.06] hover:text-white"
-            >
-              <Upload className="h-4 w-4" />
-            </button>
+            {/* [WorkflowEditor] Multi-select toolbar. Hidden when
+                nothing is selected (the per-card checkbox is the
+                primary affordance) so the toolbar stays visually
+                quiet until the user has expressed intent. When the
+                user has selected ≥1 card, we swap the Import button
+                for a "Delete N selected" affordance — this keeps the
+                destructive action at the same screen position the
+                user's eye is already tracking, and the Import button
+                returns when selection clears. */}
+            {selectedWorkflowIds.length > 0 ? (
+              <>
+                <span
+                  aria-live="polite"
+                  className="rounded-md bg-[#7C5CFF]/15 px-2 py-1 text-[11px] font-medium text-[#B8A8FF]"
+                >
+                  {selectedWorkflowIds.length} selected
+                </span>
+                <button
+                  type="button"
+                  title="Clear selection"
+                  onClick={clearWorkflowSelection}
+                  className="flex h-9 w-9 items-center justify-center rounded-lg bg-[#1A1A1A] text-white/55 transition-colors hover:bg-white/[0.06] hover:text-white"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+                <button
+                  type="button"
+                  title={`Delete ${selectedWorkflowIds.length} workflow${selectedWorkflowIds.length === 1 ? '' : 's'}`}
+                  onClick={handleBulkDeleteRequest}
+                  className="flex h-9 items-center gap-1.5 rounded-lg bg-red-500/15 px-3 text-[11px] font-medium text-red-300 transition-colors hover:bg-red-500/25"
+                >
+                  <Trash2 className="h-4 w-4" />
+                  Delete
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                title="Import workflow"
+                onClick={() => fileInputRef.current?.click()}
+                className="flex h-9 w-9 items-center justify-center rounded-lg bg-[#1A1A1A] text-white/55 transition-colors hover:bg-white/[0.06] hover:text-white"
+              >
+                <Upload className="h-4 w-4" />
+              </button>
+            )}
           </div>
+
+          {/* [WorkflowEditor] "Select all" sub-toolbar. Sits between
+              the search/import row and the grid so the user has a
+              visible mode switch ("selection mode on") before they
+              start checking cards. Hidden when the list is empty —
+              selecting nothing has no meaning. */}
+          {filteredWorkflows.length > 0 && (() => {
+            const visibleIds = filteredWorkflows.map((w) => w.id)
+            const allVisibleSelected = visibleIds.length > 0
+              && visibleIds.every((id) => selectedWorkflowIds.includes(id))
+            return (
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => toggleSelectAllVisible(visibleIds)}
+                  aria-pressed={allVisibleSelected}
+                  className={cn(
+                    'flex h-7 items-center gap-1.5 rounded-md border px-2 text-[11px] font-medium transition-colors',
+                    allVisibleSelected
+                      ? 'border-[#7C5CFF]/45 bg-[#7C5CFF]/15 text-[#B8A8FF]'
+                      : 'border-white/[0.06] bg-[#171717] text-white/55 hover:border-white/15 hover:text-white/75'
+                  )}
+                >
+                  {allVisibleSelected ? (
+                    <CheckSquare className="h-3.5 w-3.5" />
+                  ) : (
+                    <Square className="h-3.5 w-3.5" />
+                  )}
+                  {allVisibleSelected ? 'Deselect all' : 'Select all'}
+                </button>
+                {selectedWorkflowIds.length > 0 && (
+                  <span className="text-[11px] text-white/35">
+                    of {filteredWorkflows.length} visible
+                  </span>
+                )}
+              </div>
+            )
+          })()}
 
           <div className="min-h-0 flex-1 overflow-y-auto pr-1">
             {filteredWorkflows.length === 0 ? (
@@ -10054,36 +10286,71 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
               </div>
             ) : (
               <div className="grid grid-cols-[repeat(auto-fit,minmax(260px,1fr))] gap-3">
-                {filteredWorkflows.map((workflow) => (
-                  <div
-                    key={workflow.id}
-                    onDoubleClick={() => handleOpenWorkflow(workflow)}
-                    className={cn(
-                      'flex min-h-[118px] flex-col rounded-lg border bg-[#171717] p-3 transition-colors hover:border-white/15',
-                      activeWorkflowId === workflow.id ? 'border-[#7C5CFF]/45' : 'border-white/[0.06]'
-                    )}
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <button
-                        type="button"
-                        onClick={() => handleOpenWorkflow(workflow)}
-                        className="min-w-0 flex-1 text-left"
-                      >
-                        <h3 className="truncate text-[12px] font-medium text-white/80">{workflow.name}</h3>
-                        <p className="mt-1 line-clamp-1 text-[11px] leading-[16px] text-white/35">
-                          {workflow.description || 'Local workflow'}
-                        </p>
-                      </button>
-                      <button
-                        type="button"
-                        title="Run"
-                        onClick={() => handleRunWorkflow(workflow)}
-                        onDoubleClick={(event) => event.stopPropagation()}
-                        className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#7C5CFF]/15 text-[#B8A8FF] transition-colors hover:bg-[#7C5CFF]/25"
-                      >
-                        <Play className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
+                {filteredWorkflows.map((workflow) => {
+                  const isSelected = selectedWorkflowIds.includes(workflow.id)
+                  return (
+                    <div
+                      key={workflow.id}
+                      onDoubleClick={() => handleOpenWorkflow(workflow)}
+                      className={cn(
+                        'flex min-h-[118px] flex-col rounded-lg border bg-[#171717] p-3 transition-colors hover:border-[#7C5CFF]/55',
+                        isSelected
+                          ? 'border-white/[0.06] bg-[#7C5CFF]/[0.04]'
+                          : 'border-white/[0.06]'
+                      )}
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        {/* [WorkflowEditor] Per-card selection
+                            checkbox. Sits at the start of the
+                            header row, to the left of the name.
+                            `stopPropagation` covers both bubbling
+                            click + doubleclick paths so the
+                            user's intent is unambiguous (clicking
+                            the checkbox never opens the workflow,
+                            only toggles selection). The visual
+                            mirrors a desktop file-manager check:
+                            small, square, accent when on, ghost
+                            when off. */}
+                        <button
+                          type="button"
+                          role="checkbox"
+                          aria-checked={isSelected}
+                          aria-label={isSelected ? `Deselect ${workflow.name}` : `Select ${workflow.name}`}
+                          title={isSelected ? 'Deselect' : 'Select'}
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            toggleSelectWorkflow(workflow.id)
+                          }}
+                          onDoubleClick={(event) => event.stopPropagation()}
+                          className={cn(
+                            'flex h-6 w-6 shrink-0 items-center justify-center rounded-md border transition-colors',
+                            isSelected
+                              ? 'border-[#7C5CFF]/45 bg-[#7C5CFF]/20 text-[#B8A8FF]'
+                              : 'border-white/[0.1] bg-transparent text-transparent hover:border-white/25 hover:bg-white/[0.06] hover:text-white/55'
+                          )}
+                        >
+                          <Check className="h-3.5 w-3.5" strokeWidth={3} />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleOpenWorkflow(workflow)}
+                          className="min-w-0 flex-1 text-left"
+                        >
+                          <h3 className="truncate text-[12px] font-medium text-white/80">{workflow.name}</h3>
+                          <p className="mt-1 line-clamp-1 text-[11px] leading-[16px] text-white/35">
+                            {workflow.description || 'Local workflow'}
+                          </p>
+                        </button>
+                        <button
+                          type="button"
+                          title="Run"
+                          onClick={() => handleRunWorkflow(workflow)}
+                          onDoubleClick={(event) => event.stopPropagation()}
+                          className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#7C5CFF]/15 text-[#B8A8FF] transition-colors hover:bg-[#7C5CFF]/25"
+                        >
+                          <Play className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
 
                     <div className="mt-3 flex flex-wrap gap-1.5">
                       {(workflow.tags?.length ? workflow.tags : ['Workflow']).slice(0, 3).map((tag) => (
@@ -10139,7 +10406,8 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                       </div>
                     </div>
                   </div>
-                ))}
+                  )
+                })}
               </div>
             )}
           </div>
@@ -10189,6 +10457,62 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
           </div>
         </div>
       )}
+      {/* [WorkflowEditor] Bulk delete confirm modal. Reuses the
+          same `workflow-confirm-overlay` + `workflow-confirm-modal`
+          CSS classes as the single-delete dialog so the modal
+          markup and behavior stay uniform. The body intentionally
+          does NOT list individual names — selection count is the
+          single decision signal the user needs to confirm. Cancel
+          closes without action; Delete delegates to
+          `handleConfirmBulkDelete` which loops over the snapshotted
+          ids, then clears selection. */}
+      {bulkDeleteConfirmOpen && (() => {
+        const ids = selectedWorkflowIds
+        return (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="bulk-delete-confirm-title"
+            aria-describedby="bulk-delete-confirm-desc"
+            className="workflow-confirm-overlay"
+            onClick={() => setBulkDeleteConfirmOpen(false)}
+          >
+            <div
+              className="workflow-confirm-modal"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="workflow-confirm-icon">
+                <Trash2 className="h-4 w-4" />
+              </div>
+              <div className="workflow-confirm-body">
+                <h2 id="bulk-delete-confirm-title" className="workflow-confirm-title">
+                  Delete {ids.length} workflow{ids.length === 1 ? '' : 's'}?
+                </h2>
+                <p id="bulk-delete-confirm-desc" className="workflow-confirm-desc">
+                  This action cannot be undone.
+                </p>
+              </div>
+              <div className="workflow-confirm-actions">
+                <button
+                  type="button"
+                  className="workflow-confirm-cancel"
+                  onClick={() => setBulkDeleteConfirmOpen(false)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="workflow-confirm-delete"
+                  onClick={handleConfirmBulkDelete}
+                >
+                  <Trash2 className="h-4 w-4" />
+                  Delete{ids.length > 1 ? ` ${ids.length}` : ''}
+                </button>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
       {deleteConfirmTemplate && (
         <div
           role="dialog"
