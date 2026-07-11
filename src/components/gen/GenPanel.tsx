@@ -1,8 +1,10 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react'
+import * as Select from '@radix-ui/react-select'
+import { AnimatePresence, motion } from 'framer-motion'
 import {
-  Send, Upload, Bookmark, Minus, Plus, Trash2,
+  Upload, Bookmark, Minus, Plus, Trash2,
   Image as ImageIcon, Video, ChevronDown, Download, RotateCcw,
-  Search, X, FileText, GripVertical
+  Search, X, FileText, GripVertical, WandSparkles, Check, ChevronUp
 } from 'lucide-react'
 import { cn, usePersistedState } from '@/lib/utils'
 import { usePromptStore } from '@/stores/dataStore'
@@ -276,6 +278,437 @@ const StyleDropdown: React.FC<{ value: string; onChange: (v: string) => void }> 
   />
 )
 
+type PromptAssistantLanguage = 'English' | 'Vietnamese'
+type PromptAssistantDetail = 'Concise' | 'Balanced' | 'Detailed'
+
+interface PromptAssistantResult {
+  text: string
+  mediaType: GenMode
+  aspectRatio: AspectRatio
+}
+
+const PROMPT_ASSISTANT_STYLES = [
+  'Auto',
+  'Cinematic',
+  'Editorial',
+  'Photorealistic',
+  'Anime',
+  'Product',
+  'Documentary',
+]
+
+const PROMPT_ASSISTANT_LIGHTING = [
+  'Auto',
+  'Natural light',
+  'Soft studio light',
+  'Golden hour',
+  'Dramatic light',
+  'Neon light',
+]
+
+const PROMPT_ASSISTANT_CAMERAS = [
+  'Auto',
+  'Eye level',
+  'Close-up',
+  'Wide angle',
+  'Low angle',
+  'Overhead',
+]
+
+const PROMPT_ASSISTANT_TONES = [
+  'Auto',
+  'Elegant',
+  'Energetic',
+  'Warm',
+  'Moody',
+  'Minimal',
+]
+
+function buildPromptAssistantText(args: {
+  idea: string
+  mediaType: GenMode
+  count: number
+  language: PromptAssistantLanguage
+  detail: PromptAssistantDetail
+  style: string
+  lighting: string
+  camera: string
+  tone: string
+}): string {
+  const count = Math.max(1, Math.min(5, args.count))
+  const isVietnamese = args.language === 'Vietnamese'
+  const variationsEn = [
+    'hero composition with a clear focal point',
+    'intimate close-up storytelling',
+    'wide environmental composition',
+    'dynamic perspective with strong depth',
+    'minimal composition with intentional negative space',
+  ]
+  const variationsVi = [
+    'bố cục chủ đạo với điểm nhấn rõ ràng',
+    'góc cận cảnh giàu tính kể chuyện',
+    'bố cục toàn cảnh có môi trường rõ nét',
+    'góc nhìn năng động với chiều sâu mạnh',
+    'bố cục tối giản với khoảng trống có chủ đích',
+  ]
+
+  const detailEn: Record<PromptAssistantDetail, string> = {
+    Concise: 'Keep the visual direction clear and concise',
+    Balanced: 'Define the subject, environment, composition, materials, and visual hierarchy clearly',
+    Detailed: 'Use highly specific visual details, realistic textures, spatial depth, coherent composition, and production-ready art direction',
+  }
+  const detailVi: Record<PromptAssistantDetail, string> = {
+    Concise: 'Giữ định hướng hình ảnh rõ ràng và súc tích',
+    Balanced: 'Mô tả rõ chủ thể, bối cảnh, bố cục, chất liệu và thứ bậc thị giác',
+    Detailed: 'Dùng chi tiết hình ảnh cụ thể, chất liệu chân thực, chiều sâu không gian, bố cục nhất quán và chỉ đạo nghệ thuật hoàn chỉnh',
+  }
+
+  const prompts: string[] = []
+  for (let index = 0; index < count; index += 1) {
+    const parts = [args.idea.trim().replace(/[.\s]+$/, '')]
+    if (isVietnamese) {
+      parts.push(args.mediaType === 'video'
+        ? 'Tạo video có chuyển động tự nhiên, diễn tiến nhất quán và chuyển động máy quay hợp lý'
+        : 'Tạo một ảnh hoàn chỉnh với chủ thể và điểm nhấn thị giác rõ ràng')
+      if (args.style !== 'Auto') parts.push(`Phong cách hình ảnh: ${args.style}`)
+      if (args.lighting !== 'Auto') parts.push(`Ánh sáng: ${args.lighting}`)
+      if (args.camera !== 'Auto') parts.push(`Góc máy: ${args.camera}`)
+      if (args.tone !== 'Auto') parts.push(`Sắc thái: ${args.tone}`)
+      parts.push(detailVi[args.detail])
+      if (count > 1) parts.push(`Biến thể ${index + 1}: ${variationsVi[index % variationsVi.length]}`)
+    } else {
+      parts.push(args.mediaType === 'video'
+        ? 'Create a video with natural motion, temporal continuity, and purposeful camera movement'
+        : 'Create a polished still image with a clear subject and visual focal point')
+      if (args.style !== 'Auto') parts.push(`Visual style: ${args.style}`)
+      if (args.lighting !== 'Auto') parts.push(`Lighting: ${args.lighting}`)
+      if (args.camera !== 'Auto') parts.push(`Camera: ${args.camera}`)
+      if (args.tone !== 'Auto') parts.push(`Tone: ${args.tone}`)
+      parts.push(detailEn[args.detail])
+      if (count > 1) parts.push(`Variation ${index + 1}: ${variationsEn[index % variationsEn.length]}`)
+    }
+    prompts.push(parts.filter(Boolean).join('. ') + '.')
+  }
+  return prompts.join('\n\n')
+}
+
+const AssistantSelect: React.FC<{
+  value: string
+  options: string[]
+  onChange: (value: string) => void
+  ariaLabel: string
+}> = ({ value, options, onChange, ariaLabel }) => (
+  <Select.Root value={value} onValueChange={onChange}>
+    <Select.Trigger
+      aria-label={ariaLabel}
+      className="group flex h-10 w-full items-center justify-between rounded-xl border border-white/[0.08] bg-[#121212] px-3 text-left text-[12px] font-medium text-white/70 outline-none transition-colors hover:border-white/[0.14] hover:bg-[#151515] focus:border-[#7C5CFF]/70 focus:ring-2 focus:ring-[#7C5CFF]/10 data-[placeholder]:text-white/25"
+    >
+      <Select.Value />
+      <Select.Icon asChild>
+        <ChevronDown className="h-3.5 w-3.5 text-white/30 transition-transform group-data-[state=open]:rotate-180" />
+      </Select.Icon>
+    </Select.Trigger>
+    <Select.Portal>
+      <Select.Content
+        position="popper"
+        sideOffset={6}
+        collisionPadding={12}
+        className="z-[200] min-w-[var(--radix-select-trigger-width)] overflow-hidden rounded-xl border border-white/[0.1] bg-[#1B1B1B] p-1 shadow-[0_18px_48px_rgba(0,0,0,0.55)]"
+      >
+        <Select.ScrollUpButton className="flex h-6 items-center justify-center text-white/35">
+          <ChevronUp className="h-3.5 w-3.5" />
+        </Select.ScrollUpButton>
+        <Select.Viewport>
+          {options.map((option) => (
+            <Select.Item
+              key={option}
+              value={option}
+              className="relative flex h-9 cursor-pointer select-none items-center rounded-lg pl-8 pr-3 text-[12px] text-white/60 outline-none transition-colors data-[highlighted]:bg-[#7C5CFF]/12 data-[highlighted]:text-white data-[state=checked]:text-[#C4B7FF]"
+            >
+              <Select.ItemIndicator className="absolute left-2.5 inline-flex items-center text-[#9F87FF]">
+                <Check className="h-3.5 w-3.5" />
+              </Select.ItemIndicator>
+              <Select.ItemText>{option}</Select.ItemText>
+            </Select.Item>
+          ))}
+        </Select.Viewport>
+        <Select.ScrollDownButton className="flex h-6 items-center justify-center text-white/35">
+          <ChevronDown className="h-3.5 w-3.5" />
+        </Select.ScrollDownButton>
+      </Select.Content>
+    </Select.Portal>
+  </Select.Root>
+)
+
+const PromptAssistantModal: React.FC<{
+  initialIdea: string
+  initialMediaType: GenMode
+  initialAspectRatio: AspectRatio
+  referenceAliases: string[]
+  onClose: () => void
+  onApply: (result: PromptAssistantResult) => void
+}> = ({ initialIdea, initialMediaType, initialAspectRatio, referenceAliases, onClose, onApply }) => {
+  const [idea, setIdea] = useState(initialIdea)
+  const [mediaType, setMediaType] = useState<GenMode>(initialMediaType)
+  const [count, setCount] = useState(1)
+  const [language, setLanguage] = useState<PromptAssistantLanguage>('English')
+  const [detail, setDetail] = useState<PromptAssistantDetail>('Balanced')
+  const [style, setStyle] = useState('Auto')
+  const [lighting, setLighting] = useState('Auto')
+  const [camera, setCamera] = useState('Auto')
+  const [tone, setTone] = useState('Auto')
+  const [assistantAspectRatio, setAssistantAspectRatio] = useState<AspectRatio>(initialAspectRatio)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+
+  const appendReferenceAlias = (alias: string) => {
+    const token = `@${alias}`
+    if (new RegExp(`(^|\\s)${token}(?=\\s|$)`, 'i').test(idea)) return
+    setIdea((current) => `${current.trim()}${current.trim() ? ' ' : ''}${token}`)
+  }
+
+  const applyAssistant = () => {
+    if (!idea.trim()) return
+    onApply({
+      text: buildPromptAssistantText({
+        idea,
+        mediaType,
+        count,
+        language,
+        detail,
+        style,
+        lighting,
+        camera,
+        tone,
+      }),
+      mediaType,
+      aspectRatio: assistantAspectRatio,
+    })
+  }
+
+  const labelClass = 'mb-2 block text-[10px] font-semibold uppercase tracking-[0.12em] text-white/35'
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.16 }}
+      className="absolute inset-0 z-[80] flex items-center justify-center bg-black/75 p-4 backdrop-blur-[5px]"
+      onMouseDown={onClose}
+    >
+      <motion.div
+        initial={{ opacity: 0, y: 14, scale: 0.985 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        exit={{ opacity: 0, y: 10, scale: 0.99 }}
+        transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+        className="flex max-h-[calc(100vh-32px)] w-full max-w-[700px] flex-col overflow-hidden rounded-[18px] border border-white/[0.1] bg-[#181818] shadow-[0_28px_90px_rgba(0,0,0,0.68)]"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header className="flex min-h-[64px] shrink-0 items-center gap-3 border-b border-white/[0.07] px-5">
+          <span className="flex h-9 w-9 items-center justify-center rounded-xl border border-[#7C5CFF]/25 bg-[#7C5CFF]/12 text-[#B8A8FF] shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]">
+            <WandSparkles className="h-[17px] w-[17px]" />
+          </span>
+          <div className="min-w-0">
+            <h2 className="text-[15px] font-semibold tracking-[-0.01em] text-white/90">Prompt Assistant</h2>
+            <p className="mt-0.5 truncate text-[11px] text-white/35">Shape an idea into production-ready prompts</p>
+          </div>
+          <button type="button" onClick={onClose} className="ml-auto flex h-9 w-9 items-center justify-center rounded-xl text-white/35 transition-colors hover:bg-white/[0.06] hover:text-white" title="Close">
+            <X className="h-4 w-4" />
+          </button>
+        </header>
+
+        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+          <section>
+            <div className="mb-2 flex items-end justify-between gap-4">
+              <label className="text-[12px] font-semibold text-white/70">What do you want to create?</label>
+              <span className="text-[10px] text-white/25">Idea, scene, script, or shot list</span>
+            </div>
+            <div className="rounded-2xl border border-white/[0.08] bg-[#111111] p-1.5 transition-colors focus-within:border-[#7C5CFF]/55 focus-within:ring-2 focus-within:ring-[#7C5CFF]/10">
+              <textarea
+                autoFocus
+                value={idea}
+                onChange={(event) => setIdea(event.target.value)}
+                placeholder="Describe the result you want. Mention references with @image1, @image2..."
+                className="min-h-[138px] w-full resize-y bg-transparent px-3 py-2.5 text-[13px] leading-6 text-white/80 outline-none placeholder:text-white/22"
+              />
+              <div className="flex min-h-8 items-center gap-2 border-t border-white/[0.05] px-2 pt-1.5">
+                <WandSparkles className="h-3.5 w-3.5 text-[#8F76F5]" />
+                <span className="text-[10px] text-white/28">Assistant keeps your intent and adds visual direction.</span>
+              </div>
+            </div>
+          </section>
+
+          {referenceAliases.length > 0 && (
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <span className="text-[10px] font-medium text-white/30">References</span>
+              {referenceAliases.map((alias) => (
+                <button
+                  key={alias}
+                  type="button"
+                  onClick={() => appendReferenceAlias(alias)}
+                  className="rounded-lg border border-[#7C5CFF]/20 bg-[#7C5CFF]/10 px-2 py-1 text-[10px] font-semibold text-[#B8A8FF] transition-colors hover:border-[#7C5CFF]/40 hover:bg-[#7C5CFF]/16"
+                >
+                  @{alias}
+                </button>
+              ))}
+            </div>
+          )}
+
+          <section className="mt-5">
+            <span className={labelClass}>Visual direction</span>
+            <div className="flex flex-wrap gap-2">
+              {PROMPT_ASSISTANT_STYLES.map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  onClick={() => setStyle(option)}
+                  className={cn(
+                    'h-9 rounded-xl border px-3 text-[12px] font-medium transition-all',
+                    style === option
+                      ? 'border-[#7C5CFF]/55 bg-[#7C5CFF]/16 text-[#D0C6FF] shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]'
+                      : 'border-white/[0.07] bg-[#121212] text-white/45 hover:border-white/[0.14] hover:bg-[#151515] hover:text-white/75'
+                  )}
+                >
+                  {option}
+                </button>
+              ))}
+            </div>
+          </section>
+
+          <section className="mt-5 rounded-2xl border border-white/[0.07] bg-[#141414] p-4">
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <h3 className="text-[12px] font-semibold text-white/70">Output setup</h3>
+                <p className="mt-0.5 text-[10px] text-white/28">Controls are applied back to the Gen tab.</p>
+              </div>
+              <span className="rounded-lg bg-[#7C5CFF]/10 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-[#A995FF]">{mediaType}</span>
+            </div>
+
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div>
+                <span className={labelClass}>Media type</span>
+                <div className="grid grid-cols-2 gap-1 rounded-xl border border-white/[0.07] bg-[#0F0F0F] p-1">
+                  {(['image', 'video'] as GenMode[]).map((option) => (
+                    <button
+                      key={option}
+                      type="button"
+                      onClick={() => setMediaType(option)}
+                      className={cn(
+                        'flex h-9 items-center justify-center gap-2 rounded-lg text-[12px] font-semibold capitalize transition-all',
+                        mediaType === option
+                          ? 'bg-[#7C5CFF]/20 text-[#D0C6FF] shadow-sm'
+                          : 'text-white/35 hover:bg-white/[0.04] hover:text-white/65'
+                      )}
+                    >
+                      {option === 'image' ? <ImageIcon className="h-3.5 w-3.5" /> : <Video className="h-3.5 w-3.5" />}
+                      {option}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <span className={labelClass}>Prompt count</span>
+                <div className="flex h-11 items-center justify-between rounded-xl border border-white/[0.07] bg-[#0F0F0F] px-1.5">
+                  <button type="button" onClick={() => setCount((current) => Math.max(1, current - 1))} className="flex h-8 w-8 items-center justify-center rounded-lg text-white/35 hover:bg-white/[0.05] hover:text-white">
+                    <Minus className="h-3.5 w-3.5" />
+                  </button>
+                  <div className="text-center">
+                    <span className="text-[14px] font-semibold text-white/80">{count}</span>
+                    <span className="ml-1.5 text-[10px] text-white/28">{count === 1 ? 'prompt' : 'prompts'}</span>
+                  </div>
+                  <button type="button" onClick={() => setCount((current) => Math.min(5, current + 1))} className="flex h-8 w-8 items-center justify-center rounded-lg text-white/35 hover:bg-white/[0.05] hover:text-white">
+                    <Plus className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-4">
+              <span className={labelClass}>Aspect ratio</span>
+              <div className="grid grid-cols-5 gap-1 rounded-xl border border-white/[0.07] bg-[#0F0F0F] p-1">
+              {ASPECT_RATIOS.map((ratio) => (
+                <button
+                  key={ratio.value}
+                  type="button"
+                  onClick={() => setAssistantAspectRatio(ratio.value)}
+                  className={cn(
+                    'h-9 rounded-lg text-[11px] font-semibold transition-all',
+                    assistantAspectRatio === ratio.value
+                      ? 'bg-[#7C5CFF]/20 text-[#D0C6FF]'
+                      : 'text-white/35 hover:bg-white/[0.04] hover:text-white/65'
+                  )}
+                >
+                  {ratio.value}
+                </button>
+              ))}
+              </div>
+            </div>
+          </section>
+
+          <button
+            type="button"
+            onClick={() => setAdvancedOpen((current) => !current)}
+            className="mt-4 flex w-full items-center gap-2 rounded-xl border border-white/[0.07] bg-[#121212] px-3 py-2.5 text-left text-[11px] font-semibold text-white/45 transition-colors hover:border-white/[0.12] hover:text-white/75"
+          >
+            <ChevronDown className={cn('h-3.5 w-3.5 transition-transform', advancedOpen && 'rotate-180')} />
+            Advanced
+          </button>
+
+          {advancedOpen && (
+            <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="mt-3 grid grid-cols-1 gap-3 overflow-hidden sm:grid-cols-2">
+              <div>
+                <span className={labelClass}>Language</span>
+                <AssistantSelect value={language} options={['English', 'Vietnamese']} onChange={(value) => setLanguage(value as PromptAssistantLanguage)} ariaLabel="Prompt language" />
+              </div>
+              <div>
+                <span className={labelClass}>Detail level</span>
+                <AssistantSelect value={detail} options={['Concise', 'Balanced', 'Detailed']} onChange={(value) => setDetail(value as PromptAssistantDetail)} ariaLabel="Prompt detail level" />
+              </div>
+              <div>
+                <span className={labelClass}>Lighting</span>
+                <AssistantSelect value={lighting} options={PROMPT_ASSISTANT_LIGHTING} onChange={setLighting} ariaLabel="Lighting" />
+              </div>
+              <div>
+                <span className={labelClass}>Camera</span>
+                <AssistantSelect value={camera} options={PROMPT_ASSISTANT_CAMERAS} onChange={setCamera} ariaLabel="Camera" />
+              </div>
+              <div className="sm:col-span-2">
+                <span className={labelClass}>Tone</span>
+                <AssistantSelect value={tone} options={PROMPT_ASSISTANT_TONES} onChange={setTone} ariaLabel="Tone" />
+              </div>
+            </motion.div>
+          )}
+        </div>
+
+        <footer className="flex shrink-0 items-center gap-3 border-t border-white/[0.07] bg-[#151515] px-5 py-3.5">
+          <div className="hidden min-w-0 flex-1 sm:block">
+            <p className="truncate text-[11px] font-medium text-white/45">{count} {count === 1 ? 'prompt' : 'prompts'} · {mediaType} · {assistantAspectRatio}</p>
+            <p className="mt-0.5 text-[9px] text-white/22">Your current prompt is replaced only after generation.</p>
+          </div>
+          <button type="button" onClick={onClose} className="h-10 rounded-xl px-4 text-[12px] font-semibold text-white/40 transition-colors hover:bg-white/[0.05] hover:text-white/75">
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={applyAssistant}
+            disabled={!idea.trim()}
+            className={cn(
+              'flex h-10 min-w-[170px] items-center justify-center gap-2 rounded-xl px-5 text-[12px] font-semibold transition-all',
+              idea.trim()
+                ? 'bg-[#7C5CFF] text-white shadow-[0_8px_24px_rgba(124,92,255,0.28)] hover:bg-[#8768FF] active:translate-y-px'
+                : 'cursor-not-allowed bg-white/5 text-white/20'
+            )}
+          >
+            <WandSparkles className="h-4 w-4" />
+            Generate prompts
+          </button>
+        </footer>
+      </motion.div>
+    </motion.div>
+  )
+}
+
 // ─── Main Component ───────────────────────────────────────────────────────────
 
 export const GenPanel: React.FC<{
@@ -412,6 +845,7 @@ export const GenPanel: React.FC<{
   const [promptSaveStatus, setPromptSaveStatus] = useState<'idle' | 'saved'>('idle')
   const [promptSearchQuery, setPromptSearchQuery] = useState('')
   const [promptSearchTab, setPromptSearchTab] = useState<'my' | 'template'>('my')
+  const [promptAssistantOpen, setPromptAssistantOpen] = useState(false)
 
   // ── Multi-Prompt Types ────────────────────────────────────────────────────────
   type PromptRunStatus = 'pending' | 'running' | 'success' | 'partial' | 'failed'
@@ -1507,10 +1941,12 @@ const handleGenerate = useCallback(async () => {
                 </svg>
               </button>
               <button
-                className="flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] text-white/50 hover:text-white hover:bg-white/5 transition-colors border border-transparent hover:border-white/10"
+                type="button"
+                onClick={() => setPromptAssistantOpen(true)}
+                className="flex h-7 items-center gap-1.5 rounded-lg border border-[#7C5CFF]/20 bg-[#7C5CFF]/8 px-2.5 text-[11px] font-semibold text-[#B8A8FF] transition-colors hover:border-[#7C5CFF]/40 hover:bg-[#7C5CFF]/14 hover:text-[#D2C9FF]"
               >
-                <Send className="w-3 h-3" />
-                Chat AI
+                <WandSparkles className="h-3.5 w-3.5" />
+                Prompt Assistant
               </button>
               <button
                 onClick={() => txtInputRef.current?.click()}
@@ -2056,6 +2492,28 @@ const handleGenerate = useCallback(async () => {
           )}
         </button>
       </div>
+
+      <AnimatePresence>
+        {promptAssistantOpen && (
+          <PromptAssistantModal
+            initialIdea={prompt}
+            initialMediaType={mode}
+            initialAspectRatio={aspectRatio}
+            referenceAliases={
+              refMode === 'none'
+                ? []
+                : refImages.map((ref, index) => getRefImageAlias(ref, index))
+            }
+            onClose={() => setPromptAssistantOpen(false)}
+            onApply={(result) => {
+              setPrompt(result.text)
+              handleModeChange(result.mediaType)
+              setAspectRatio(result.aspectRatio)
+              setPromptAssistantOpen(false)
+            }}
+          />
+        )}
+      </AnimatePresence>
 
       {showSearch && (
         <div
