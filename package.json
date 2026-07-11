@@ -48,6 +48,7 @@
       "sidePanel",
       "tabs",
       "storage",
+      "unlimitedStorage",
       "activeTab",
       "scripting",
       "notifications",

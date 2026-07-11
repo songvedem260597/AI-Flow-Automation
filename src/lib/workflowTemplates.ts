@@ -34,9 +34,8 @@
  *
  * Thumbnail extraction is best-effort and 100% async. It walks the
  * workflow in priority order:
- *   a) Image-node first media (assetId > mediaUrl > imageUrl).
- *   b) Generate-node first successfulOutputImage.
- *   c) Video poster fallback.
+ *   a) The last Generate node's image or video poster.
+ *   b) Remaining nodes in workflow order.
  * Whatever resolves first wins. The originating node id is recorded
  * as `thumbnailSourceNodeId` so the restore path can prefer that
  * node's preview first. If nothing works the template is saved
@@ -674,8 +673,8 @@ export function applyNodePreviews(
 }
 
 /**
- * Walk order: first usable image-node asset, else first successful
- * Generate-node output, else first valid poster. Never throws.
+ * Walk order: the last Generate node first, then every remaining
+ * node in workflow order. Never throws.
  *
  * This variant also returns the originating node id. Most callers
  * want both the data URL and the id; the back-compat shim below
@@ -697,13 +696,19 @@ export async function extractWorkflowThumbnail(
 export async function extractWorkflowThumbnailWithSource(
   workflow: Pick<Workflow, 'nodes'>
 ): Promise<{ dataUrl: string; sourceNodeId: string } | undefined> {
-  // Order: image nodes first (deterministic — user's source media),
-  // then generate nodes (run results).
-  const orderedNodes = [
-    ...workflow.nodes.filter((n) => n.type === 'image'),
-    ...workflow.nodes.filter((n) => n.type === 'generate'),
-    ...workflow.nodes.filter((n) => n.type !== 'image' && n.type !== 'generate')
-  ]
+  let lastGenerateIndex = -1
+  for (let index = workflow.nodes.length - 1; index >= 0; index -= 1) {
+    if (workflow.nodes[index]?.type === 'generate') {
+      lastGenerateIndex = index
+      break
+    }
+  }
+  const orderedNodes = lastGenerateIndex >= 0
+    ? [
+        workflow.nodes[lastGenerateIndex],
+        ...workflow.nodes.filter((_, index) => index !== lastGenerateIndex)
+      ]
+    : workflow.nodes
   for (const node of orderedNodes) {
     const candidate = await pickCandidateImageUrlWithAssets(node)
     if (!candidate) continue
@@ -807,7 +812,7 @@ export function generateUniqueTemplateName(
   activeName: string,
   existing: Pick<UserWorkflowTemplate, 'name'>[]
 ): string {
-  const base = `${activeName.trim() || 'Untitled Workflow'} Template`
+  const base = activeName.trim() || 'Untitled Workflow'
   const taken = new Set(existing.map((t) => t.name))
   if (!taken.has(base)) return base
   for (let counter = 2; counter < 1000; counter += 1) {
@@ -993,15 +998,12 @@ function readTemplateNodePreview(node: WorkflowNode): string {
  * stored template in this order and returns the first non-empty
  * candidate:
  *
- *   1. `template.thumbnail`            — already-compressed card cover.
- *   2. First node `data.templateImagePreview`
- *                                     — per-node compressed preview
- *                                       saved at template-write time
- *                                       (see `applyNodePreviews`).
- *   3. First node `data.templateVideoPoster`
- *                                     — video poster slot; still
- *                                       usable as a static card cover.
- *   4. First node `data.imageUrl` /
+ *   1. Last Generate node preview      — final generated image or video
+ *                                       poster saved by `applyNodePreviews`.
+ *   2. `thumbnailSourceNodeId` preview — extraction winner at save time.
+ *   3. `template.thumbnail`            — already-compressed card cover.
+ *   4. Remaining node previews         — first usable image or poster.
+ *   5. First node `data.imageUrl` /
  *      `data.mediaUrl` / `data.previewUrl`
  *                                     — pasted URL — only accepted
  *                                       when it parses as an
@@ -1016,28 +1018,43 @@ function readTemplateNodePreview(node: WorkflowNode): string {
 export function resolveTemplateCardThumbnail(
   template: Pick<UserWorkflowTemplate, 'thumbnail' | 'thumbnailSourceNodeId' | 'workflow'>
 ): string | undefined {
+  const nodes = template.workflow.nodes
+  let lastGenerateNode: WorkflowNode | undefined
+  for (let index = nodes.length - 1; index >= 0; index -= 1) {
+    if (nodes[index]?.type === 'generate') {
+      lastGenerateNode = nodes[index]
+      break
+    }
+  }
+
+  if (lastGenerateNode) {
+    const finalGeneratePreview = readTemplateNodePreview(lastGenerateNode)
+    if (finalGeneratePreview) return finalGeneratePreview
+  }
+
   if (template.thumbnailSourceNodeId) {
-    const sourceNode = template.workflow.nodes.find((node) => node.id === template.thumbnailSourceNodeId)
+    const sourceNode = nodes.find((node) => node.id === template.thumbnailSourceNodeId)
     if (sourceNode) {
       const sourcePreview = readTemplateNodePreview(sourceNode)
       if (sourcePreview) return sourcePreview
     }
   }
 
-  for (const node of template.workflow.nodes) {
+  const direct = template.thumbnail
+  if (typeof direct === 'string' && direct.trim().length > 0) return direct
+
+  for (const node of nodes) {
+    if (node.id === lastGenerateNode?.id || node.id === template.thumbnailSourceNodeId) continue
     const preview = readTemplateNodePreview(node)
     if (preview) return preview
   }
-
-  const direct = template.thumbnail
-  if (typeof direct === 'string' && direct.trim().length > 0) return direct
 
   // [WorkflowTemplate] URL paste fallback — only accept
   // URLs that survive a tab swap. `blob:` and `data:` URLs are
   // scoped to the page that created them and produce broken
   // images once that tab closes.
   const SAFE_URL_PREFIXES = ['http://', 'https://', 'chrome-extension://', 'chrome://']
-  for (const node of template.workflow.nodes) {
+  for (const node of nodes) {
     const data = node.data as Record<string, unknown>
     if (!data || typeof data !== 'object') continue
     for (const field of ['imageUrl', 'mediaUrl', 'previewUrl', 'thumbnailUrl']) {

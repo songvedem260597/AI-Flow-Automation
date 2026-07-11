@@ -2742,6 +2742,21 @@ function renderDrawflowMediaFileCard(
       </div>`
 }
 
+function getGenerateNodeTitle(data: Record<string, unknown>): string {
+  const output = data._output as Record<string, unknown> | undefined
+  const outputUrls = getGenerateOutputImageUrls(output)
+  if (outputUrls.length === 0) return 'New Generate Node'
+
+  const selectedOutputIndex = Math.max(
+    0,
+    Math.min(outputUrls.length - 1, Number(data.selectedOutputIndex) || 0)
+  )
+  const outputItems = buildGenerateOutputItems(output, outputUrls)
+  const selectedOutput = outputItems[selectedOutputIndex] || outputItems[0]
+  const outputMediaType = selectedOutput?.mediaType || getGenerateMediaType(data)
+  return getMediaCardLabel(outputMediaType)
+}
+
 function renderDrawflowNode(node: WorkflowNode) {
   const data = node.data as Record<string, unknown>
   const generateData = node.type === 'generate'
@@ -2752,6 +2767,8 @@ function renderDrawflowNode(node: WorkflowNode) {
     ? 'New Media Node'
     : node.type === 'prompt'
       ? (String(data.prompt || '').trim() ? 'Prompt' : 'New Prompt Node')
+      : node.type === 'generate'
+        ? getGenerateNodeTitle(generateData)
       : data.label || meta.title
   const label = escapeHtml(rawLabel)
   const provider = providerSlug(generateData.provider)
@@ -3714,6 +3731,9 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const [nodePickerPosition, setNodePickerPosition] = useState<{ x: number; y: number } | null>(null)
   const [nodePillMenu, setNodePillMenu] = useState<NodePillMenuState | null>(null)
   const [showLogs, setShowLogs] = useState(false)
+  const [isRenamingWorkflow, setIsRenamingWorkflow] = useState(false)
+  const [workflowNameDraft, setWorkflowNameDraft] = useState(workflow.name)
+  const workflowNameInputRef = useRef<HTMLInputElement | null>(null)
   const [zoomLevel, setZoomLevel] = useState(100)
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null)
   // [WorkflowTemplate] Tiny inline toast for Save-to-Template feedback.
@@ -3752,6 +3772,39 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       }
     }
   }, [])
+
+  useEffect(() => {
+    if (!isRenamingWorkflow) setWorkflowNameDraft(workflow.name)
+  }, [isRenamingWorkflow, workflow.id, workflow.name])
+
+  useEffect(() => {
+    if (!isRenamingWorkflow) return
+    const input = workflowNameInputRef.current
+    if (!input) return
+    input.focus()
+    input.select()
+  }, [isRenamingWorkflow])
+
+  const beginWorkflowRename = () => {
+    setWorkflowNameDraft(workflow.name)
+    setIsRenamingWorkflow(true)
+  }
+
+  const cancelWorkflowRename = () => {
+    setWorkflowNameDraft(workflow.name)
+    setIsRenamingWorkflow(false)
+  }
+
+  const commitWorkflowRename = () => {
+    const nextName = workflowNameDraft.trim()
+    setIsRenamingWorkflow(false)
+    if (!nextName || nextName === workflow.name) {
+      setWorkflowNameDraft(workflow.name)
+      return
+    }
+    setWorkflowNameDraft(nextName)
+    updateWorkflow(workflow.id, { name: nextName })
+  }
   const [inspectorNodeId, setInspectorNodeId] = useState<string | null>(null)
   const [marqueeRect, setMarqueeRect] = useState<MarqueeRect | null>(null)
   // Multi-selection: the Set lives in a ref for hot-path reads inside
@@ -8962,12 +9015,36 @@ const groupDragMirrorLog = (
             <WorkflowIcon className="h-4 w-4" />
           </div>
           <div className="min-w-0">
-            <input
-              value={workflow.name}
-              onChange={(event) => updateWorkflow(workflow.id, { name: event.target.value })}
-              className="h-6 w-[min(42vw,360px)] min-w-[150px] bg-transparent text-[12px] font-medium text-white/85 outline-none"
-              aria-label="Workflow name"
-            />
+            {isRenamingWorkflow ? (
+              <input
+                ref={workflowNameInputRef}
+                value={workflowNameDraft}
+                maxLength={120}
+                onChange={(event) => setWorkflowNameDraft(event.target.value)}
+                onBlur={commitWorkflowRename}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault()
+                    commitWorkflowRename()
+                  } else if (event.key === 'Escape') {
+                    event.preventDefault()
+                    cancelWorkflowRename()
+                  }
+                }}
+                className="h-7 w-[min(42vw,360px)] min-w-[180px] rounded-md border border-[#7C5CFF]/70 bg-[#101010] px-2 text-[12px] font-medium text-white outline-none shadow-[0_0_0_2px_rgba(124,92,255,0.14)]"
+                aria-label="Rename workflow"
+              />
+            ) : (
+              <button
+                type="button"
+                onClick={beginWorkflowRename}
+                title="Click to rename workflow"
+                className="group -ml-1.5 flex h-7 w-[min(42vw,360px)] min-w-[180px] items-center gap-1.5 rounded-md px-1.5 text-left text-[12px] font-medium text-white/85 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7C5CFF]/60"
+              >
+                <span className="truncate">{workflow.name}</span>
+                <Pencil className="h-3 w-3 shrink-0 text-white/35 opacity-70 transition-opacity group-hover:opacity-100" />
+              </button>
+            )}
             <div className="text-[10px] font-medium text-white/28">
               {workflow.nodes.length} nodes / {workflow.edges.length} connections
             </div>
@@ -9034,6 +9111,7 @@ const groupDragMirrorLog = (
             // clear a selection that lives inside a node the
             // user is interacting with.
             if (event.button !== 0) return
+            if (isRenamingWorkflow) commitWorkflowRename()
             const target = event.target as HTMLElement | null
             if (!target) return
             if (
