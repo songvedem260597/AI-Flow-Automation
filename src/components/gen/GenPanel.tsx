@@ -403,6 +403,8 @@ export const GenPanel: React.FC<{
   const [generatedCount, setGeneratedCount] = useState(0)
   const [multiPrompt, setMultiPrompt] = usePersistedState<boolean>('genpanel.multiPrompt', false)
   const [refMode, setRefMode] = usePersistedState<string>('genpanel.refMode', 'all')
+  const [imageMention, setImageMention] = useState<{ start: number; query: string } | null>(null)
+  const [imageMentionIndex, setImageMentionIndex] = useState(0)
   const [showSearch, setShowSearch] = useState(false)
   const [failedPrompts, setFailedPrompts] = useState<string[]>([])
   const [promptQueue, setPromptQueue] = useState<PromptRun[]>([])
@@ -430,6 +432,7 @@ export const GenPanel: React.FC<{
 
   const imageInputRef = useRef<HTMLInputElement>(null)
   const txtInputRef = useRef<HTMLInputElement>(null)
+  const promptTextareaRef = useRef<HTMLTextAreaElement>(null)
 
   // Throttled RENDER_STATE log — only fires when key UI state changes
   const lastRenderLogRef = useRef<string>('')
@@ -530,6 +533,105 @@ export const GenPanel: React.FC<{
     thumbnail?: string
     /** 'image' or 'video' */
     type?: 'image' | 'video'
+    /** Stable prompt alias without the @ prefix, e.g. image1 */
+    alias?: string
+  }
+
+  function getRefImageAlias(ref: RefImage, index: number): string {
+    return ref.alias || `image${index + 1}`
+  }
+
+  function mentionedImageAliases(promptText: string): Set<string> {
+    const aliases = new Set<string>()
+    for (const match of promptText.matchAll(/@image\d+\b/gi)) {
+      aliases.add(match[0].slice(1).toLowerCase())
+    }
+    return aliases
+  }
+
+  function selectReferenceImagesForPrompt(promptText: string, images: RefImage[]): RefImage[] {
+    if (refMode === 'none') return []
+    if (refMode !== 'mention') return images
+    const aliases = mentionedImageAliases(promptText)
+    return images.filter((ref, index) => aliases.has(getRefImageAlias(ref, index).toLowerCase()))
+  }
+
+  const imageMentionOptions = refImages.map((ref, index) => ({
+    ref,
+    alias: getRefImageAlias(ref, index),
+    index,
+  }))
+  const filteredImageMentionOptions = imageMention
+    ? imageMentionOptions.filter((option) => option.alias.toLowerCase().includes(imageMention.query.toLowerCase()))
+    : []
+
+  useEffect(() => {
+    if (refMode !== 'mention' || refImages.length === 0) {
+      setImageMention(null)
+      setImageMentionIndex(0)
+    }
+  }, [refMode, refImages.length])
+
+  const updateImageMentionFromPrompt = (value: string, cursor: number) => {
+    if (refMode !== 'mention' || refImages.length === 0) {
+      setImageMention(null)
+      return
+    }
+    const beforeCursor = value.slice(0, cursor)
+    const match = beforeCursor.match(/@([a-zA-Z0-9]*)$/)
+    if (!match) {
+      setImageMention(null)
+      return
+    }
+    const start = beforeCursor.length - match[0].length
+    const preceding = start > 0 ? beforeCursor[start - 1] : ''
+    if (preceding && !/[\s([,{]/.test(preceding)) {
+      setImageMention(null)
+      return
+    }
+    setImageMention({ start, query: match[1] || '' })
+    setImageMentionIndex(0)
+  }
+
+  const insertImageMention = (alias: string) => {
+    const textarea = promptTextareaRef.current
+    const currentCursor = textarea?.selectionStart ?? prompt.length
+    const replaceStart = imageMention?.start ?? currentCursor
+    const before = prompt.slice(0, replaceStart)
+    const after = prompt.slice(currentCursor)
+    const needsLeadingSpace = before.length > 0 && !/\s$/.test(before)
+    const needsTrailingSpace = after.length === 0 || !/^\s/.test(after)
+    const inserted = `${needsLeadingSpace ? ' ' : ''}@${alias}${needsTrailingSpace ? ' ' : ''}`
+    const nextPrompt = before + inserted + after
+    const nextCursor = before.length + inserted.length
+
+    setPrompt(nextPrompt)
+    setImageMention(null)
+    setImageMentionIndex(0)
+    requestAnimationFrame(() => {
+      const input = promptTextareaRef.current
+      if (!input) return
+      input.focus()
+      input.setSelectionRange(nextCursor, nextCursor)
+    })
+  }
+
+  const handlePromptKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (!imageMention || filteredImageMentionOptions.length === 0) return
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      setImageMentionIndex((current) => (current + 1) % filteredImageMentionOptions.length)
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      setImageMentionIndex((current) => (current - 1 + filteredImageMentionOptions.length) % filteredImageMentionOptions.length)
+    } else if (event.key === 'Enter' || event.key === 'Tab') {
+      event.preventDefault()
+      const selected = filteredImageMentionOptions[imageMentionIndex] || filteredImageMentionOptions[0]
+      if (selected) insertImageMention(selected.alias)
+    } else if (event.key === 'Escape') {
+      event.preventDefault()
+      setImageMention(null)
+    }
   }
 
   // ── Pending upload store helpers ────────────────────────────────────────────
@@ -628,6 +730,7 @@ export const GenPanel: React.FC<{
           name: realFileName,
           thumbnail: uploadResult.thumbnail || ref.thumbnail,
           type: ref.type,
+          alias: ref.alias,
         })
         resolvedFileIds.push(realTileId)
         resolvedFileNameMap[realTileId] = realFileName
@@ -650,25 +753,35 @@ export const GenPanel: React.FC<{
     // Mutable tracker shared across async onload closures
     const tracker = {
       count: 0,
-      newImages: [] as RefImage[],
+      newImages: new Array<RefImage>(imageFiles.length),
       pending: {} as Record<string, File>,
     }
 
-    imageFiles.forEach((file) => {
+    imageFiles.forEach((file, fileIndex) => {
       const uploadKey = makeUploadKey()
       tracker.pending[uploadKey] = file
       const reader = new FileReader()
       reader.onload = (e) => {
-        tracker.newImages.push({
+        tracker.newImages[fileIndex] = {
           id: uploadKey,
           name: file.name,
           thumbnail: e.target?.result as string,
           type: 'image',
-        })
+        }
         tracker.count++
         if (tracker.count === imageFiles.length) {
           setPendingUploads((prev) => ({ ...prev, ...tracker.pending }))
-          setRefImages((prev) => [...prev, ...tracker.newImages])
+          setRefImages((prev) => {
+            const highestAlias = prev.reduce((highest, ref, index) => {
+              const match = getRefImageAlias(ref, index).match(/^image(\d+)$/i)
+              return Math.max(highest, match ? Number(match[1]) : 0)
+            }, 0)
+            const aliasedImages = tracker.newImages.map((image, index) => ({
+              ...image,
+              alias: `image${highestAlias + index + 1}`,
+            }))
+            return [...prev, ...aliasedImages]
+          })
           if (imageInputRef.current) {
             imageInputRef.current.value = ''
           }
@@ -909,14 +1022,19 @@ const runPromptQueue = useCallback(async (
   try {
     // ── Resolve ref images ONE TIME before the loop ───────────────────────────
     let resolvedRefImages: RefImage[] = []
-    let resolvedFileIds: string[] = []
     let resolvedFileNameMap: Record<string, string> = {}
 
-    if (refImages.length > 0) {
+    const queueRefImages = refMode === 'mention'
+      ? refImages.filter((ref, index) => {
+          const alias = getRefImageAlias(ref, index).toLowerCase()
+          return promptTexts.some((text) => mentionedImageAliases(text).has(alias))
+        })
+      : selectReferenceImagesForPrompt('', refImages)
+
+    if (queueRefImages.length > 0) {
       setFlowStep('Uploading reference images...')
-      const resolved = await resolveReferenceImagesBeforeRun(refImages, pendingUploads)
+      const resolved = await resolveReferenceImagesBeforeRun(queueRefImages, pendingUploads)
       resolvedRefImages = resolved.resolvedRefImages
-      resolvedFileIds = resolved.resolvedFileIds
       resolvedFileNameMap = resolved.resolvedFileNameMap
     }
 
@@ -943,11 +1061,14 @@ const runPromptQueue = useCallback(async (
       ))
       setFlowStep(`[${i + 1}/${queue.length}] ${run.text.slice(0, 50)}...`)
 
-      const payload = buildGenerationPayload(
-        resolvedRefImages,
-        resolvedFileIds,
-        resolvedFileNameMap,
+      const promptRefImages = selectReferenceImagesForPrompt(run.text, resolvedRefImages)
+      const promptRefIds = promptRefImages.map((ref) => ref.id)
+      const promptRefNameMap = Object.fromEntries(
+        promptRefIds
+          .filter((id) => resolvedFileNameMap[id])
+          .map((id) => [id, resolvedFileNameMap[id]])
       )
+      const payload = buildGenerationPayload(promptRefImages, promptRefIds, promptRefNameMap)
       payload.prompt = run.text
       payload.promptIndex = i
       payload.promptTotal = queue.length
@@ -999,7 +1120,7 @@ const runPromptQueue = useCallback(async (
     setIsGenerating(false)
     setRunAbortController(null)
   }
-}, [autoDownload, refImages, pendingUploads, mode, aspectRatio, quantity, videoDuration,
+}, [autoDownload, refImages, pendingUploads, refMode, mode, aspectRatio, quantity, videoDuration,
     imageModel, videoModel, frameFileIds, styleId, subFolder,
     downloadRes, videoDownloadRes])
 
@@ -1056,6 +1177,7 @@ const handleGenerate = useCallback(async () => {
       }
 
       const hasFrameFileIds = frameFileIds && (frameFileIds.frame1 || frameFileIds.frame2)
+      const selectedRefImages = selectReferenceImagesForPrompt(prompt, refImages)
       console.log('[GenPanel][RUN_CLICK_STATE]', JSON.stringify({
         mode,
         isVideoMode: mode === 'video',
@@ -1067,7 +1189,7 @@ const handleGenerate = useCallback(async () => {
         videoDuration,
         duration: mode === 'video' ? videoDuration : '',
         isFrames: !!hasFrameFileIds,
-        refCount: refImages.length,
+        refCount: selectedRefImages.length,
       }, null, 2))
 
       // ── Step 0: Resolve all upload_xxx keys to real Flow tile IDs ──
@@ -1077,9 +1199,9 @@ const handleGenerate = useCallback(async () => {
       let resolvedFileIds: string[] = []
       let resolvedFileNameMap: Record<string, string> = {}
 
-      if (refImages.length > 0) {
+      if (selectedRefImages.length > 0) {
         setFlowStep('Uploading reference images...')
-        const resolved = await resolveReferenceImagesBeforeRun(refImages, pendingUploads)
+        const resolved = await resolveReferenceImagesBeforeRun(selectedRefImages, pendingUploads)
         resolvedRefImages = resolved.resolvedRefImages
         resolvedFileIds = resolved.resolvedFileIds
         resolvedFileNameMap = resolved.resolvedFileNameMap
@@ -1299,7 +1421,7 @@ const handleGenerate = useCallback(async () => {
     return
   }
 
-}, [prompt, multiPrompt, activeProvider, isGenerating, runPromptQueue, mode, aspectRatio, quantity, videoDuration, imageModel, videoModel, refImages, pendingUploads, frameFileIds, styleId, subFolder, autoDownload, downloadRes, videoDownloadRes])
+}, [prompt, multiPrompt, activeProvider, isGenerating, runPromptQueue, mode, aspectRatio, quantity, videoDuration, imageModel, videoModel, refImages, pendingUploads, refMode, frameFileIds, styleId, subFolder, autoDownload, downloadRes, videoDownloadRes])
 
   return (
     <div className="relative flex flex-col h-full bg-[#0A0A0A]">
@@ -1331,12 +1453,44 @@ const handleGenerate = useCallback(async () => {
 
           <div className="relative rounded-xl overflow-hidden border border-white/5">
             <textarea
+              ref={promptTextareaRef}
               value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
+              onChange={(event) => {
+                const value = event.target.value
+                setPrompt(value)
+                updateImageMentionFromPrompt(value, event.target.selectionStart ?? value.length)
+              }}
+              onKeyDown={handlePromptKeyDown}
               placeholder={`Describe what you want to generate...\n\n${multiPrompt ? 'Separate each prompt with a blank line' : ''}`}
               className="w-full min-h-[140px] px-3 py-2.5 bg-[#141414] text-xs text-white/70 placeholder:text-white/15 outline-none resize-none leading-relaxed"
               style={{ fontFamily: 'inherit' }}
             />
+
+            {imageMention && filteredImageMentionOptions.length > 0 && (
+              <div className="absolute bottom-10 left-3 z-40 max-h-32 w-56 overflow-y-auto rounded-xl border border-white/10 bg-[#1A1A1A] py-1 shadow-2xl">
+                {filteredImageMentionOptions.map((option, optionIndex) => (
+                  <button
+                    key={option.ref.id}
+                    type="button"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => insertImageMention(option.alias)}
+                    className={cn(
+                      'flex w-full items-center gap-2 px-2.5 py-2 text-left text-[11px] transition-colors',
+                      optionIndex === imageMentionIndex
+                        ? 'bg-[#7C5CFF]/15 text-[#B8A8FF]'
+                        : 'text-white/60 hover:bg-white/5 hover:text-white'
+                    )}
+                  >
+                    <img
+                      src={option.ref.thumbnail || option.ref.id}
+                      alt=""
+                      className="h-7 w-7 rounded-md object-cover"
+                    />
+                    <span className="font-medium">@{option.alias}</span>
+                  </button>
+                ))}
+              </div>
+            )}
 
             {/* Prompt toolbar */}
             <div className="flex items-center gap-1 px-2 py-1.5 bg-[#1A1A1A] border-t border-white/5">
@@ -1589,8 +1743,10 @@ const handleGenerate = useCallback(async () => {
             </button>
           </div>
 
-          {/* Upload bar */}
-          <div className="flex items-center gap-1.5">
+          {!(activeProvider === 'flow' && refMode === 'none') && (
+          <>
+            {/* Upload bar */}
+            <div className="flex items-center gap-1.5">
             <button
               onClick={() => imageInputRef.current?.click()}
               className="flex-1 flex items-center justify-center gap-2 px-3 py-2.5 bg-[#141414] rounded-xl text-[11px] text-white/40 hover:text-white/60 hover:bg-white/5 transition-colors border border-white/5 border-dashed hover:border-white/10"
@@ -1608,10 +1764,10 @@ const handleGenerate = useCallback(async () => {
               </svg>
             </button>
             <input ref={imageInputRef} type="file" accept="image/*" multiple className="hidden" onChange={(e) => handleFileSelect(e.target.files)} />
-          </div>
+            </div>
 
           {/* Drag hint + count */}
-          <div className="flex items-center justify-between mt-1.5">
+            <div className="flex items-center justify-between mt-1.5">
             {refImages.length > 0 && activeProvider === 'flow' && (
               <span className="text-[10px] text-white/25 flex items-center gap-1">
                 <GripVertical className="w-3 h-3" />
@@ -1621,23 +1777,49 @@ const handleGenerate = useCallback(async () => {
             {refImages.length > 0 && (
               <span className="ml-auto text-[10px] text-white/20">{refImages.length} selected</span>
             )}
-          </div>
+            </div>
 
           {/* Image grid */}
-          {refImages.length > 0 && (
+            {refImages.length > 0 && (
             <div className="mt-2 grid grid-cols-4 gap-1.5 h-full">
-              {refImages.map((img, i) => (
-                <div key={img.id} className="relative group h-full min-h-0">
-                  <img src={img.thumbnail || img.id} alt={img.name || ''} className="w-full h-full object-cover rounded-lg" />
-                  <button
-                    onClick={() => setRefImages((prev) => prev.filter((_, idx) => idx !== i))}
-                    className="absolute inset-0 flex items-center justify-center bg-black/50 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity"
-                  >
-                    <X className="w-4 h-4 text-white" />
-                  </button>
-                </div>
-              ))}
+              {refImages.map((img, i) => {
+                const alias = getRefImageAlias(img, i)
+                return (
+                  <div key={img.id} className="relative group h-full min-h-0">
+                    <img src={img.thumbnail || img.id} alt={`Reference @${alias}`} className="w-full h-full object-cover rounded-lg" />
+                    <span className="pointer-events-none absolute left-1 top-1 rounded-md bg-[#7C5CFF]/85 px-1.5 py-0.5 text-[9px] font-semibold text-white">
+                      @{alias}
+                    </span>
+                    <button
+                      onClick={() => setRefImages((prev) => prev.filter((_, idx) => idx !== i))}
+                      className="absolute inset-0 flex items-center justify-center bg-black/50 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity"
+                    >
+                      <X className="w-4 h-4 text-white" />
+                    </button>
+                  </div>
+                )
+              })}
             </div>
+            )}
+            {refImages.length > 0 && refMode === 'mention' && (
+            <div className="mt-2 flex flex-wrap items-center gap-1.5 rounded-lg bg-white/[0.03] px-2 py-1.5 text-[10px] text-white/30">
+              <span>Use in prompt:</span>
+              {refImages.map((ref, index) => {
+                const alias = getRefImageAlias(ref, index)
+                return (
+                  <button
+                    key={ref.id}
+                    type="button"
+                    onClick={() => insertImageMention(alias)}
+                    className="rounded-md bg-[#7C5CFF]/10 px-1.5 py-0.5 font-medium text-[#B8A8FF] hover:bg-[#7C5CFF]/20"
+                  >
+                    @{alias}
+                  </button>
+                )
+              })}
+            </div>
+            )}
+          </>
           )}
         </div>
         )}
