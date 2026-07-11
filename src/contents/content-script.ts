@@ -262,6 +262,19 @@ const AIFlowContentScript = {
           provider: detectProvider(),
           url: location.href,
         }
+      // owner: prompt-assistant
+      // Kept separate from RUN_CHATGPT_PROMPT / CHATGPT_SUBMIT_AND_WAIT so
+      // Prompt Assistant cannot alter the stable image-generation contract.
+      case 'PROMPT_ASSISTANT_PING': {
+        const provider = detectProvider()
+        return {
+          success: provider === 'chatgpt' || provider === 'gemini',
+          provider,
+          url: location.href,
+        }
+      }
+      case 'PROMPT_ASSISTANT_SUBMIT_TEXT':
+        return this.promptAssistantSubmitText(message.payload)
       case 'INSERT_PROMPT':
         return this.insertPrompt(message.payload.prompt)
       case 'UPLOAD_IMAGE':
@@ -1700,6 +1713,236 @@ const AIFlowContentScript = {
   dispatchInputEvent(element) {
     element.dispatchEvent(new Event('input', { bubbles: true }))
     element.dispatchEvent(new Event('change', { bubbles: true }))
+  },
+
+  // Prompt Assistant uses a text-only contract adapted from Toby Flow's
+  // submitText/submitAndWait path: snapshot, submit, then wait for a new
+  // stable response. It does not reuse the ChatGPT image job contract.
+  async promptAssistantSubmitText(payload) {
+    const provider = detectProvider()
+    const expectedProvider = payload?.provider
+    const instruction = String(payload?.instruction || '').trim()
+    const requestedTimeout = Number(payload?.timeoutMs)
+    const timeoutMs = Number.isFinite(requestedTimeout)
+      ? Math.max(15000, Math.min(180000, requestedTimeout))
+      : 90000
+
+    if (provider !== 'chatgpt' && provider !== 'gemini') {
+      return { success: false, error: 'UNSUPPORTED_PROVIDER', message: 'Prompt Assistant supports ChatGPT and Gemini only.' }
+    }
+    if (expectedProvider && provider !== expectedProvider) {
+      return { success: false, error: 'WRONG_PROVIDER_TAB', message: `Expected ${expectedProvider}, but this tab is ${provider}.` }
+    }
+    if (!instruction) {
+      return { success: false, error: 'EMPTY_INSTRUCTION', message: 'Enter an idea before generating prompts.' }
+    }
+
+    try {
+      return provider === 'chatgpt'
+        ? await this.promptAssistantSubmitChatGPTText(instruction, timeoutMs)
+        : await this.promptAssistantSubmitGeminiText(instruction, timeoutMs)
+    } catch (error) {
+      return {
+        success: false,
+        error: 'PROMPT_ASSISTANT_FAILED',
+        message: error?.message || String(error),
+      }
+    }
+  },
+
+  promptAssistantCleanText(value) {
+    let text = String(value || '').trim()
+    const fenced = text.match(/^```(?:text|markdown)?\s*([\s\S]*?)\s*```$/i)
+    if (fenced) text = fenced[1].trim()
+    return text.replace(/^\s*(?:final\s+)?prompt\s*:\s*/i, '').trim()
+  },
+
+  promptAssistantResponseText(element) {
+    if (!element) return ''
+    const content = element.querySelector?.('.markdown, .prose, message-content') || element
+    return this.promptAssistantCleanText(content?.innerText || content?.textContent || '')
+  },
+
+  promptAssistantChatGPTResponses() {
+    return Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'))
+      .filter((element) => {
+        const style = window.getComputedStyle(element)
+        return style.display !== 'none' && style.visibility !== 'hidden'
+      })
+  },
+
+  async promptAssistantSubmitChatGPTText(instruction, timeoutMs) {
+    await this.chatgptWaitForIdle(30000)
+    const baselineResponses = this.promptAssistantChatGPTResponses()
+    const baselineCount = baselineResponses.length
+    const baselineLastText = this.promptAssistantResponseText(baselineResponses[baselineCount - 1])
+
+    const submitted = await this.chatgptInjectTextAndSubmit(instruction)
+    if (!submitted) {
+      return { success: false, error: 'SUBMIT_FAILED', message: 'Could not submit the Prompt Assistant request to ChatGPT.' }
+    }
+
+    const startedAt = Date.now()
+    let lastText = ''
+    let stableCount = 0
+    while (Date.now() - startedAt < timeoutMs) {
+      const responses = this.promptAssistantChatGPTResponses()
+      const currentText = this.promptAssistantResponseText(responses[responses.length - 1])
+      const hasNewTurn = responses.length > baselineCount
+      const changedLastTurn = responses.length === baselineCount && currentText && currentText !== baselineLastText
+
+      if ((hasNewTurn || changedLastTurn) && currentText) {
+        if (currentText === lastText) stableCount += 1
+        else {
+          lastText = currentText
+          stableCount = 0
+        }
+        if (stableCount >= 3 && !this.chatgptIsGenerating()) {
+          return { success: true, text: currentText, provider: 'chatgpt' }
+        }
+      }
+      await this.chatgptSleep(500)
+    }
+
+    return { success: false, error: 'TIMEOUT', message: 'ChatGPT did not finish the prompt response in time.' }
+  },
+
+  promptAssistantFindGeminiComposer() {
+    const selectors = [
+      'rich-textarea .ql-editor[contenteditable="true"]',
+      '.ql-editor[contenteditable="true"]',
+      '[contenteditable="true"][role="textbox"]',
+      'textarea[aria-label*="prompt" i]',
+      'textarea[placeholder*="prompt" i]',
+    ]
+    for (const selector of selectors) {
+      const element = document.querySelector(selector)
+      if (!element) continue
+      const rect = element.getBoundingClientRect()
+      if (rect.width > 0 && rect.height > 0) return element
+    }
+    return null
+  },
+
+  promptAssistantGeminiResponses() {
+    for (const selector of ['model-response', '[data-test-id="model-response"]', '.model-response']) {
+      const responses = Array.from(document.querySelectorAll(selector))
+      if (responses.length > 0) return responses
+    }
+    return []
+  },
+
+  promptAssistantIsGeminiGenerating() {
+    const buttons = document.querySelectorAll('button[aria-label]')
+    for (const button of buttons) {
+      const label = String(button.getAttribute('aria-label') || '').toLowerCase()
+      if (label.includes('stop response') || label.includes('dừng phản hồi') || label === 'stop') return true
+    }
+    return !!document.querySelector('.markdown[aria-busy="true"], message-content[aria-busy="true"], mat-progress-bar:not([hidden])')
+  },
+
+  async promptAssistantInsertGeminiText(editor, instruction) {
+    editor.focus()
+    await this.chatgptSleep(150)
+
+    if (editor.tagName === 'TEXTAREA' || editor.tagName === 'INPUT') {
+      this.setInputValue(editor, instruction)
+      this.dispatchInputEvent(editor)
+    } else {
+      const selection = window.getSelection()
+      const range = document.createRange()
+      range.selectNodeContents(editor)
+      selection.removeAllRanges()
+      selection.addRange(range)
+      document.execCommand('delete', false)
+      const inserted = document.execCommand('insertText', false, instruction)
+      if (!inserted) editor.textContent = instruction
+      editor.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        inputType: 'insertText',
+        data: instruction,
+      }))
+    }
+
+    await this.chatgptSleep(250)
+    const current = String(editor.value || editor.textContent || '').trim()
+    return current.includes(instruction.slice(0, Math.min(24, instruction.length)))
+  },
+
+  promptAssistantFindGeminiSubmitButton(editor) {
+    const selectors = [
+      'button[aria-label*="Send message" i]',
+      'button[aria-label*="Send" i]',
+      'button[aria-label*="Gửi" i]',
+      'button.send-button',
+      '.send-button button',
+      '[data-test-id="send-button"]',
+    ]
+    for (const selector of selectors) {
+      const buttons = Array.from(document.querySelectorAll(selector))
+      const button = buttons.find((candidate) => {
+        const rect = candidate.getBoundingClientRect()
+        return rect.width > 0 && rect.height > 0 && !candidate.disabled && candidate.getAttribute('aria-disabled') !== 'true'
+      })
+      if (button) return button
+    }
+
+    const container = editor.closest('rich-textarea, form, [class*="input-area"], [class*="composer"]')
+    if (!container) return null
+    const buttons = Array.from(container.querySelectorAll('button:not([disabled])'))
+    return buttons.reverse().find((button) => {
+      const rect = button.getBoundingClientRect()
+      return rect.width > 0 && rect.height > 0
+    }) || null
+  },
+
+  async promptAssistantSubmitGeminiText(instruction, timeoutMs) {
+    const editor = this.promptAssistantFindGeminiComposer()
+    if (!editor) {
+      return { success: false, error: 'COMPOSER_NOT_FOUND', message: 'Gemini is not ready or you are not signed in.' }
+    }
+
+    const baselineResponses = this.promptAssistantGeminiResponses()
+    const baselineCount = baselineResponses.length
+    const baselineLastText = this.promptAssistantResponseText(baselineResponses[baselineCount - 1])
+    const inserted = await this.promptAssistantInsertGeminiText(editor, instruction)
+    if (!inserted) {
+      return { success: false, error: 'INSERT_FAILED', message: 'Could not enter the Prompt Assistant request in Gemini.' }
+    }
+
+    const submitButton = this.promptAssistantFindGeminiSubmitButton(editor)
+    if (submitButton) {
+      submitButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }))
+      submitButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
+      submitButton.click()
+    } else {
+      editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }))
+      editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }))
+    }
+
+    const startedAt = Date.now()
+    let lastText = ''
+    let stableCount = 0
+    while (Date.now() - startedAt < timeoutMs) {
+      const responses = this.promptAssistantGeminiResponses()
+      const currentText = this.promptAssistantResponseText(responses[responses.length - 1])
+      const hasNewTurn = responses.length > baselineCount
+      const changedLastTurn = responses.length === baselineCount && currentText && currentText !== baselineLastText
+
+      if ((hasNewTurn || changedLastTurn) && currentText) {
+        if (currentText === lastText) stableCount += 1
+        else {
+          lastText = currentText
+          stableCount = 0
+        }
+        if (stableCount >= 3 && !this.promptAssistantIsGeminiGenerating()) {
+          return { success: true, text: currentText, provider: 'gemini' }
+        }
+      }
+      await this.chatgptSleep(500)
+    }
+
+    return { success: false, error: 'TIMEOUT', message: 'Gemini did not finish the prompt response in time.' }
   },
 
   // ── ChatGPT submit + wait-for-images (fire-and-forget) ─────────────────

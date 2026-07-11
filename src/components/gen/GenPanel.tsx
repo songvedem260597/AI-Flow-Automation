@@ -4,9 +4,10 @@ import { AnimatePresence, motion } from 'framer-motion'
 import {
   Upload, Bookmark, Minus, Plus, Trash2,
   Image as ImageIcon, Video, ChevronDown, Download, RotateCcw,
-  Search, X, FileText, GripVertical, WandSparkles, Check, ChevronUp
+  Search, X, FileText, GripVertical, WandSparkles, Check, ChevronUp, LoaderCircle
 } from 'lucide-react'
 import { cn, usePersistedState } from '@/lib/utils'
+import { runPromptAssistant, type PromptAssistantProvider } from '@/lib/promptAssistant'
 import { usePromptStore } from '@/stores/dataStore'
 
 // ─── Flow Model Constants ───────────────────────────────────────────────────────
@@ -392,6 +393,36 @@ function buildPromptAssistantText(args: {
   return prompts.join('\n\n')
 }
 
+function buildPromptAssistantInstruction(args: {
+  idea: string
+  mediaType: GenMode
+  aspectRatio: AspectRatio
+  count: number
+  language: PromptAssistantLanguage
+  detail: PromptAssistantDetail
+  style: string
+  lighting: string
+  camera: string
+  tone: string
+}): string {
+  const structuredBrief = buildPromptAssistantText(args)
+  const language = args.language === 'Vietnamese' ? 'Vietnamese' : 'English'
+  const plural = args.count === 1 ? 'prompt' : 'prompts'
+
+  return [
+    'You are a professional prompt engineer for AI image and video generation.',
+    `Rewrite the source brief into exactly ${args.count} production-ready ${args.mediaType} ${plural}.`,
+    `Write in ${language}. Use the requested detail level: ${args.detail}.`,
+    `The intended aspect ratio is ${args.aspectRatio}.`,
+    'Preserve every reference token such as @image1 or @image2 exactly as written.',
+    'Return only the finished prompt text. Do not add explanations, headings, markdown fences, or quotation marks.',
+    args.count > 1 ? 'Separate prompts with one blank line.' : '',
+    '',
+    'Source brief:',
+    structuredBrief,
+  ].filter((line) => line !== '').join('\n')
+}
+
 const AssistantSelect: React.FC<{
   value: string
   options: string[]
@@ -449,6 +480,7 @@ const PromptAssistantModal: React.FC<{
   onApply: (result: PromptAssistantResult) => void
 }> = ({ initialIdea, initialMediaType, initialAspectRatio, referenceAliases, onClose, onApply }) => {
   const [idea, setIdea] = useState(initialIdea)
+  const [assistantProvider, setAssistantProvider] = useState<PromptAssistantProvider>('chatgpt')
   const [mediaType, setMediaType] = useState<GenMode>(initialMediaType)
   const [count, setCount] = useState(1)
   const [language, setLanguage] = useState<PromptAssistantLanguage>('English')
@@ -459,6 +491,8 @@ const PromptAssistantModal: React.FC<{
   const [tone, setTone] = useState('Auto')
   const [assistantAspectRatio, setAssistantAspectRatio] = useState<AspectRatio>(initialAspectRatio)
   const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [isGeneratingPrompt, setIsGeneratingPrompt] = useState(false)
+  const [assistantError, setAssistantError] = useState('')
 
   const appendReferenceAlias = (alias: string) => {
     const token = `@${alias}`
@@ -466,12 +500,15 @@ const PromptAssistantModal: React.FC<{
     setIdea((current) => `${current.trim()}${current.trim() ? ' ' : ''}${token}`)
   }
 
-  const applyAssistant = () => {
-    if (!idea.trim()) return
-    onApply({
-      text: buildPromptAssistantText({
+  const applyAssistant = async () => {
+    if (!idea.trim() || isGeneratingPrompt) return
+    setIsGeneratingPrompt(true)
+    setAssistantError('')
+    try {
+      const instruction = buildPromptAssistantInstruction({
         idea,
         mediaType,
+        aspectRatio: assistantAspectRatio,
         count,
         language,
         detail,
@@ -479,10 +516,14 @@ const PromptAssistantModal: React.FC<{
         lighting,
         camera,
         tone,
-      }),
-      mediaType,
-      aspectRatio: assistantAspectRatio,
-    })
+      })
+      const text = await runPromptAssistant(assistantProvider, instruction)
+      onApply({ text, mediaType, aspectRatio: assistantAspectRatio })
+    } catch (error) {
+      setAssistantError(error instanceof Error ? error.message : 'Prompt Assistant failed. Please try again.')
+    } finally {
+      setIsGeneratingPrompt(false)
+    }
   }
 
   const labelClass = 'mb-2 block text-[10px] font-semibold uppercase tracking-[0.12em] text-white/35'
@@ -528,6 +569,12 @@ const PromptAssistantModal: React.FC<{
                 autoFocus
                 value={idea}
                 onChange={(event) => setIdea(event.target.value)}
+                onKeyDown={(event) => {
+                  if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+                    event.preventDefault()
+                    void applyAssistant()
+                  }
+                }}
                 placeholder="Describe the result you want. Mention references with @image1, @image2..."
                 className="min-h-[138px] w-full resize-y bg-transparent px-3 py-2.5 text-[13px] leading-6 text-white/80 outline-none placeholder:text-white/22"
               />
@@ -551,6 +598,40 @@ const PromptAssistantModal: React.FC<{
                   @{alias}
                 </button>
               ))}
+            </div>
+          )}
+
+          <section className="mt-4 flex flex-col gap-2.5 rounded-2xl border border-white/[0.07] bg-[#141414] p-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-[11px] font-semibold text-white/65">Generate with</p>
+              <p className="mt-0.5 text-[9px] text-white/25">Uses your signed-in provider tab and returns the finished text here.</p>
+            </div>
+            <div className="grid grid-cols-2 gap-1 rounded-xl border border-white/[0.07] bg-[#0F0F0F] p-1">
+              {(['chatgpt', 'gemini'] as PromptAssistantProvider[]).map((provider) => (
+                <button
+                  key={provider}
+                  type="button"
+                  onClick={() => {
+                    setAssistantProvider(provider)
+                    setAssistantError('')
+                  }}
+                  className={cn(
+                    'flex h-8 min-w-[92px] items-center justify-center gap-2 rounded-lg px-3 text-[11px] font-semibold transition-all',
+                    assistantProvider === provider
+                      ? 'bg-[#7C5CFF]/20 text-[#D0C6FF] shadow-sm'
+                      : 'text-white/35 hover:bg-white/[0.04] hover:text-white/65'
+                  )}
+                >
+                  <span className={cn('h-1.5 w-1.5 rounded-full', assistantProvider === provider ? 'bg-[#A995FF]' : 'bg-white/20')} />
+                  {provider === 'chatgpt' ? 'ChatGPT' : 'Gemini'}
+                </button>
+              ))}
+            </div>
+          </section>
+
+          {assistantError && (
+            <div className="mt-3 rounded-xl border border-red-400/20 bg-red-400/[0.07] px-3 py-2.5 text-[10px] leading-4 text-red-200/80">
+              {assistantError}
             </div>
           )}
 
@@ -683,8 +764,8 @@ const PromptAssistantModal: React.FC<{
 
         <footer className="flex shrink-0 items-center gap-3 border-t border-white/[0.07] bg-[#151515] px-5 py-3.5">
           <div className="hidden min-w-0 flex-1 sm:block">
-            <p className="truncate text-[11px] font-medium text-white/45">{count} {count === 1 ? 'prompt' : 'prompts'} · {mediaType} · {assistantAspectRatio}</p>
-            <p className="mt-0.5 text-[9px] text-white/22">Your current prompt is replaced only after generation.</p>
+            <p className="truncate text-[11px] font-medium text-white/45">{count} {count === 1 ? 'prompt' : 'prompts'} · {mediaType} · {assistantAspectRatio} · {assistantProvider === 'chatgpt' ? 'ChatGPT' : 'Gemini'}</p>
+            <p className="mt-0.5 text-[9px] text-white/22">Your current prompt is replaced only after the AI response is complete.</p>
           </div>
           <button type="button" onClick={onClose} className="h-10 rounded-xl px-4 text-[12px] font-semibold text-white/40 transition-colors hover:bg-white/[0.05] hover:text-white/75">
             Cancel
@@ -692,16 +773,16 @@ const PromptAssistantModal: React.FC<{
           <button
             type="button"
             onClick={applyAssistant}
-            disabled={!idea.trim()}
+            disabled={!idea.trim() || isGeneratingPrompt}
             className={cn(
               'flex h-10 min-w-[170px] items-center justify-center gap-2 rounded-xl px-5 text-[12px] font-semibold transition-all',
-              idea.trim()
+              idea.trim() && !isGeneratingPrompt
                 ? 'bg-[#7C5CFF] text-white shadow-[0_8px_24px_rgba(124,92,255,0.28)] hover:bg-[#8768FF] active:translate-y-px'
                 : 'cursor-not-allowed bg-white/5 text-white/20'
             )}
           >
-            <WandSparkles className="h-4 w-4" />
-            Generate prompts
+            {isGeneratingPrompt ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <WandSparkles className="h-4 w-4" />}
+            {isGeneratingPrompt ? `Waiting for ${assistantProvider === 'chatgpt' ? 'ChatGPT' : 'Gemini'}...` : 'Generate prompts'}
           </button>
         </footer>
       </motion.div>
