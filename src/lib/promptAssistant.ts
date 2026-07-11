@@ -2,6 +2,12 @@ import { PROVIDER_TABS } from '@/constants'
 
 export type PromptAssistantProvider = 'chatgpt' | 'gemini'
 
+export interface PromptAssistantMediaUpload {
+  base64: string
+  name: string
+  type: string
+}
+
 interface PromptAssistantResponse {
   success?: boolean
   text?: string
@@ -107,13 +113,14 @@ export async function runPromptAssistant(
   provider: PromptAssistantProvider,
   instruction: string,
   timeoutMs = 90000,
+  mediaUploads: PromptAssistantMediaUpload[] = [],
 ): Promise<string> {
   const tabId = await findOrCreateProviderTab(provider)
   await ensurePromptAssistantListener(tabId, provider)
 
   const response = await chrome.tabs.sendMessage(tabId, {
     action: 'PROMPT_ASSISTANT_SUBMIT_TEXT',
-    payload: { provider, instruction, timeoutMs },
+    payload: { provider, instruction, timeoutMs, mediaUploads: mediaUploads.slice(0, 5) },
   }) as PromptAssistantResponse
 
   if (!response?.success || !response.text?.trim()) {

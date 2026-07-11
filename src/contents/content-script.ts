@@ -1722,6 +1722,9 @@ const AIFlowContentScript = {
     const provider = detectProvider()
     const expectedProvider = payload?.provider
     const instruction = String(payload?.instruction || '').trim()
+    const mediaUploads = Array.isArray(payload?.mediaUploads)
+      ? payload.mediaUploads.filter((item) => item && (item.base64 || item.data)).slice(0, 5)
+      : []
     const requestedTimeout = Number(payload?.timeoutMs)
     const timeoutMs = Number.isFinite(requestedTimeout)
       ? Math.max(15000, Math.min(180000, requestedTimeout))
@@ -1739,8 +1742,8 @@ const AIFlowContentScript = {
 
     try {
       return provider === 'chatgpt'
-        ? await this.promptAssistantSubmitChatGPTText(instruction, timeoutMs)
-        : await this.promptAssistantSubmitGeminiText(instruction, timeoutMs)
+        ? await this.promptAssistantSubmitChatGPTText(instruction, timeoutMs, mediaUploads)
+        : await this.promptAssistantSubmitGeminiText(instruction, timeoutMs, mediaUploads)
     } catch (error) {
       return {
         success: false,
@@ -1771,8 +1774,18 @@ const AIFlowContentScript = {
       })
   },
 
-  async promptAssistantSubmitChatGPTText(instruction, timeoutMs) {
+  async promptAssistantSubmitChatGPTText(instruction, timeoutMs, mediaUploads = []) {
     await this.chatgptWaitForIdle(30000)
+    if (mediaUploads.length > 0) {
+      const uploadResult = await this.uploadImagesBatchViaFileInput(mediaUploads, `prompt-assistant-${Date.now()}`)
+      if (!uploadResult?.success) {
+        return {
+          success: false,
+          error: 'REF_UPLOAD_FAILED',
+          message: `Could not attach reference images to ChatGPT: ${uploadResult?.error || 'unknown upload error'}`,
+        }
+      }
+    }
     const baselineResponses = this.promptAssistantChatGPTResponses()
     const baselineCount = baselineResponses.length
     const baselineLastText = this.promptAssistantResponseText(baselineResponses[baselineCount - 1])
@@ -1841,7 +1854,44 @@ const AIFlowContentScript = {
     return !!document.querySelector('.markdown[aria-busy="true"], message-content[aria-busy="true"], mat-progress-bar:not([hidden])')
   },
 
-  async promptAssistantInsertGeminiText(editor, instruction) {
+  async promptAssistantUploadGeminiImages(editor, mediaUploads) {
+    if (!Array.isArray(mediaUploads) || mediaUploads.length === 0) return { success: true }
+    const files = mediaUploads.map((item, index) => {
+      const base64 = item?.base64 || item?.data || ''
+      const type = item?.type || 'image/png'
+      const name = item?.name || `prompt-assistant-ref-${index + 1}.png`
+      return this.chatgptBase64ToFile(base64, name, type)
+    })
+
+    const inputs = Array.from(document.querySelectorAll('input[type="file"]'))
+    const fileInput = inputs.find((input) => {
+      const accept = String(input.accept || '').toLowerCase()
+      return input.multiple || accept.includes('image') || accept === ''
+    })
+    if (fileInput) {
+      this.chatgptSetInputFiles(fileInput, files)
+      await this.chatgptSleep(1200)
+      return { success: true, strategy: 'file-input' }
+    }
+
+    editor.focus()
+    const transfer = new DataTransfer()
+    files.forEach((file) => transfer.items.add(file))
+    try {
+      const pasteEvent = new ClipboardEvent('paste', {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: transfer,
+      })
+      editor.dispatchEvent(pasteEvent)
+      await this.chatgptSleep(1400)
+      return { success: true, strategy: 'batch-paste' }
+    } catch (error) {
+      return { success: false, error: error?.message || 'Gemini image paste failed' }
+    }
+  },
+
+  async promptAssistantInsertGeminiText(editor, instruction, preserveAttachments = false) {
     editor.focus()
     await this.chatgptSleep(150)
 
@@ -1852,16 +1902,22 @@ const AIFlowContentScript = {
       const selection = window.getSelection()
       const range = document.createRange()
       range.selectNodeContents(editor)
+      if (preserveAttachments) range.collapse(false)
       selection.removeAllRanges()
       selection.addRange(range)
-      document.execCommand('delete', false)
+      if (!preserveAttachments) document.execCommand('delete', false)
       const inserted = document.execCommand('insertText', false, instruction)
-      if (!inserted) editor.textContent = instruction
-      editor.dispatchEvent(new InputEvent('input', {
-        bubbles: true,
-        inputType: 'insertText',
-        data: instruction,
-      }))
+      if (!inserted) {
+        if (preserveAttachments) editor.appendChild(document.createTextNode(instruction))
+        else editor.textContent = instruction
+      }
+      if (!preserveAttachments || !inserted) {
+        editor.dispatchEvent(new InputEvent('input', {
+          bubbles: true,
+          inputType: 'insertText',
+          data: instruction,
+        }))
+      }
     }
 
     await this.chatgptSleep(250)
@@ -1896,16 +1952,25 @@ const AIFlowContentScript = {
     }) || null
   },
 
-  async promptAssistantSubmitGeminiText(instruction, timeoutMs) {
+  async promptAssistantSubmitGeminiText(instruction, timeoutMs, mediaUploads = []) {
     const editor = this.promptAssistantFindGeminiComposer()
     if (!editor) {
       return { success: false, error: 'COMPOSER_NOT_FOUND', message: 'Gemini is not ready or you are not signed in.' }
     }
 
+    const uploadResult = await this.promptAssistantUploadGeminiImages(editor, mediaUploads)
+    if (!uploadResult?.success) {
+      return {
+        success: false,
+        error: 'REF_UPLOAD_FAILED',
+        message: `Could not attach reference images to Gemini: ${uploadResult?.error || 'unknown upload error'}`,
+      }
+    }
+
     const baselineResponses = this.promptAssistantGeminiResponses()
     const baselineCount = baselineResponses.length
     const baselineLastText = this.promptAssistantResponseText(baselineResponses[baselineCount - 1])
-    const inserted = await this.promptAssistantInsertGeminiText(editor, instruction)
+    const inserted = await this.promptAssistantInsertGeminiText(editor, instruction, mediaUploads.length > 0)
     if (!inserted) {
       return { success: false, error: 'INSERT_FAILED', message: 'Could not enter the Prompt Assistant request in Gemini.' }
     }

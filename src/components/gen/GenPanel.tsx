@@ -4,10 +4,12 @@ import { AnimatePresence, motion } from 'framer-motion'
 import {
   Upload, Bookmark, Minus, Plus, Trash2,
   Image as ImageIcon, Video, ChevronDown, Download, RotateCcw,
-  Search, X, FileText, GripVertical, WandSparkles, Check, ChevronUp, LoaderCircle
+  Search, X, FileText, GripVertical, WandSparkles, Check, ChevronUp, LoaderCircle,
+  Globe2, AlignLeft, Palette, Sun, Camera, Clock3, Activity, RectangleHorizontal
 } from 'lucide-react'
 import { cn, usePersistedState } from '@/lib/utils'
-import { runPromptAssistant, type PromptAssistantProvider } from '@/lib/promptAssistant'
+import { runPromptAssistant, type PromptAssistantMediaUpload, type PromptAssistantProvider } from '@/lib/promptAssistant'
+import { PROMPT_ASSISTANT_STYLE_THUMBNAIL_URLS } from '@/lib/promptAssistantStyleThumbnails'
 import { usePromptStore } from '@/stores/dataStore'
 
 // ─── Flow Model Constants ───────────────────────────────────────────────────────
@@ -288,15 +290,164 @@ interface PromptAssistantResult {
   aspectRatio: AspectRatio
 }
 
-const PROMPT_ASSISTANT_STYLES = [
-  'Auto',
-  'Cinematic',
-  'Editorial',
-  'Photorealistic',
-  'Anime',
-  'Product',
-  'Documentary',
+interface PromptAssistantReferenceImage {
+  id: string
+  file: File
+  previewUrl: string
+}
+
+function promptAssistantFileToUpload(file: File): Promise<PromptAssistantMediaUpload> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const value = String(reader.result || '')
+      const commaIndex = value.indexOf(',')
+      resolve({
+        base64: commaIndex >= 0 ? value.slice(commaIndex + 1) : value,
+        name: file.name || `reference-${Date.now()}.png`,
+        type: file.type || 'image/png',
+      })
+    }
+    reader.onerror = () => reject(new Error(`Could not read ${file.name || 'reference image'}.`))
+    reader.readAsDataURL(file)
+  })
+}
+
+const PROMPT_ASSISTANT_STYLE_CATEGORIES = ['Animation', 'Storytelling', 'Lifestyle', 'Education', 'Relax', 'Fitness'] as const
+
+type PromptAssistantStyleCategory = typeof PROMPT_ASSISTANT_STYLE_CATEGORIES[number]
+
+interface PromptAssistantStyleAddon {
+  id: string
+  name: string
+  category: PromptAssistantStyleCategory
+  thumbnail: string
+  premium?: boolean
+}
+
+function createPromptAssistantStyleThumbnail(name: string, from: string, to: string, accent: string): string {
+  const initials = name.split(/\s+/).slice(0, 2).map((part) => part[0]).join('').toUpperCase()
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 160">
+    <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="${from}"/><stop offset="1" stop-color="${to}"/></linearGradient></defs>
+    <rect width="120" height="160" rx="14" fill="url(#g)"/>
+    <circle cx="92" cy="30" r="18" fill="${accent}" opacity=".65"/>
+    <path d="M0 118 29 88l22 22 23-35 46 51v34H0Z" fill="${accent}" opacity=".28"/>
+    <circle cx="59" cy="69" r="24" fill="#fff" opacity=".16"/>
+    <text x="60" y="78" text-anchor="middle" font-family="Arial,sans-serif" font-size="24" font-weight="700" fill="#fff">${initials}</text>
+  </svg>`
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
+}
+
+const PROMPT_ASSISTANT_STYLE_ADDONS: PromptAssistantStyleAddon[] = [
+  { id: 'doodle-dreams', name: 'Doodle Dreams', category: 'Animation', premium: true, thumbnail: createPromptAssistantStyleThumbnail('Doodle Dreams', '#0F1830', '#273B7A', '#F9D648') },
+  { id: '3d-family', name: '3D Family', category: 'Animation', premium: true, thumbnail: createPromptAssistantStyleThumbnail('3D Family', '#6F5143', '#D3A47D', '#F3D0A9') },
+  { id: 'kids-nursery', name: 'Kids Nursery', category: 'Animation', thumbnail: createPromptAssistantStyleThumbnail('Kids Nursery', '#F1B98E', '#FFD96A', '#72D6C9') },
+  { id: 'anime-manga', name: 'Anime / Manga', category: 'Animation', thumbnail: createPromptAssistantStyleThumbnail('Anime Manga', '#101B49', '#DB315F', '#4E8BFF') },
+  { id: 'ghibli-watercolor', name: 'Ghibli Watercolor', category: 'Animation', thumbnail: createPromptAssistantStyleThumbnail('Ghibli Watercolor', '#74A985', '#CFE1B9', '#F0D99B') },
+  { id: 'clay-story', name: 'Clay Story', category: 'Animation', thumbnail: createPromptAssistantStyleThumbnail('Clay Story', '#B05B4E', '#E6A56F', '#F7D0AE') },
+  { id: 'paper-cut', name: 'Paper Cut', category: 'Animation', thumbnail: createPromptAssistantStyleThumbnail('Paper Cut', '#5D397D', '#D06790', '#F4B7D2') },
+
+  { id: 'cinematic-story', name: 'Cinematic Story', category: 'Storytelling', premium: true, thumbnail: createPromptAssistantStyleThumbnail('Cinematic Story', '#111827', '#4B5563', '#F59E0B') },
+  { id: 'documentary', name: 'Documentary', category: 'Storytelling', thumbnail: createPromptAssistantStyleThumbnail('Documentary', '#2E3A3B', '#71827C', '#D7C9A5') },
+  { id: 'storybook', name: 'Storybook', category: 'Storytelling', thumbnail: createPromptAssistantStyleThumbnail('Storybook', '#644B7A', '#D08AA5', '#F6D28B') },
+  { id: 'fantasy-quest', name: 'Fantasy Quest', category: 'Storytelling', thumbnail: createPromptAssistantStyleThumbnail('Fantasy Quest', '#163B4D', '#5067A1', '#D0B866') },
+
+  { id: 'editorial-fashion', name: 'Editorial Fashion', category: 'Lifestyle', premium: true, thumbnail: createPromptAssistantStyleThumbnail('Editorial Fashion', '#532D3A', '#B36B78', '#F5D6D0') },
+  { id: 'product-studio', name: 'Product Studio', category: 'Lifestyle', thumbnail: createPromptAssistantStyleThumbnail('Product Studio', '#24304B', '#5977A9', '#E9E6DD') },
+  { id: 'cozy-home', name: 'Cozy Home', category: 'Lifestyle', thumbnail: createPromptAssistantStyleThumbnail('Cozy Home', '#815F42', '#D3A778', '#F6E1B7') },
+  { id: 'travel-diary', name: 'Travel Diary', category: 'Lifestyle', thumbnail: createPromptAssistantStyleThumbnail('Travel Diary', '#17707C', '#7FC4BA', '#FFE39C') },
+
+  { id: 'learning-lab', name: 'Learning Lab', category: 'Education', thumbnail: createPromptAssistantStyleThumbnail('Learning Lab', '#1E4C68', '#4DA4B8', '#F5CE62') },
+  { id: 'science-explainer', name: 'Science Explainer', category: 'Education', premium: true, thumbnail: createPromptAssistantStyleThumbnail('Science Explainer', '#3B3478', '#6E71D9', '#68E0C1') },
+  { id: 'history-story', name: 'History Story', category: 'Education', thumbnail: createPromptAssistantStyleThumbnail('History Story', '#684B32', '#B08A5D', '#E9D1A1') },
+  { id: 'infographic', name: 'Infographic', category: 'Education', thumbnail: createPromptAssistantStyleThumbnail('Infographic', '#174A5A', '#2D8FA3', '#F09A63') },
+
+  { id: 'dreamy-pastel', name: 'Dreamy Pastel', category: 'Relax', thumbnail: createPromptAssistantStyleThumbnail('Dreamy Pastel', '#9677B5', '#E2B7CF', '#F8E1B8') },
+  { id: 'nature-calm', name: 'Nature Calm', category: 'Relax', thumbnail: createPromptAssistantStyleThumbnail('Nature Calm', '#376B58', '#86B892', '#D6E6B5') },
+  { id: 'lofi-night', name: 'Lo-fi Night', category: 'Relax', premium: true, thumbnail: createPromptAssistantStyleThumbnail('Lo-fi Night', '#22264B', '#70538F', '#E4A7C5') },
+  { id: 'soft-watercolor', name: 'Soft Watercolor', category: 'Relax', thumbnail: createPromptAssistantStyleThumbnail('Soft Watercolor', '#7AA6B3', '#C9DDB8', '#F0C7AE') },
+
+  { id: 'sports-energy', name: 'Sports Energy', category: 'Fitness', premium: true, thumbnail: createPromptAssistantStyleThumbnail('Sports Energy', '#4C1824', '#D63D42', '#FFB347') },
+  { id: 'yoga-flow', name: 'Yoga Flow', category: 'Fitness', thumbnail: createPromptAssistantStyleThumbnail('Yoga Flow', '#385B5B', '#84AFA3', '#E8D9B9') },
+  { id: 'running-campaign', name: 'Running Campaign', category: 'Fitness', thumbnail: createPromptAssistantStyleThumbnail('Running Campaign', '#173D65', '#2E7AB8', '#F3C65A') },
+  { id: 'gym-editorial', name: 'Gym Editorial', category: 'Fitness', thumbnail: createPromptAssistantStyleThumbnail('Gym Editorial', '#292929', '#686868', '#D8FF62') },
 ]
+
+const PROMPT_ASSISTANT_STYLE_THUMBNAILS_KEY = 'promptAssistantStyleThumbnailsV1'
+const PROMPT_ASSISTANT_STYLE_PROMPTS_KEY = 'promptAssistantStylePromptsV1'
+
+function getDefaultStyleEditPrompt(addon: PromptAssistantStyleAddon): string {
+  const categoryDirection: Record<PromptAssistantStyleCategory, string> = {
+    Animation: 'Transform the image into a polished animated illustration with expressive shapes, clean silhouettes, rich color harmony, and production-quality character styling.',
+    Storytelling: 'Reframe the image as a cinematic storytelling scene with clear visual hierarchy, environmental depth, purposeful lighting, and an emotionally readable focal subject.',
+    Lifestyle: 'Restyle the image as premium lifestyle editorial photography with natural materials, refined composition, believable lighting, and tasteful commercial polish.',
+    Education: 'Turn the image into a clear educational visual with an immediately readable subject, organized composition, friendly color contrast, and accurate supporting details.',
+    Relax: 'Create a calm atmospheric interpretation with soft color transitions, gentle natural light, uncluttered composition, and soothing tactile detail.',
+    Fitness: 'Create a high-energy fitness visual with a strong athletic focal subject, dynamic composition, crisp directional light, and realistic motion or muscle detail.',
+  }
+  return `${categoryDirection[addon.category]} Apply the specific visual identity of “${addon.name}”. Preserve the original subject and core composition. No text, logo, watermark, border, badge, or UI element.`
+}
+
+const PromptAssistantStyleThumbnailImage: React.FC<{
+  addon: PromptAssistantStyleAddon
+  customThumbnail?: string
+  className?: string
+}> = ({ addon, customThumbnail, className }) => {
+  return (
+    <img
+      src={customThumbnail || PROMPT_ASSISTANT_STYLE_THUMBNAIL_URLS[addon.id] || addon.thumbnail}
+      alt={addon.name}
+      className={cn('block object-cover', className)}
+      loading="lazy"
+    />
+  )
+}
+
+function compressPromptAssistantStyleThumbnail(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    if (!file.type.startsWith('image/')) {
+      reject(new Error('Please select an image file.'))
+      return
+    }
+    if (file.size > 12 * 1024 * 1024) {
+      reject(new Error('Thumbnail image must be smaller than 12 MB.'))
+      return
+    }
+
+    const objectUrl = URL.createObjectURL(file)
+    const image = new Image()
+    image.onload = () => {
+      try {
+        const targetWidth = 152
+        const targetHeight = 208
+        const canvas = document.createElement('canvas')
+        canvas.width = targetWidth
+        canvas.height = targetHeight
+        const context = canvas.getContext('2d')
+        if (!context) throw new Error('Image canvas is unavailable.')
+
+        const scale = Math.max(targetWidth / image.naturalWidth, targetHeight / image.naturalHeight)
+        const sourceWidth = targetWidth / scale
+        const sourceHeight = targetHeight / scale
+        const sourceX = Math.max(0, (image.naturalWidth - sourceWidth) / 2)
+        const sourceY = Math.max(0, (image.naturalHeight - sourceHeight) / 2)
+        context.drawImage(image, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, targetWidth, targetHeight)
+
+        const webp = canvas.toDataURL('image/webp', 0.8)
+        resolve(webp.startsWith('data:image/webp') ? webp : canvas.toDataURL('image/jpeg', 0.8))
+      } catch (error) {
+        reject(error)
+      } finally {
+        URL.revokeObjectURL(objectUrl)
+      }
+    }
+    image.onerror = () => {
+      URL.revokeObjectURL(objectUrl)
+      reject(new Error('Could not read this image.'))
+    }
+    image.src = objectUrl
+  })
+}
 
 const PROMPT_ASSISTANT_LIGHTING = [
   'Auto',
@@ -316,15 +467,6 @@ const PROMPT_ASSISTANT_CAMERAS = [
   'Overhead',
 ]
 
-const PROMPT_ASSISTANT_TONES = [
-  'Auto',
-  'Elegant',
-  'Energetic',
-  'Warm',
-  'Moody',
-  'Minimal',
-]
-
 function buildPromptAssistantText(args: {
   idea: string
   mediaType: GenMode
@@ -335,8 +477,17 @@ function buildPromptAssistantText(args: {
   lighting: string
   camera: string
   tone: string
+  totalSeconds: number
+  secondsPerImage: number
+  sequential: boolean
+  keepConsistent: boolean
+  numbered: boolean
+  autoWriteScript: boolean
+  burnSubtitles: boolean
+  negativePrompt: string
+  referenceImageCount: number
 }): string {
-  const count = Math.max(1, Math.min(5, args.count))
+  const count = Math.max(1, Math.min(10, args.count))
   const isVietnamese = args.language === 'Vietnamese'
   const variationsEn = [
     'hero composition with a clear focal point',
@@ -414,6 +565,14 @@ function buildPromptAssistantInstruction(args: {
     `Rewrite the source brief into exactly ${args.count} production-ready ${args.mediaType} ${plural}.`,
     `Write in ${language}. Use the requested detail level: ${args.detail}.`,
     `The intended aspect ratio is ${args.aspectRatio}.`,
+    `Timing target: ${args.totalSeconds} seconds total, approximately ${args.secondsPerImage} seconds per image or shot.`,
+    args.referenceImageCount > 0 ? `Use the ${args.referenceImageCount} attached reference image(s) in their displayed order.` : '',
+    args.sequential ? 'Arrange the output as a sequential storyboard with clear progression.' : '',
+    args.keepConsistent ? 'Keep characters, wardrobe, locations, lighting logic, and visual identity consistent across prompts.' : '',
+    args.numbered ? 'Number each prompt in sequence.' : 'Do not number the prompts.',
+    args.autoWriteScript ? 'Include concise narration or subtitle copy suitable for each shot.' : '',
+    args.burnSubtitles ? 'Describe subtitles as visibly burned into the generated image or video frame.' : '',
+    args.negativePrompt.trim() ? `Avoid these elements: ${args.negativePrompt.trim()}.` : '',
     'Preserve every reference token such as @image1 or @image2 exactly as written.',
     'Return only the finished prompt text. Do not add explanations, headings, markdown fences, or quotation marks.',
     args.count > 1 ? 'Separate prompts with one blank line.' : '',
@@ -484,15 +643,175 @@ const PromptAssistantModal: React.FC<{
   const [mediaType, setMediaType] = useState<GenMode>(initialMediaType)
   const [count, setCount] = useState(1)
   const [language, setLanguage] = useState<PromptAssistantLanguage>('English')
-  const [detail, setDetail] = useState<PromptAssistantDetail>('Balanced')
+  const [detail, setDetail] = useState<PromptAssistantDetail>('Concise')
   const [style, setStyle] = useState('Auto')
+  const [styleCategory, setStyleCategory] = useState<PromptAssistantStyleCategory>('Animation')
   const [lighting, setLighting] = useState('Auto')
   const [camera, setCamera] = useState('Auto')
-  const [tone, setTone] = useState('Auto')
+  const [tone, setTone] = useState('auto')
+  const [totalSeconds, setTotalSeconds] = useState('60')
+  const [secondsPerImage, setSecondsPerImage] = useState('5')
+  const [sequential, setSequential] = useState(true)
+  const [keepConsistent, setKeepConsistent] = useState(true)
+  const [numbered, setNumbered] = useState(true)
+  const [autoWriteScript, setAutoWriteScript] = useState(false)
+  const [burnSubtitles, setBurnSubtitles] = useState(false)
+  const [negativePrompt, setNegativePrompt] = useState('')
   const [assistantAspectRatio, setAssistantAspectRatio] = useState<AspectRatio>(initialAspectRatio)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [isGeneratingPrompt, setIsGeneratingPrompt] = useState(false)
   const [assistantError, setAssistantError] = useState('')
+  const [styleThumbnailOverrides, setStyleThumbnailOverrides] = useState<Record<string, string>>({})
+  const [styleThumbnailManagerOpen, setStyleThumbnailManagerOpen] = useState(false)
+  const [styleThumbnailEditorOpen, setStyleThumbnailEditorOpen] = useState(false)
+  const [styleThumbnailEditorId, setStyleThumbnailEditorId] = useState(PROMPT_ASSISTANT_STYLE_ADDONS[0].id)
+  const [styleThumbnailEditPrompt, setStyleThumbnailEditPrompt] = useState('')
+  const [stylePromptOverrides, setStylePromptOverrides] = useState<Record<string, string>>({})
+  const [assistantReferenceImages, setAssistantReferenceImages] = useState<PromptAssistantReferenceImage[]>([])
+  const [referenceDropActive, setReferenceDropActive] = useState(false)
+  const styleThumbnailInputRef = useRef<HTMLInputElement>(null)
+  const styleThumbnailTargetRef = useRef<string | null>(null)
+  const styleThumbnailManagerRef = useRef<HTMLDivElement>(null)
+  const assistantReferenceInputRef = useRef<HTMLInputElement>(null)
+  const assistantReferenceImagesRef = useRef<PromptAssistantReferenceImage[]>([])
+  const visibleStyleAddons = PROMPT_ASSISTANT_STYLE_ADDONS.filter((addon) => addon.category === styleCategory)
+
+  useEffect(() => {
+    if (!chrome?.storage?.local) return
+    chrome.storage.local.get([PROMPT_ASSISTANT_STYLE_THUMBNAILS_KEY, PROMPT_ASSISTANT_STYLE_PROMPTS_KEY]).then((stored) => {
+      const value = stored?.[PROMPT_ASSISTANT_STYLE_THUMBNAILS_KEY]
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        setStyleThumbnailOverrides(value as Record<string, string>)
+      }
+      const promptValue = stored?.[PROMPT_ASSISTANT_STYLE_PROMPTS_KEY]
+      if (promptValue && typeof promptValue === 'object' && !Array.isArray(promptValue)) {
+        setStylePromptOverrides(promptValue as Record<string, string>)
+      }
+    }).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    assistantReferenceImagesRef.current = assistantReferenceImages
+  }, [assistantReferenceImages])
+
+  useEffect(() => {
+    if (!styleThumbnailManagerOpen) return
+    const closeManager = (event: PointerEvent) => {
+      if (!styleThumbnailManagerRef.current?.contains(event.target as Node)) {
+        setStyleThumbnailManagerOpen(false)
+      }
+    }
+    document.addEventListener('pointerdown', closeManager, true)
+    return () => document.removeEventListener('pointerdown', closeManager, true)
+  }, [styleThumbnailManagerOpen])
+
+  useEffect(() => () => {
+    assistantReferenceImagesRef.current.forEach((image) => URL.revokeObjectURL(image.previewUrl))
+  }, [])
+
+  const persistStyleThumbnailOverrides = async (next: Record<string, string>) => {
+    setStyleThumbnailOverrides(next)
+    if (!chrome?.storage?.local) return
+    await chrome.storage.local.set({ [PROMPT_ASSISTANT_STYLE_THUMBNAILS_KEY]: next })
+  }
+
+  const openStyleThumbnailUpload = (styleId: string) => {
+    styleThumbnailTargetRef.current = styleId
+    if (styleThumbnailInputRef.current) {
+      styleThumbnailInputRef.current.value = ''
+      styleThumbnailInputRef.current.click()
+    }
+  }
+
+  const handleStyleThumbnailUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    const styleId = styleThumbnailTargetRef.current
+    if (!file || !styleId) return
+    try {
+      const thumbnail = await compressPromptAssistantStyleThumbnail(file)
+      await persistStyleThumbnailOverrides({ ...styleThumbnailOverrides, [styleId]: thumbnail })
+      setAssistantError('')
+    } catch (error) {
+      setAssistantError(error instanceof Error ? error.message : 'Could not save this style thumbnail.')
+    } finally {
+      styleThumbnailTargetRef.current = null
+      event.target.value = ''
+    }
+  }
+
+  const resetStyleThumbnail = async (styleId: string) => {
+    const next = { ...styleThumbnailOverrides }
+    delete next[styleId]
+    try {
+      await persistStyleThumbnailOverrides(next)
+      setAssistantError('')
+    } catch (error) {
+      setAssistantError(error instanceof Error ? error.message : 'Could not reset this style thumbnail.')
+    }
+  }
+
+  const openStyleThumbnailEditor = () => {
+    const firstStyle = visibleStyleAddons[0]
+    if (firstStyle) {
+      setStyleThumbnailEditorId(firstStyle.id)
+      setStyleThumbnailEditPrompt(stylePromptOverrides[firstStyle.id] || getDefaultStyleEditPrompt(firstStyle))
+    }
+    setStyleThumbnailManagerOpen(false)
+    setStyleThumbnailEditorOpen(true)
+  }
+
+  const selectStyleThumbnailEditor = (styleId: string) => {
+    const addon = PROMPT_ASSISTANT_STYLE_ADDONS.find((item) => item.id === styleId)
+    if (!addon) return
+    setStyleThumbnailEditorId(styleId)
+    setStyleThumbnailEditPrompt(stylePromptOverrides[styleId] || getDefaultStyleEditPrompt(addon))
+  }
+
+  const saveStyleEditPrompt = async () => {
+    if (!styleThumbnailEditPrompt.trim()) return
+    setAssistantError('')
+    try {
+      const next = { ...stylePromptOverrides, [styleThumbnailEditorId]: styleThumbnailEditPrompt.trim() }
+      setStylePromptOverrides(next)
+      await chrome.storage.local.set({ [PROMPT_ASSISTANT_STYLE_PROMPTS_KEY]: next })
+      setStyleThumbnailEditorOpen(false)
+    } catch (error) {
+      setAssistantError(error instanceof Error ? error.message : 'Could not save this style prompt.')
+    }
+  }
+
+  const addAssistantReferenceFiles = (files: File[]) => {
+    const imageFiles = files.filter((file) => file.type.startsWith('image/'))
+    if (imageFiles.length === 0) {
+      setAssistantError('Please select image files only.')
+      return
+    }
+    setAssistantReferenceImages((current) => {
+      const existing = new Set(current.map((image) => `${image.file.name}:${image.file.size}:${image.file.lastModified}`))
+      const next = [...current]
+      for (const file of imageFiles) {
+        if (next.length >= 5) break
+        const signature = `${file.name}:${file.size}:${file.lastModified}`
+        if (existing.has(signature)) continue
+        existing.add(signature)
+        next.push({
+          id: `assistant-ref-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          file,
+          previewUrl: URL.createObjectURL(file),
+        })
+      }
+      return next
+    })
+    setAssistantError('')
+  }
+
+  const removeAssistantReferenceImage = (id: string) => {
+    setAssistantReferenceImages((current) => {
+      const removed = current.find((image) => image.id === id)
+      if (removed) URL.revokeObjectURL(removed.previewUrl)
+      return current.filter((image) => image.id !== id)
+    })
+  }
 
   const appendReferenceAlias = (alias: string) => {
     const token = `@${alias}`
@@ -505,6 +824,10 @@ const PromptAssistantModal: React.FC<{
     setIsGeneratingPrompt(true)
     setAssistantError('')
     try {
+      const selectedStyleAddon = PROMPT_ASSISTANT_STYLE_ADDONS.find((addon) => addon.name === style)
+      const styleDirection = selectedStyleAddon
+        ? `${selectedStyleAddon.name}. ${stylePromptOverrides[selectedStyleAddon.id] || getDefaultStyleEditPrompt(selectedStyleAddon)}`
+        : style
       const instruction = buildPromptAssistantInstruction({
         idea,
         mediaType,
@@ -512,12 +835,22 @@ const PromptAssistantModal: React.FC<{
         count,
         language,
         detail,
-        style,
+        style: styleDirection,
         lighting,
         camera,
         tone,
+        totalSeconds: Math.max(1, Number(totalSeconds) || 60),
+        secondsPerImage: Math.max(1, Number(secondsPerImage) || 5),
+        sequential,
+        keepConsistent,
+        numbered,
+        autoWriteScript,
+        burnSubtitles,
+        negativePrompt,
+        referenceImageCount: assistantReferenceImages.length,
       })
-      const text = await runPromptAssistant(assistantProvider, instruction)
+      const mediaUploads = await Promise.all(assistantReferenceImages.map((image) => promptAssistantFileToUpload(image.file)))
+      const text = await runPromptAssistant(assistantProvider, instruction, 90000, mediaUploads)
       onApply({ text, mediaType, aspectRatio: assistantAspectRatio })
     } catch (error) {
       setAssistantError(error instanceof Error ? error.message : 'Prompt Assistant failed. Please try again.')
@@ -527,6 +860,8 @@ const PromptAssistantModal: React.FC<{
   }
 
   const labelClass = 'mb-2 block text-[10px] font-semibold uppercase tracking-[0.12em] text-white/35'
+  const advancedLabelClass = 'mb-1.5 flex items-center gap-1.5 text-[10px] font-medium text-white/40'
+  const advancedInputClass = 'h-10 w-full rounded-xl border border-white/[0.08] bg-[#121212] px-3 text-[12px] font-medium text-white/70 outline-none transition-colors placeholder:text-white/22 hover:border-white/[0.14] focus:border-[#7C5CFF]/70 focus:ring-2 focus:ring-[#7C5CFF]/10'
 
   return (
     <motion.div
@@ -542,7 +877,7 @@ const PromptAssistantModal: React.FC<{
         animate={{ opacity: 1, y: 0, scale: 1 }}
         exit={{ opacity: 0, y: 10, scale: 0.99 }}
         transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
-        className="flex max-h-[calc(100vh-32px)] w-full max-w-[700px] flex-col overflow-hidden rounded-[18px] border border-white/[0.1] bg-[#181818] shadow-[0_28px_90px_rgba(0,0,0,0.68)]"
+        className="relative flex max-h-[calc(100vh-32px)] w-full max-w-[700px] flex-col overflow-hidden rounded-[18px] border border-white/[0.1] bg-[#181818] shadow-[0_28px_90px_rgba(0,0,0,0.68)]"
         onMouseDown={(event) => event.stopPropagation()}
       >
         <header className="flex min-h-[64px] shrink-0 items-center gap-3 border-b border-white/[0.07] px-5">
@@ -606,26 +941,37 @@ const PromptAssistantModal: React.FC<{
               <p className="text-[11px] font-semibold text-white/65">Generate with</p>
               <p className="mt-0.5 text-[9px] text-white/25">Uses your signed-in provider tab and returns the finished text here.</p>
             </div>
-            <div className="grid grid-cols-2 gap-1 rounded-xl border border-white/[0.07] bg-[#0F0F0F] p-1">
-              {(['chatgpt', 'gemini'] as PromptAssistantProvider[]).map((provider) => (
-                <button
-                  key={provider}
-                  type="button"
-                  onClick={() => {
-                    setAssistantProvider(provider)
-                    setAssistantError('')
-                  }}
-                  className={cn(
-                    'flex h-8 min-w-[92px] items-center justify-center gap-2 rounded-lg px-3 text-[11px] font-semibold transition-all',
-                    assistantProvider === provider
-                      ? 'bg-[#7C5CFF]/20 text-[#D0C6FF] shadow-sm'
-                      : 'text-white/35 hover:bg-white/[0.04] hover:text-white/65'
-                  )}
-                >
-                  <span className={cn('h-1.5 w-1.5 rounded-full', assistantProvider === provider ? 'bg-[#A995FF]' : 'bg-white/20')} />
-                  {provider === 'chatgpt' ? 'ChatGPT' : 'Gemini'}
-                </button>
-              ))}
+            <div className="flex items-center gap-2">
+              {(['chatgpt', 'gemini'] as PromptAssistantProvider[]).map((provider) => {
+                const selected = assistantProvider === provider
+                const running = selected && isGeneratingPrompt
+                return (
+                  <button
+                    key={provider}
+                    type="button"
+                    aria-pressed={selected}
+                    disabled={isGeneratingPrompt}
+                    onClick={() => {
+                      setAssistantProvider(provider)
+                      setAssistantError('')
+                    }}
+                    className={cn(
+                      'flex h-8 items-center gap-2 rounded-lg border px-3 text-[11px] font-medium transition-all disabled:cursor-not-allowed',
+                      running
+                        ? 'border-white/[0.1] bg-emerald-500/12 text-emerald-300'
+                        : selected
+                          ? 'border-[#7C5CFF]/45 bg-[#7C5CFF]/16 text-[#D0C6FF]'
+                          : 'border-white/[0.09] bg-[#121212] text-white/45 hover:border-white/[0.16] hover:text-white/70'
+                    )}
+                  >
+                    <span className={cn(
+                      'h-2 w-2 rounded-full transition-colors',
+                      running ? 'bg-emerald-400' : selected ? 'bg-[#9F87FF]' : 'bg-white/30'
+                    )} />
+                    {provider === 'chatgpt' ? 'ChatGPT' : 'Gemini'}
+                  </button>
+                )
+              })}
             </div>
           </section>
 
@@ -636,94 +982,215 @@ const PromptAssistantModal: React.FC<{
           )}
 
           <section className="mt-5">
-            <span className={labelClass}>Visual direction</span>
-            <div className="flex flex-wrap gap-2">
-              {PROMPT_ASSISTANT_STYLES.map((option) => (
+            <input
+              ref={styleThumbnailInputRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={handleStyleThumbnailUpload}
+            />
+            <div className="relative z-40 flex items-center gap-4 overflow-visible">
+              <div className="flex min-w-0 flex-1 items-center gap-4 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                {PROMPT_ASSISTANT_STYLE_CATEGORIES.map((category) => (
+                  <button
+                    key={category}
+                    type="button"
+                    onClick={() => setStyleCategory(category)}
+                    className={cn(
+                      'shrink-0 text-[11px] transition-colors',
+                      styleCategory === category
+                        ? 'font-semibold text-white'
+                        : 'font-medium text-[#707070] hover:text-[#A8A8A8]'
+                    )}
+                  >
+                    {category}
+                  </button>
+                ))}
+              </div>
+              <div ref={styleThumbnailManagerRef} className="relative shrink-0">
                 <button
-                  key={option}
                   type="button"
-                  onClick={() => setStyle(option)}
+                  onClick={() => setStyleThumbnailManagerOpen((current) => !current)}
                   className={cn(
-                    'h-9 rounded-xl border px-3 text-[12px] font-medium transition-all',
-                    style === option
-                      ? 'border-[#7C5CFF]/55 bg-[#7C5CFF]/16 text-[#D0C6FF] shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]'
-                      : 'border-white/[0.07] bg-[#121212] text-white/45 hover:border-white/[0.14] hover:bg-[#151515] hover:text-white/75'
+                    'flex h-7 w-7 items-center justify-center rounded-lg border text-[13px] tracking-[0.08em] transition-colors',
+                    styleThumbnailManagerOpen
+                      ? 'border-[#7C5CFF]/45 bg-[#7C5CFF]/14 text-[#D0C6FF]'
+                      : 'border-white/[0.1] bg-[#121212] text-white/40 hover:bg-white/[0.06] hover:text-white/70'
                   )}
+                  title="Manage style thumbnails"
                 >
-                  {option}
+                  ···
                 </button>
-              ))}
+
+                {styleThumbnailManagerOpen && (
+                  <div className="absolute right-0 top-9 z-50 w-[218px] rounded-xl border border-white/[0.1] bg-[#1B1B1B] p-1.5 shadow-[0_18px_48px_rgba(0,0,0,0.65)]">
+                    <button type="button" onClick={openStyleThumbnailEditor} className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[10px] font-medium text-white/65 transition-colors hover:bg-white/[0.06] hover:text-white">
+                      <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#7C5CFF]/14 text-[#C8BCFF]">
+                        <ImageIcon className="h-3.5 w-3.5" />
+                      </span>
+                      <span>
+                        <span className="block">Upload ảnh thumbnail</span>
+                        <span className="mt-0.5 block text-[8px] font-normal text-white/28">Thêm, sửa hoặc xóa ảnh style</span>
+                      </span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="mt-3 overflow-x-auto overflow-y-hidden pb-7 [scrollbar-color:rgba(255,255,255,0.16)_transparent] [scrollbar-width:thin]">
+              <div className="flex min-w-max gap-2">
+                <button
+                  type="button"
+                  onClick={() => setStyle('Auto')}
+                  className="group h-[134px] w-[76px] shrink-0 text-left transition-transform hover:-translate-y-0.5"
+                  title="No visual style"
+                >
+                  <span className={cn(
+                    'flex h-[104px] w-full items-center justify-center rounded-xl border bg-[#202020] text-white/35 transition-colors',
+                    style === 'Auto'
+                      ? 'border-[#7C5CFF] ring-1 ring-[#7C5CFF]/30'
+                      : 'border-white/[0.1] group-hover:border-white/25 group-hover:text-white/55'
+                  )}>
+                    <span className="relative h-7 w-7 rounded-full border-2 border-current">
+                      <span className="absolute left-1/2 top-1/2 h-0.5 w-8 -translate-x-1/2 -translate-y-1/2 -rotate-45 rounded-full bg-current" />
+                    </span>
+                  </span>
+                  <span className="block truncate px-1 pt-1.5 text-center text-[9px] font-semibold text-white/55">None</span>
+                </button>
+
+                {visibleStyleAddons.map((addon) => {
+                  const customThumbnail = styleThumbnailOverrides[addon.id]
+                  return (
+                    <div key={addon.id} className="group relative h-[134px] w-[76px] shrink-0 overflow-visible transition-transform hover:-translate-y-0.5">
+                      <button type="button" onClick={() => setStyle(addon.name)} className="block h-full w-full text-left" title={addon.name}>
+                        <span className={cn(
+                          'block h-[104px] overflow-hidden rounded-xl border bg-[#202020] transition-colors',
+                          style === addon.name
+                            ? 'border-[#7C5CFF] ring-1 ring-[#7C5CFF]/30'
+                            : 'border-white/[0.1] group-hover:border-white/25'
+                        )}>
+                          <PromptAssistantStyleThumbnailImage addon={addon} customThumbnail={customThumbnail} className="h-full w-full" />
+                        </span>
+                        <span className="block truncate px-1 pt-1.5 text-[9px] font-semibold text-white/75">{addon.name}</span>
+                      </button>
+
+                      {addon.premium ? (
+                        <span className="absolute left-1 top-1 flex h-4 min-w-4 items-center justify-center rounded bg-black/65 px-1 text-[8px] text-[#D0C6FF]">♛</span>
+                      ) : null}
+
+                      <span className="pointer-events-none absolute left-1/2 top-[calc(100%+7px)] z-20 -translate-x-1/2 whitespace-nowrap rounded-md bg-black/90 px-2 py-1 text-[9px] font-medium text-white opacity-0 shadow-lg transition-opacity group-hover:opacity-100">
+                        {addon.name}
+                      </span>
+                    </div>
+                  )
+                })}
+              </div>
             </div>
           </section>
 
           <section className="mt-5 rounded-2xl border border-white/[0.07] bg-[#141414] p-4">
-            <div className="mb-4 flex items-center justify-between">
-              <div>
-                <h3 className="text-[12px] font-semibold text-white/70">Output setup</h3>
-                <p className="mt-0.5 text-[10px] text-white/28">Controls are applied back to the Gen tab.</p>
+            <div className="w-full sm:w-1/2">
+              <span className={advancedLabelClass}><AlignLeft className="h-3 w-3" />Count</span>
+              <div className="flex h-10 w-full items-center rounded-xl border border-white/[0.08] bg-[#121212] p-1 transition-colors focus-within:border-[#7C5CFF]/70 focus-within:ring-2 focus-within:ring-[#7C5CFF]/10">
+                <button
+                  type="button"
+                  onClick={() => setCount((current) => Math.max(1, current - 1))}
+                  disabled={count <= 1}
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-white/45 transition-colors hover:bg-white/[0.06] hover:text-white disabled:cursor-not-allowed disabled:text-white/12 disabled:hover:bg-transparent"
+                  aria-label="Decrease prompt count"
+                >
+                  <Minus className="h-3.5 w-3.5" />
+                </button>
+                <input
+                  type="number"
+                  min="1"
+                  max="10"
+                  value={count}
+                  onChange={(event) => setCount(Math.max(1, Math.min(10, Number(event.target.value) || 1)))}
+                  className="h-full min-w-0 flex-1 appearance-none bg-transparent text-center text-[12px] font-semibold text-white/75 outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                  aria-label="Number of prompts to return"
+                />
+                <button
+                  type="button"
+                  onClick={() => setCount((current) => Math.min(10, current + 1))}
+                  disabled={count >= 10}
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-white/45 transition-colors hover:bg-white/[0.06] hover:text-white disabled:cursor-not-allowed disabled:text-white/12 disabled:hover:bg-transparent"
+                  aria-label="Increase prompt count"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                </button>
               </div>
-              <span className="rounded-lg bg-[#7C5CFF]/10 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-[#A995FF]">{mediaType}</span>
-            </div>
-
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <div>
-                <span className={labelClass}>Media type</span>
-                <div className="grid grid-cols-2 gap-1 rounded-xl border border-white/[0.07] bg-[#0F0F0F] p-1">
-                  {(['image', 'video'] as GenMode[]).map((option) => (
-                    <button
-                      key={option}
-                      type="button"
-                      onClick={() => setMediaType(option)}
-                      className={cn(
-                        'flex h-9 items-center justify-center gap-2 rounded-lg text-[12px] font-semibold capitalize transition-all',
-                        mediaType === option
-                          ? 'bg-[#7C5CFF]/20 text-[#D0C6FF] shadow-sm'
-                          : 'text-white/35 hover:bg-white/[0.04] hover:text-white/65'
-                      )}
-                    >
-                      {option === 'image' ? <ImageIcon className="h-3.5 w-3.5" /> : <Video className="h-3.5 w-3.5" />}
-                      {option}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div>
-                <span className={labelClass}>Prompt count</span>
-                <div className="flex h-11 items-center justify-between rounded-xl border border-white/[0.07] bg-[#0F0F0F] px-1.5">
-                  <button type="button" onClick={() => setCount((current) => Math.max(1, current - 1))} className="flex h-8 w-8 items-center justify-center rounded-lg text-white/35 hover:bg-white/[0.05] hover:text-white">
-                    <Minus className="h-3.5 w-3.5" />
-                  </button>
-                  <div className="text-center">
-                    <span className="text-[14px] font-semibold text-white/80">{count}</span>
-                    <span className="ml-1.5 text-[10px] text-white/28">{count === 1 ? 'prompt' : 'prompts'}</span>
-                  </div>
-                  <button type="button" onClick={() => setCount((current) => Math.min(5, current + 1))} className="flex h-8 w-8 items-center justify-center rounded-lg text-white/35 hover:bg-white/[0.05] hover:text-white">
-                    <Plus className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              </div>
+              <p className="mt-1 text-[9px] text-white/24">Number of prompts ChatGPT or Gemini must return.</p>
             </div>
 
             <div className="mt-4">
-              <span className={labelClass}>Aspect ratio</span>
-              <div className="grid grid-cols-5 gap-1 rounded-xl border border-white/[0.07] bg-[#0F0F0F] p-1">
-              {ASPECT_RATIOS.map((ratio) => (
-                <button
-                  key={ratio.value}
-                  type="button"
-                  onClick={() => setAssistantAspectRatio(ratio.value)}
-                  className={cn(
-                    'h-9 rounded-lg text-[11px] font-semibold transition-all',
-                    assistantAspectRatio === ratio.value
-                      ? 'bg-[#7C5CFF]/20 text-[#D0C6FF]'
-                      : 'text-white/35 hover:bg-white/[0.04] hover:text-white/65'
-                  )}
-                >
-                  {ratio.value}
-                </button>
-              ))}
+              <div className="mb-2 flex items-center justify-between">
+                <span className={advancedLabelClass}><ImageIcon className="h-3 w-3" />Reference images</span>
+                <span className="text-[9px] font-medium text-white/28">{assistantReferenceImages.length}/5</span>
               </div>
+              <input
+                ref={assistantReferenceInputRef}
+                type="file"
+                accept="image/*"
+                multiple
+                className="hidden"
+                onChange={(event) => {
+                  addAssistantReferenceFiles(Array.from(event.target.files || []))
+                  event.target.value = ''
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => assistantReferenceInputRef.current?.click()}
+                onDragEnter={(event) => {
+                  event.preventDefault()
+                  setReferenceDropActive(true)
+                }}
+                onDragOver={(event) => {
+                  event.preventDefault()
+                  setReferenceDropActive(true)
+                }}
+                onDragLeave={(event) => {
+                  event.preventDefault()
+                  setReferenceDropActive(false)
+                }}
+                onDrop={(event) => {
+                  event.preventDefault()
+                  setReferenceDropActive(false)
+                  addAssistantReferenceFiles(Array.from(event.dataTransfer.files || []))
+                }}
+                disabled={assistantReferenceImages.length >= 5}
+                className={cn(
+                  'flex h-10 w-full items-center justify-center gap-2 rounded-xl border bg-[#121212] text-[10px] font-medium transition-colors',
+                  referenceDropActive
+                    ? 'border-[#7C5CFF]/70 bg-[#7C5CFF]/10 text-[#D0C6FF]'
+                    : 'border-white/[0.09] text-white/35 hover:border-white/[0.16] hover:text-white/60',
+                  assistantReferenceImages.length >= 5 && 'cursor-not-allowed opacity-45'
+                )}
+              >
+                <Upload className="h-3.5 w-3.5" />
+                Select / Drag image
+              </button>
+
+              {assistantReferenceImages.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {assistantReferenceImages.map((image, index) => (
+                    <div key={image.id} className="group relative h-12 w-12 overflow-visible rounded-lg border border-white/[0.1] bg-[#101010]">
+                      <img src={image.previewUrl} alt={`Reference ${index + 1}`} className="h-full w-full rounded-[7px] object-cover" />
+                      <span className="absolute bottom-0.5 left-0.5 rounded bg-black/70 px-1 text-[8px] font-semibold text-white/75">{index + 1}</span>
+                      <button
+                        type="button"
+                        onClick={() => removeAssistantReferenceImage(image.id)}
+                        className="absolute -right-1.5 -top-1.5 flex h-4 w-4 items-center justify-center rounded-full border border-[#141414] bg-[#282828] text-white/60 opacity-0 transition-all hover:bg-red-500 hover:text-white group-hover:opacity-100"
+                        title="Remove reference"
+                      >
+                        <X className="h-2 w-2" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </section>
 
@@ -737,30 +1204,188 @@ const PromptAssistantModal: React.FC<{
           </button>
 
           {advancedOpen && (
-            <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="mt-3 grid grid-cols-1 gap-3 overflow-hidden sm:grid-cols-2">
-              <div>
-                <span className={labelClass}>Language</span>
-                <AssistantSelect value={language} options={['English', 'Vietnamese']} onChange={(value) => setLanguage(value as PromptAssistantLanguage)} ariaLabel="Prompt language" />
+            <motion.div
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: 'auto' }}
+              className="mt-3 overflow-hidden rounded-2xl border border-white/[0.07] bg-[#141414] p-4"
+            >
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div>
+                  <span className={advancedLabelClass}><Globe2 className="h-3 w-3" />Language</span>
+                  <AssistantSelect value={language} options={['English', 'Vietnamese']} onChange={(value) => setLanguage(value as PromptAssistantLanguage)} ariaLabel="Prompt language" />
+                </div>
+                <div>
+                  <span className={advancedLabelClass}><AlignLeft className="h-3 w-3" />Detail</span>
+                  <AssistantSelect value={detail} options={['Concise', 'Balanced', 'Detailed']} onChange={(value) => setDetail(value as PromptAssistantDetail)} ariaLabel="Prompt detail level" />
+                </div>
+
+                <div>
+                  <span className={advancedLabelClass}><Palette className="h-3 w-3" />Style</span>
+                  <input value={style} onChange={(event) => setStyle(event.target.value)} className={advancedInputClass} placeholder="cinematic" />
+                </div>
+                <div />
+
+                <div className="sm:col-span-2">
+                  <span className={advancedLabelClass}><RectangleHorizontal className="h-3 w-3" />Aspect</span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {(['16:9', '9:16', '1:1', '4:3', '3:4'] as AspectRatio[]).map((ratio) => (
+                      <button
+                        key={ratio}
+                        type="button"
+                        onClick={() => setAssistantAspectRatio(ratio)}
+                        className={cn(
+                          'flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-[10px] font-medium transition-colors',
+                          assistantAspectRatio === ratio
+                            ? 'border-[#7C5CFF]/55 bg-[#7C5CFF]/16 text-[#D0C6FF]'
+                            : 'border-white/[0.09] bg-[#121212] text-white/45 hover:border-white/[0.16] hover:text-white/70'
+                        )}
+                      >
+                        <span className={cn('h-2.5 w-2.5 rounded-[2px] border', assistantAspectRatio === ratio ? 'border-[#9F87FF] bg-[#9F87FF]/30' : 'border-white/35')} />
+                        {ratio}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
+                  <span className={advancedLabelClass}><Sun className="h-3 w-3" />Lighting</span>
+                  <AssistantSelect value={lighting} options={PROMPT_ASSISTANT_LIGHTING} onChange={setLighting} ariaLabel="Lighting" />
+                </div>
+                <div>
+                  <span className={advancedLabelClass}><Camera className="h-3 w-3" />Camera</span>
+                  <AssistantSelect value={camera} options={PROMPT_ASSISTANT_CAMERAS} onChange={setCamera} ariaLabel="Camera" />
+                </div>
+
+                <div>
+                  <span className={advancedLabelClass}><Clock3 className="h-3 w-3" />Total (sec)</span>
+                  <input type="number" min="1" value={totalSeconds} onChange={(event) => setTotalSeconds(event.target.value)} className={advancedInputClass} />
+                </div>
+                <div>
+                  <span className={advancedLabelClass}><Clock3 className="h-3 w-3" />Sec/image</span>
+                  <input type="number" min="1" value={secondsPerImage} onChange={(event) => setSecondsPerImage(event.target.value)} className={advancedInputClass} />
+                </div>
+
+                <div>
+                  <span className={advancedLabelClass}><Activity className="h-3 w-3" />Tone/genre</span>
+                  <input value={tone} onChange={(event) => setTone(event.target.value)} className={advancedInputClass} placeholder="auto" />
+                </div>
               </div>
-              <div>
-                <span className={labelClass}>Detail level</span>
-                <AssistantSelect value={detail} options={['Concise', 'Balanced', 'Detailed']} onChange={(value) => setDetail(value as PromptAssistantDetail)} ariaLabel="Prompt detail level" />
+
+              <div className="mt-3 grid grid-cols-1 gap-x-4 gap-y-2 sm:grid-cols-3">
+                {[
+                  { label: 'Sequential (storyboard)', checked: sequential, setChecked: setSequential },
+                  { label: 'Keep consistent', checked: keepConsistent, setChecked: setKeepConsistent },
+                  { label: 'Numbered', checked: numbered, setChecked: setNumbered },
+                  { label: 'Auto-write script + subs', checked: autoWriteScript, setChecked: setAutoWriteScript },
+                  { label: 'Burn subtitle on image/video', checked: burnSubtitles, setChecked: setBurnSubtitles },
+                ].map((option) => (
+                  <label key={option.label} className="flex cursor-pointer items-start gap-2 text-[10px] leading-4 text-white/65">
+                    <input
+                      type="checkbox"
+                      checked={option.checked}
+                      onChange={(event) => option.setChecked(event.target.checked)}
+                      className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-[#7C5CFF]"
+                    />
+                    <span>{option.label}</span>
+                  </label>
+                ))}
               </div>
-              <div>
-                <span className={labelClass}>Lighting</span>
-                <AssistantSelect value={lighting} options={PROMPT_ASSISTANT_LIGHTING} onChange={setLighting} ariaLabel="Lighting" />
-              </div>
-              <div>
-                <span className={labelClass}>Camera</span>
-                <AssistantSelect value={camera} options={PROMPT_ASSISTANT_CAMERAS} onChange={setCamera} ariaLabel="Camera" />
-              </div>
-              <div className="sm:col-span-2">
-                <span className={labelClass}>Tone</span>
-                <AssistantSelect value={tone} options={PROMPT_ASSISTANT_TONES} onChange={setTone} ariaLabel="Tone" />
-              </div>
+
+              <input
+                value={negativePrompt}
+                onChange={(event) => setNegativePrompt(event.target.value)}
+                className={cn(advancedInputClass, 'mt-4')}
+                placeholder="Avoid: ... (negative, optional)"
+              />
             </motion.div>
           )}
         </div>
+
+        <AnimatePresence>
+          {styleThumbnailEditorOpen && (() => {
+            const selectedAddon = PROMPT_ASSISTANT_STYLE_ADDONS.find((addon) => addon.id === styleThumbnailEditorId) || visibleStyleAddons[0]
+            if (!selectedAddon) return null
+            const hasCustomThumbnail = Boolean(styleThumbnailOverrides[selectedAddon.id])
+            return (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="absolute inset-0 z-[70] flex items-center justify-center bg-black/70 p-5 backdrop-blur-[3px]"
+                onMouseDown={() => setStyleThumbnailEditorOpen(false)}
+              >
+                <motion.div
+                  initial={{ opacity: 0, y: 10, scale: 0.985 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: 8, scale: 0.99 }}
+                  className="w-full max-w-[560px] overflow-hidden rounded-2xl border border-white/[0.1] bg-[#1A1A1A] shadow-[0_24px_70px_rgba(0,0,0,0.7)]"
+                  onMouseDown={(event) => event.stopPropagation()}
+                >
+                  <div className="flex items-center justify-between border-b border-white/[0.07] px-4 py-3.5">
+                    <div>
+                      <p className="text-[12px] font-semibold text-white/80">Chỉnh sửa thumbnail</p>
+                      <p className="mt-0.5 text-[9px] text-white/30">Upload, xóa và tùy chỉnh prompt sửa ảnh</p>
+                    </div>
+                    <button type="button" onClick={() => setStyleThumbnailEditorOpen(false)} className="flex h-8 w-8 items-center justify-center rounded-lg text-white/30 hover:bg-white/[0.06] hover:text-white/70">
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-[164px_minmax(0,1fr)] gap-5 p-5">
+                    <div className="rounded-2xl border border-white/[0.07] bg-[#141414] p-3">
+                      <div className="mx-auto h-[180px] w-[128px] overflow-hidden rounded-xl bg-[#0E0E0E] shadow-[0_10px_28px_rgba(0,0,0,0.35)]">
+                        <PromptAssistantStyleThumbnailImage addon={selectedAddon} customThumbnail={styleThumbnailOverrides[selectedAddon.id]} className="h-full w-full" />
+                      </div>
+                      <p className="mt-2.5 truncate text-center text-[10px] font-semibold text-white/70">{selectedAddon.name}</p>
+                      <div className="mt-3 flex gap-2">
+                        <button type="button" onClick={() => openStyleThumbnailUpload(selectedAddon.id)} className="flex h-9 flex-1 items-center justify-center gap-1.5 rounded-xl bg-[#7C5CFF] text-[9px] font-semibold text-white shadow-[0_7px_20px_rgba(124,92,255,0.2)] hover:bg-[#8768FF]">
+                          <Upload className="h-3.5 w-3.5" /> Thay ảnh
+                        </button>
+                        <button type="button" disabled={!hasCustomThumbnail} onClick={() => void resetStyleThumbnail(selectedAddon.id)} className={cn('flex h-9 w-9 items-center justify-center rounded-xl border', hasCustomThumbnail ? 'border-red-400/20 text-red-300 hover:bg-red-500/15' : 'cursor-not-allowed border-white/[0.06] text-white/15')} title="Xóa ảnh custom">
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="min-w-0">
+                      <label className="mb-1.5 block text-[9px] font-semibold uppercase tracking-[0.1em] text-white/30">Style cần chỉnh</label>
+                      <Select.Root value={styleThumbnailEditorId} onValueChange={selectStyleThumbnailEditor}>
+                        <Select.Trigger className="group flex h-10 w-full items-center justify-between rounded-xl border border-white/[0.08] bg-[#111] px-3 text-left text-[10px] font-medium text-white/70 outline-none transition-colors hover:border-white/[0.14] focus:border-[#7C5CFF]/60">
+                          <Select.Value />
+                          <Select.Icon asChild><ChevronDown className="h-3.5 w-3.5 text-white/30 group-data-[state=open]:rotate-180" /></Select.Icon>
+                        </Select.Trigger>
+                        <Select.Portal>
+                          <Select.Content position="popper" sideOffset={6} collisionPadding={12} className="z-[240] max-h-[300px] min-w-[var(--radix-select-trigger-width)] overflow-hidden rounded-xl border border-white/[0.1] bg-[#1B1B1B] p-1 shadow-[0_18px_48px_rgba(0,0,0,0.65)]">
+                            <Select.Viewport>
+                              {PROMPT_ASSISTANT_STYLE_ADDONS.map((addon) => (
+                                <Select.Item key={addon.id} value={addon.id} className="relative flex h-9 cursor-pointer select-none items-center rounded-lg pl-8 pr-3 text-[10px] text-white/60 outline-none data-[highlighted]:bg-[#7C5CFF]/12 data-[highlighted]:text-white data-[state=checked]:text-[#C8BCFF]">
+                                  <Select.ItemIndicator className="absolute left-2.5"><Check className="h-3.5 w-3.5" /></Select.ItemIndicator>
+                                  <Select.ItemText>{addon.category} · {addon.name}</Select.ItemText>
+                                </Select.Item>
+                              ))}
+                            </Select.Viewport>
+                          </Select.Content>
+                        </Select.Portal>
+                      </Select.Root>
+
+                      <label className="mb-1.5 mt-3 block text-[9px] font-semibold uppercase tracking-[0.1em] text-white/30">Prompt sửa ảnh</label>
+                      <textarea value={styleThumbnailEditPrompt} onChange={(event) => setStyleThumbnailEditPrompt(event.target.value)} className="h-[134px] w-full resize-none rounded-xl border border-white/[0.09] bg-[#111] p-3 text-[10px] leading-5 text-white/75 outline-none focus:border-[#7C5CFF]/60 focus:ring-2 focus:ring-[#7C5CFF]/10" />
+
+                      <div className="mt-3 flex items-center justify-between gap-3">
+                        <button type="button" onClick={() => setStyleThumbnailEditPrompt(getDefaultStyleEditPrompt(selectedAddon))} className="flex h-9 items-center gap-1.5 rounded-xl px-2.5 text-[9px] font-medium text-white/35 hover:bg-white/[0.05] hover:text-white/65">
+                          <RotateCcw className="h-3.5 w-3.5" /> Khôi phục prompt mẫu
+                        </button>
+                        <button type="button" disabled={!styleThumbnailEditPrompt.trim()} onClick={() => void saveStyleEditPrompt()} className={cn('flex h-9 items-center gap-1.5 rounded-xl px-4 text-[9px] font-semibold', styleThumbnailEditPrompt.trim() ? 'bg-[#7C5CFF] text-white shadow-[0_7px_20px_rgba(124,92,255,0.2)] hover:bg-[#8768FF]' : 'cursor-not-allowed bg-white/5 text-white/20')}>
+                          <Check className="h-3.5 w-3.5" /> Lưu thay đổi
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </motion.div>
+              </motion.div>
+            )
+          })()}
+        </AnimatePresence>
 
         <footer className="flex shrink-0 items-center gap-3 border-t border-white/[0.07] bg-[#151515] px-5 py-3.5">
           <div className="hidden min-w-0 flex-1 sm:block">
