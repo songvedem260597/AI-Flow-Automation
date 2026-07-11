@@ -5,6 +5,7 @@ import { useHistoryStore } from '@/stores/dataStore'
 import { useSettingsStore } from '@/stores/settingsStore'
 import { hasExtensionContext, isContextInvalidated } from '@/lib/extensionContextGuard'
 import { debugLog, debugWarn, DEBUG_FLAGS } from '@/lib/debug'
+import { getAsset } from '@/lib/assets/assetStore'
 
 // Same helpers, plain JS names (avoid TS-only `unknown` typing here)
 const hasExtensionContextSafe = (): boolean => hasExtensionContext()
@@ -134,6 +135,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function asString(value: unknown): string {
   return typeof value === 'string' ? value : ''
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result || ''))
+    reader.onerror = () => reject(reader.error || new Error('FileReader failed'))
+    reader.readAsDataURL(blob)
+  })
 }
 
 function shouldRestoreEditorAfterProviderAction(data: Record<string, unknown>): boolean {
@@ -965,17 +975,39 @@ export class PipelineRunner {
     }
   }
 
-  private executeMediaNode(data: Record<string, unknown>) {
-    const mediaType = normalizeMediaType(data.mediaType || (data.videoData || data.videoUrl ? 'video' : 'image'))
-    const mediaData = asString(data.mediaData) || asString(data.imageData) || asString(data.videoData)
+  private async executeMediaNode(data: Record<string, unknown>) {
+    let mediaType = normalizeMediaType(data.mediaType || (data.videoData || data.videoUrl ? 'video' : 'image'))
+    let mediaData = asString(data.mediaData) || asString(data.imageData) || asString(data.videoData)
     const mediaUrl = asString(data.mediaUrl) || asString(data.imageUrl) || asString(data.videoUrl)
-    const mediaName = asString(data.mediaName) || asString(data.imageName) || asString(data.videoName) || 'media'
+    let mediaName = asString(data.mediaName) || asString(data.imageName) || asString(data.videoName) || 'media'
+    let storedMimeType = ''
+
+    // Persisted Media nodes intentionally keep only a lightweight
+    // assetId pointer; their bytes live in IndexedDB. The editor resolves
+    // that pointer for preview, so the runner must resolve the same pointer
+    // before deciding that a visibly populated node has no media.
+    const assetId = asString(data.assetId) || asString(data.mediaAssetId) || asString(data.imageAssetId)
+    if (!mediaData && !mediaUrl && assetId) {
+      const asset = await getAsset(assetId)
+      if (asset) {
+        mediaData = await blobToDataUrl(asset.blob)
+        mediaName = asString(data.mediaName)
+          || asString(data.imageName)
+          || asString(data.videoName)
+          || asset.fileName
+          || 'media'
+        storedMimeType = asset.mimeType
+        if (!data.mediaType && asset.kind === 'video') mediaType = 'video'
+      }
+    }
+
     if (!mediaData && !mediaUrl) {
       const label = asString(data.label) || 'Media node'
       throw new Error(`${label} has no media. Upload an image or video before running.`)
     }
     const mimeType = asString(data.mediaMimeType)
       || (mediaData.match(/^data:([^;]+);base64,/)?.[1] || '')
+      || storedMimeType
       || (mediaType === 'video' ? 'video/mp4' : 'image/png')
 
     return {
@@ -1008,9 +1040,14 @@ export class PipelineRunner {
     }
 
     if (provider === 'chatgpt') {
+      const aspectRatio = asString(data.aspectRatio) || DEFAULT_IMAGE_RATIO
+      const trimmedPrompt = prompt.trim()
+      const chatgptPrompt = trimmedPrompt.toLowerCase().endsWith(aspectRatio.toLowerCase())
+        ? trimmedPrompt
+        : `${trimmedPrompt.replace(/,\s*$/, '')}, ${aspectRatio}`
       console.log('[Workflow][ProviderRoute] dispatch node=' + node.id + ' provider=chatgpt')
       return this.runWithForegroundFallback('chatgpt', node.id, () =>
-        this.runChatGPTGenerate({ ...data, nodeId: node.id }, prompt, mediaInputs)
+        this.runChatGPTGenerate({ ...data, nodeId: node.id }, chatgptPrompt, mediaInputs)
       )
     }
 

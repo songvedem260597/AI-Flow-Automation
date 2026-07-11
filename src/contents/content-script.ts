@@ -2156,7 +2156,11 @@ const AIFlowContentScript = {
     // 1. Image-mode + ratio. AIFlow sends the raw prompt when ChatGPT image
     //    mode can be activated; only fallback to prefixing the prompt if the
     //    Create image tool cannot be toggled on.
-    let promptToSubmit = prompt
+    const normalizedRatio = typeof ratio === 'string' ? ratio.trim() : ''
+    const trimmedPrompt = prompt.trim()
+    let promptToSubmit = normalizedRatio && !trimmedPrompt.toLowerCase().endsWith(normalizedRatio.toLowerCase())
+      ? `${trimmedPrompt.replace(/,\s*$/, '')}, ${normalizedRatio}`
+      : trimmedPrompt
     let imageModeReady = false
     try {
       imageModeReady = await this.chatgptEnableImageMode()

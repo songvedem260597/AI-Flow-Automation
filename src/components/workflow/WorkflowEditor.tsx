@@ -312,10 +312,25 @@ interface NodePillMenuState {
   options: NodePillOption[]
 }
 
+interface PreviewMetadata {
+  model?: string
+  mimeType?: string
+  size?: number
+  width?: number
+  height?: number
+  duration?: number
+  createdAt?: number | string
+  cost?: number | string
+  createdBy?: string
+}
+
 interface ImagePreviewState {
   src: string
   name: string
   mediaType: MediaNodeType
+  metadata?: PreviewMetadata
+  baseMetadata?: PreviewMetadata
+  zoom?: number
   /** Carousel context. When `outputItems.length > 1`, the lightbox
    *  shows prev/next/counter and lets the user flip through outputs
    *  without leaving the modal. Empty array → no carousel. */
@@ -574,22 +589,203 @@ function getMediaNodePoster(data: Record<string, unknown>) {
   )
 }
 
-function captureVideoPoster(videoSrc: string): Promise<{ width?: number; height?: number; poster?: string }> {
+// [WorkflowMediaFileCard] Helpers used by the new Media (image /
+// video) canvas card. Kept local to the editor so the GenTab runner
+// / asset store / template loaders do not gain a new public surface.
+const MEDIA_CARD_LABEL: Record<MediaNodeType, string> = {
+  video: 'Video File',
+  image: 'Image File'
+}
+
+function getMediaCardLabel(mediaType: MediaNodeType): string {
+  return MEDIA_CARD_LABEL[mediaType] || 'Media File'
+}
+
+function formatMediaFileSize(bytes: unknown): string {
+  const numeric = Number(bytes)
+  if (!Number.isFinite(numeric) || numeric <= 0) return ''
+  if (numeric < 1024 * 1024) {
+    const kb = numeric / 1024
+    return `${kb.toFixed(kb >= 100 ? 0 : 2)} KB`
+  }
+  const mb = numeric / (1024 * 1024)
+  return `${mb.toFixed(2)} MB`
+}
+
+function formatMediaDuration(seconds: unknown): string {
+  const numeric = Number(seconds)
+  if (!Number.isFinite(numeric) || numeric <= 0) return ''
+  return `${Number.isInteger(numeric) ? numeric.toFixed(0) : numeric.toFixed(1)}s`
+}
+
+function firstPreviewString(
+  records: Array<Record<string, unknown> | undefined>,
+  keys: string[]
+): string | undefined {
+  for (const record of records) {
+    if (!record) continue
+    for (const key of keys) {
+      const value = record[key]
+      if (typeof value === 'string' && value.trim()) return value.trim()
+    }
+  }
+  return undefined
+}
+
+function firstPreviewNumber(
+  records: Array<Record<string, unknown> | undefined>,
+  keys: string[]
+): number | undefined {
+  for (const record of records) {
+    if (!record) continue
+    for (const key of keys) {
+      const value = Number(record[key])
+      if (Number.isFinite(value) && value > 0) return value
+    }
+  }
+  return undefined
+}
+
+function firstPreviewScalar(
+  records: Array<Record<string, unknown> | undefined>,
+  keys: string[]
+): number | string | undefined {
+  for (const record of records) {
+    if (!record) continue
+    for (const key of keys) {
+      const value = record[key]
+      if (typeof value === 'number' && Number.isFinite(value)) return value
+      if (typeof value === 'string' && value.trim() && value.trim() !== '—') return value.trim()
+    }
+  }
+  return undefined
+}
+
+function buildPreviewMetadata(
+  records: Array<Record<string, unknown> | undefined>,
+  mediaType: MediaNodeType
+): PreviewMetadata {
+  const metadata: PreviewMetadata = {}
+  const model = firstPreviewString(records, ['model', 'activeModel', 'modelName'])
+  const mimeType = firstPreviewString(records, ['mediaMimeType', 'mimeType', 'contentType'])
+  const size = firstPreviewNumber(records, ['mediaSize', 'size', 'fileSize', 'byteSize'])
+  const width = firstPreviewNumber(records, ['mediaWidth', 'imageWidth', 'videoWidth', 'width'])
+  const height = firstPreviewNumber(records, ['mediaHeight', 'imageHeight', 'videoHeight', 'height'])
+  const duration = firstPreviewNumber(records, ['mediaDuration', 'duration'])
+  const createdAt = firstPreviewScalar(records, ['createdAt', 'dateCreated', 'created_at'])
+  const cost = firstPreviewScalar(records, ['cost', 'generationCost', 'creditCost'])
+  const createdBy = firstPreviewString(records, ['createdBy', 'createdByName', 'creator', 'uploadedBy', 'uploadedByName'])
+
+  if (model) metadata.model = model
+  metadata.mimeType = mimeType || (mediaType === 'video' ? 'video/mp4' : 'image/png')
+  if (size) metadata.size = size
+  if (width) metadata.width = width
+  if (height) metadata.height = height
+  if (duration) metadata.duration = duration
+  if (createdAt !== undefined) metadata.createdAt = createdAt
+  if (cost !== undefined) metadata.cost = cost
+  if (createdBy) metadata.createdBy = createdBy
+  return metadata
+}
+
+function formatPreviewFileType(
+  metadata: PreviewMetadata | undefined,
+  name: string,
+  src: string,
+  mediaType: MediaNodeType
+): string {
+  const mimeSubtype = String(metadata?.mimeType || '').split('/')[1]?.split(';')[0]?.trim()
+  if (mimeSubtype) return mimeSubtype.toUpperCase() === 'JPG' ? 'JPEG' : mimeSubtype.toUpperCase()
+  const cleanSource = `${name} ${src}`.split(/[?#]/)[0]
+  const extension = cleanSource.match(/\.([a-z0-9]{2,5})(?:\s|$)/i)?.[1]
+  return extension ? extension.toUpperCase() : mediaType === 'video' ? 'MP4' : 'PNG'
+}
+
+function formatPreviewCreatedAt(value: number | string | undefined): string {
+  if (value === undefined || value === '') return ''
+  const numeric = typeof value === 'number' ? value : Number(value)
+  const date = Number.isFinite(numeric)
+    ? new Date(numeric > 0 && numeric < 10_000_000_000 ? numeric * 1000 : numeric)
+    : new Date(value)
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleString()
+}
+
+function formatPreviewCost(value: number | string | undefined): string {
+  if (value === undefined || value === null || value === '') return ''
+  return String(value).trim()
+}
+
+// Falls back through every documented width/height field so legacy
+// Media nodes (imageWidth / videoWidth / raw width / raw height) all
+// paint the badge the same way. Returns 0 when missing — caller
+// decides whether to show the badge.
+function getMediaCardDimensions(data: Record<string, unknown>): { width: number; height: number } {
+  const width = Number(
+    data.mediaWidth
+    || data.imageWidth
+    || data.videoWidth
+    || data.width
+    || 0
+  )
+  const height = Number(
+    data.mediaHeight
+    || data.imageHeight
+    || data.videoHeight
+    || data.height
+    || 0
+  )
+  return { width, height }
+}
+
+function getMediaCardFileName(data: Record<string, unknown>): string {
+  return String(
+    data.mediaName
+    || data.imageName
+    || data.videoName
+    || data.fileName
+    || ''
+  )
+}
+
+function getMediaCardByteSize(data: Record<string, unknown>): number {
+  const raw = Number(
+    data.mediaSize
+    || data.size
+    || 0
+  )
+  return Number.isFinite(raw) && raw > 0 ? raw : 0
+}
+
+function getMediaCardDurationSeconds(data: Record<string, unknown>): number {
+  const raw = Number(data.duration || data.mediaDuration || 0)
+  return Number.isFinite(raw) && raw > 0 ? raw : 0
+}
+
+function captureVideoPoster(videoSrc: string): Promise<{ width?: number; height?: number; duration?: number; poster?: string }> {
   return new Promise((resolve) => {
     const video = document.createElement('video')
     let settled = false
     let waitingForSeek = false
 
+    let captureDuration: number | undefined
     const finish = (poster?: string) => {
       if (settled) return
       settled = true
       const width = video.videoWidth || undefined
       const height = video.videoHeight || undefined
+      // [WorkflowMediaFileCard] Surface the video duration so the
+      // card badge can show "720\u00d71280 \u00b7 11.9s". The
+      // `duration` field is already in SAFE_MEDIA_METADATA_KEYS, so
+      // it round-trips through the import sanitizer.
+      if (videoDurationSnapshot > 0 && captureDuration === undefined) {
+        captureDuration = videoDurationSnapshot
+      }
       video.removeAttribute('src')
       video.load()
       resolve({
         width,
         height,
+        duration: captureDuration,
         poster
       })
     }
@@ -626,8 +822,10 @@ function captureVideoPoster(videoSrc: string): Promise<{ width?: number; height?
     video.muted = true
     video.playsInline = true
     video.preload = 'metadata'
+    let videoDurationSnapshot = 0
     video.onloadedmetadata = () => {
       const duration = Number.isFinite(video.duration) ? video.duration : 0
+      videoDurationSnapshot = duration > 0 ? duration : 0
       const seekTime = duration > 0.2 ? Math.min(0.15, Math.max(0, duration - 0.05)) : 0
       if (seekTime > 0) {
         waitingForSeek = true
@@ -1834,6 +2032,13 @@ interface DrawflowInstance {
   node_selected: HTMLElement | null
   ele_selected?: HTMLElement | null
   drag?: boolean
+  drag_point?: boolean
+  connection?: boolean
+  connection_ele?: Element | null
+  editor_selected?: boolean
+  click?: (event: MouseEvent | TouchEvent) => unknown
+  position?: (event: MouseEvent | TouchEvent) => unknown
+  dragEnd?: (event: MouseEvent | TouchEvent) => unknown
   start: () => void
   clear: () => void
   import: (data: unknown, notify?: boolean) => void
@@ -1860,6 +2065,11 @@ interface DrawflowInstance {
   zoom_reset: () => void
   zoom_refresh: () => void
   on: (event: string, callback: (payload: any) => void) => void
+}
+
+function isStaleDrawflowDomError(error: unknown) {
+  return error instanceof TypeError
+    && /parentElement|offsetWidth|offsetHeight|classList/.test(error.message)
 }
 
 function escapeHtml(value: unknown) {
@@ -1893,7 +2103,7 @@ const DF_ICONS = {
   download: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
   image: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>',
   delay: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
-  prompt: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l2.39 5.26L20 10l-4.5 4.13L17 20l-5-3-5 3 1.5-5.87L4 10l5.61-1.74L12 3z"/></svg>',
+  prompt: 'T',
   wait: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/></svg>',
   trash: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>',
   zoom: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M11 8v6"/><path d="M8 11h6"/></svg>',
@@ -2032,10 +2242,29 @@ function providerBadge(provider: unknown) {
   `
 }
 
-function nodeHoverToolbar() {
+function nodeHoverToolbar(nodeType: FlowNodeType) {
+  // [PromptNodeRunButton] Run button is hidden for prompt and image
+  // nodes — both are source/leaf nodes that produce no execution
+  // artifact of their own when fired alone. Image already had the
+  // gate; prompt was leaking the play icon even though running a
+  // prompt standalone is meaningless. Generate / Wait / Download /
+  // Condition / Loop / Merge / Split keep the Run button.
+  const runButton = nodeType === 'image' || nodeType === 'prompt'
+    ? ''
+    : `<button type="button" class="df-hover-btn" data-node-action="run" title="Run node">${DF_ICONS.run}</button>`
+  // [WorkflowMediaFileCard] Media nodes get a leading "Expand media"
+  // button on the hover toolbar so the user can open the lightbox
+  // even when the card preview hasn't loaded yet (or when the
+  // source asset is a remote URL with no on-card preview). The
+  // action is gated to image-type nodes — non-Media nodes keep the
+  // legacy Run-first ordering.
+  const expandButton = nodeType === 'image'
+    ? `<button type="button" class="df-hover-btn" data-node-action="expand-media" title="Expand media" aria-label="Expand media"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg></button>`
+    : ''
   return `
     <div class="df-hover-toolbar">
-      <button type="button" class="df-hover-btn" data-node-action="run" title="Run node">${DF_ICONS.run}</button>
+      ${expandButton}
+      ${runButton}
       <button type="button" class="df-hover-btn" data-node-action="duplicate" title="Duplicate"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
       <button type="button" class="df-hover-btn" data-node-action="settings" title="Settings"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.17a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68 1.65 1.65 0 0 0 10 3.17V3a2 2 0 0 1 4 0v.17a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.32 9c.23.61.81 1 1.51 1H21a2 2 0 0 1 0 4h-.17a1.65 1.65 0 0 0-1.43 1z"/></svg></button>
       <button type="button" class="df-hover-btn df-hover-btn-danger" data-node-action="delete" title="Delete node">${DF_ICONS.trash}</button>
@@ -2183,6 +2412,7 @@ interface GenerateOutputItem {
    *  item so the resolver effect can pre-warm the sync cache even
    *  before the blob URL resolves). */
   assetId?: string
+  metadata?: PreviewMetadata
   source: 'outputs' | 'imageUrls' | 'fallback'
 }
 
@@ -2251,6 +2481,7 @@ function buildGenerateOutputItems(
             (typeof rich.type === 'string' && rich.type === 'image')
             ? 'image'
             : undefined
+      const resolvedMediaType = mediaType || detectGenerateOutputMediaType(rich)
       // [AssetStore] Resolve the cached blob URL when this rich
       // descriptor carries an assetId. The original `url` stays
       // untouched so auto-download and downstream consumers keep
@@ -2262,7 +2493,8 @@ function buildGenerateOutputItems(
         url,
         name,
         savedFilename,
-        mediaType,
+        mediaType: resolvedMediaType,
+        metadata: buildPreviewMetadata([rich], resolvedMediaType),
         ...(previewUrl ? { previewUrl } : {}),
         ...(itemAssetId ? { assetId: itemAssetId } : {}),
         source: 'outputs' as const,
@@ -2397,6 +2629,119 @@ async function downloadWorkflowOutputAsset(args: {
   }
 }
 
+function renderDrawflowMediaFileCard(
+  node: WorkflowNode,
+  data: Record<string, unknown>,
+  enabled: boolean,
+  ratioClass: string
+) {
+  // [WorkflowMediaFileCard] New Media (image / video) card layout.
+  // Mirrors the mockup: header on top of a dark preview card, badge
+  // metadata bottom-left, filename + size in the card footer, and
+  // a 3-dot menu + enable toggle in the header. Port / output port
+  // are NOT touched — they live on the parent `.drawflow-node`
+  // wrapper around `.df-node`, which is still painted unchanged by
+  // `renderDrawflowNode`.
+  const mediaType = getMediaNodeType(data)
+  const mediaSrc = getMediaNodeSource(data)
+  const mediaPoster = getMediaNodePoster(data)
+  // [WorkflowMediaFileCard] Header label is "Upload" while the node has
+  // no asset attached, and only switches to "Image File" / "Video File"
+  // once the user has dropped a file in. The empty state must NEVER
+  // advertise a file type that isn't loaded yet — otherwise the user
+  // thinks they already have media attached when they don't.
+  const labelText = mediaSrc ? getMediaCardLabel(mediaType) : 'Upload'
+  const label = escapeHtml(labelText)
+  const cardLabel = `${labelText} · Media`
+  // Metadata is meaningful only while a renderable asset exists.
+  // Imported/legacy nodes may retain filename/dimensions after their
+  // blob or remote URL is gone; never surface those stale values in
+  // the empty Upload state.
+  const dims = mediaSrc ? getMediaCardDimensions(data) : { width: 0, height: 0 }
+  const fileName = mediaSrc ? getMediaCardFileName(data) : ''
+  const byteSize = mediaSrc ? getMediaCardByteSize(data) : 0
+  const durationSeconds = mediaSrc ? getMediaCardDurationSeconds(data) : 0
+
+  const dimPart = dims.width > 0 && dims.height > 0
+    ? `${dims.width}\u00d7${dims.height}`
+    : ''
+  const durationPart = mediaType === 'video' && durationSeconds > 0
+    ? formatMediaDuration(durationSeconds)
+    : ''
+  const metaTextParts: string[] = []
+  if (dimPart) metaTextParts.push(dimPart)
+  if (durationPart) metaTextParts.push(durationPart)
+  const metaText = escapeHtml(metaTextParts.join(' \u00b7 '))
+
+  const fileNameText = escapeHtml(fileName || 'Select image or video to upload')
+  const sizeText = escapeHtml(formatMediaFileSize(byteSize) || '—')
+
+  const previewInner = mediaSrc
+    ? (
+      mediaType === 'video'
+        ? (
+          mediaPoster
+            ? `<img class="df-node-preview-media" src="${escapeHtml(mediaPoster)}" alt="" draggable="false">`
+            : `<div class="df-node-preview-placeholder">${DF_PORT_ICONS.video}</div>`
+        )
+        : `<img class="df-node-preview-media" src="${escapeHtml(mediaSrc)}" alt="" draggable="false">`
+    )
+    : `<div class="df-node-preview-placeholder"><span class="workflow-media-file-empty-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></span><span class="workflow-media-file-empty-text">Drop image / video here</span></div>`
+
+  const previewRemoveButton = mediaSrc
+    ? `<button type="button" class="workflow-media-file-remove nodrag" data-node-action="remove-media" title="Remove media" aria-label="Remove media">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </button>`
+    : ''
+
+  const previewOpenButton = mediaSrc
+    ? `<button type="button" class="df-node-image-preview-button nodrag" data-node-action="preview-image" title="Preview media" aria-label="Preview media">
+                ${DF_ICONS.zoom}
+              </button>`
+    : ''
+
+  const metaBadge = mediaSrc && metaText
+    ? `<div class="workflow-media-file-meta" aria-hidden="true">${metaText}</div>`
+    : ''
+
+  const footerBlock = mediaSrc ? `
+        <div class="workflow-media-file-footer">
+          <span class="workflow-media-file-name" title="${fileNameText}">${fileNameText}</span>
+          <span class="workflow-media-file-size">${sizeText}</span>
+        </div>
+      ` : ''
+
+  const cardBody = `
+    <div class="workflow-media-file-card ${mediaSrc ? 'has-image' : ''}">
+      <div class="workflow-media-file-header">
+        <span class="workflow-media-file-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        </span>
+        <span class="workflow-media-file-label">${label}</span>
+        <button
+          type="button"
+          class="df-node-toggle ${enabled ? 'on' : 'off'}"
+          title="${enabled ? 'Disable node' : 'Enable node'}"
+          aria-label="${enabled ? 'Disable node' : 'Enable node'}"
+        >
+          <span class="df-node-toggle-track"><span class="df-node-toggle-thumb"></span></span>
+        </button>
+      </div>
+      <div class="workflow-media-file-preview df-node-image-upload-target ${ratioClass} ${mediaSrc ? 'has-image' : ''}" data-image-upload-target="true" aria-label="${escapeHtml(cardLabel)}">
+        ${previewInner}
+        ${previewOpenButton}
+        ${previewRemoveButton}
+        ${metaBadge}
+      </div>
+      ${footerBlock}
+    </div>
+  `
+
+  return `<div class="workflow-media-file-node" data-workflow-node-id="${escapeHtml(node.id)}">
+        ${cardBody}
+      </div>`
+}
+
 function renderDrawflowNode(node: WorkflowNode) {
   const data = node.data as Record<string, unknown>
   const generateData = node.type === 'generate'
@@ -2405,7 +2750,9 @@ function renderDrawflowNode(node: WorkflowNode) {
   const meta = nodeMeta(node.type)
   const rawLabel = node.type === 'image' && (!data.label || data.label === 'New Image Node' || data.label === 'image')
     ? 'New Media Node'
-    : data.label || meta.title
+    : node.type === 'prompt'
+      ? (String(data.prompt || '').trim() ? 'Prompt' : 'New Prompt Node')
+      : data.label || meta.title
   const label = escapeHtml(rawLabel)
   const provider = providerSlug(generateData.provider)
   const prompt = escapeHtml(String(data.prompt || '').slice(0, 150))
@@ -2413,6 +2760,23 @@ function renderDrawflowNode(node: WorkflowNode) {
   const providerPill = node.type === 'generate' ? providerBadge(generateData.provider) : ''
   const aspectRatio = String(data.aspectRatio || '1:1')
   const ratioClass = `ratio-${aspectRatio.replace(':', '-')}`
+
+  // [WorkflowMediaFileCard] Media nodes opt out of the legacy
+  // .df-node / .df-node-header chrome and use the new card layout.
+  // The outer Drawflow wrapper, .input / .output port children,
+  // and the `data-workflow-node-id` anchor that drawflow.js reads
+  // stay intact — only the inner card body changes. Port position
+  // is set by Drawflow's `.drawflow-node .output` rules in CSS, not
+  // by us.
+  if (node.type === 'image') {
+    return `
+    <div class="df-node workflow-media-file-shell ${!enabled ? 'df-node-disabled' : ''}" data-node-type="${escapeHtml(node.type)}" data-provider="${provider}" data-enabled="${enabled}" data-workflow-node-id="${escapeHtml(node.id)}">
+      ${providerPill}
+      ${nodeHoverToolbar(node.type)}
+      ${renderDrawflowMediaFileCard(node, data, enabled, ratioClass)}
+    </div>
+  `
+  }
 
   let body = ''
   if (node.type === 'prompt') {
@@ -2634,8 +2998,7 @@ function renderDrawflowNode(node: WorkflowNode) {
   return `
     <div class="df-node ${!enabled ? 'df-node-disabled' : ''}" data-node-type="${escapeHtml(node.type)}" data-provider="${provider}" data-enabled="${enabled}" data-workflow-node-id="${escapeHtml(node.id)}">
       ${providerPill}
-      ${nodeHoverToolbar()}
-      <div class="df-node-status pending"></div>
+      ${nodeHoverToolbar(node.type)}
       <div class="df-node-header">
         <div class="df-node-icon ${meta.color}">${meta.icon}</div>
         <div class="df-node-title">${label}</div>
@@ -2910,6 +3273,13 @@ const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, nodeId, onClose
             <textarea
               value={String(data.prompt || '')}
               onChange={(event) => update('prompt', event.target.value)}
+              onBlur={(event) => {
+                const currentLabel = String(data.label || '').trim()
+                const promptValue = event.currentTarget.value
+                if (!currentLabel || currentLabel === 'New Prompt Node' || currentLabel === 'Prompt') {
+                  update('label', promptValue.trim() ? 'Prompt' : 'New Prompt Node')
+                }
+              }}
               rows={8}
               className={fieldTextAreaClass}
             />
@@ -4391,10 +4761,10 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       filename = rawName ? rawName.replace(/[^\w.\-]+/g, '-').replace(/^-+|-+$/g, '') : ''
     }
     if (!filename) {
-      filename = `image-${Date.now()}.png`
+      filename = `${imagePreview.mediaType}-${Date.now()}.${imagePreview.mediaType === 'video' ? 'mp4' : 'png'}`
     }
     if (!/\.[a-zA-Z0-9]{2,5}$/.test(filename)) {
-      filename = `${filename}.png`
+      filename = `${filename}.${imagePreview.mediaType === 'video' ? 'mp4' : 'png'}`
     }
 
     // Use the same SW-routed helper as the node-bar download so the
@@ -4437,6 +4807,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         // looking at right now — not the asset they opened.
         outputName: nextItem.name,
         downloadFilename: resolveGenerateOutputFilename(nextItem, nextIdx),
+        metadata: { ...(prev.baseMetadata || {}), ...(nextItem.metadata || {}) },
+        zoom: 100,
         // Track the asset's media type so the lightbox switches
         // between <img> and <video> as the user flips through
         // mixed outputs (e.g. quantity=2 with one image + one
@@ -4459,6 +4831,8 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
         src: nextItem.url,
         outputName: nextItem.name,
         downloadFilename: resolveGenerateOutputFilename(nextItem, nextIdx),
+        metadata: { ...(prev.baseMetadata || {}), ...(nextItem.metadata || {}) },
+        zoom: 100,
         // Track the asset's media type — see handleLightboxPrev.
         mediaType: nextItem.mediaType === 'video' ? 'video' : 'image',
       }
@@ -5144,9 +5518,12 @@ const groupDragMirrorLog = (
   console.debug(`[GroupDrag][${event}]`, payload)
 }
 
-  const rerenderDrawflowNode = (nodeId: string) => {
+  const rerenderDrawflowNode = (nodeIdOrNode: string | WorkflowNode) => {
     const editor = editorRef.current
-    const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
+    const node = typeof nodeIdOrNode === 'string'
+      ? workflowRef.current.nodes.find((item) => item.id === nodeIdOrNode)
+      : nodeIdOrNode
+    const nodeId = typeof nodeIdOrNode === 'string' ? nodeIdOrNode : nodeIdOrNode.id
     if (!editor || !node) return
 
     // [GroupDrag] Per-node rerender wipes the node's
@@ -5809,6 +6186,73 @@ const groupDragMirrorLog = (
     editor.zoom_min = 0.35
     editor.zoom_max = 1.6
     editor.zoom_value = 0.1
+
+    // Drawflow assumes every node/port it previously saw is still mounted.
+    // React can replace that DOM between a pointer event and Drawflow's next
+    // connection refresh, so guard only the known stale-DOM failure paths.
+    const recoverFromStaleDrawflowDom = (error: unknown) => {
+      if (!isStaleDrawflowDomError(error)) throw error
+      editor.drag = false
+      editor.drag_point = false
+      editor.connection = false
+      editor.editor_selected = false
+      editor.ele_selected = null
+      if (editor.connection_ele && !editor.connection_ele.isConnected) {
+        editor.connection_ele = null
+      }
+    }
+
+    const updateConnectionNodes = editor.updateConnectionNodes.bind(editor)
+    editor.updateConnectionNodes = (nodeId: string) => {
+      try {
+        updateConnectionNodes(nodeId)
+      } catch (error) {
+        recoverFromStaleDrawflowDom(error)
+      }
+    }
+
+    const removeSingleConnection = editor.removeSingleConnection.bind(editor)
+    editor.removeSingleConnection = (source, target, sourceHandle, targetHandle) => {
+      try {
+        removeSingleConnection(source, target, sourceHandle, targetHandle)
+      } catch (error) {
+        recoverFromStaleDrawflowDom(error)
+      }
+    }
+
+    const click = editor.click?.bind(editor)
+    if (click) {
+      editor.click = (event) => {
+        try {
+          return click(event)
+        } catch (error) {
+          recoverFromStaleDrawflowDom(error)
+        }
+      }
+    }
+
+    const position = editor.position?.bind(editor)
+    if (position) {
+      editor.position = (event) => {
+        try {
+          return position(event)
+        } catch (error) {
+          recoverFromStaleDrawflowDom(error)
+        }
+      }
+    }
+
+    const dragEnd = editor.dragEnd?.bind(editor)
+    if (dragEnd) {
+      editor.dragEnd = (event) => {
+        try {
+          return dragEnd(event)
+        } catch (error) {
+          recoverFromStaleDrawflowDom(error)
+        }
+      }
+    }
+
     editor.contextmenu = (event: Event) => {
       event.preventDefault()
       return false
@@ -6743,14 +7187,80 @@ const groupDragMirrorLog = (
         textarea.removeEventListener('mousedown', stopEditorEvent)
         textarea.removeEventListener('click', stopEditorEvent)
         textarea.removeEventListener('dblclick', stopEditorEvent)
+        document.removeEventListener('pointerdown', handleEditorPointerDown, true)
+
+        // [PromptNodeEditExit] Always detach the <textarea> from the DOM
+        // BEFORE the rerender. Listeners get removed above but the
+        // element itself stays inside `promptEl` until either
+        // `innerHTML` is replaced or we explicitly remove it. Without
+        // this, races (canvas null, drawflow content not found) leave
+        // a stale textarea + `.editing` class visible on the node.
+        promptEl.classList.remove('editing')
+        if (textarea.parentNode === promptEl) {
+          promptEl.removeChild(textarea)
+        }
+        if (commit) {
+          // Restore visible prompt text immediately so the node looks
+          // like the prompt nodes below the canvas (no textarea, no
+          // `.editing` chrome). The rerender below is still useful for
+          // inspector sync, but the visible state is already correct.
+          const displayPrompt = textarea.value
+          promptEl.classList.toggle('df-node-prompt-empty', !displayPrompt.trim())
+          promptEl.textContent = displayPrompt.trim() || 'Empty prompt'
+        } else {
+          // ESC / cancel: drop the textarea content and fall back to
+          // the pre-edit prompt text from the store.
+          promptEl.textContent = currentPrompt || 'Empty prompt'
+          promptEl.classList.toggle('df-node-prompt-empty', !currentPrompt.trim())
+        }
 
         if (commit) {
-          updateNode(nodeId, { prompt: textarea.value } as Partial<FlowNodeData>)
+          const newPromptValue = textarea.value
+          const currentLabel = String((node.data as Record<string, unknown>).label || '').trim()
+          const nextLabel = !currentLabel || currentLabel === 'New Prompt Node' || currentLabel === 'Prompt'
+            ? (newPromptValue.trim() ? 'Prompt' : 'New Prompt Node')
+            : currentLabel
+          updateNode(nodeId, { prompt: newPromptValue, label: nextLabel } as Partial<FlowNodeData>)
+          // [PromptNodeLabel] After committing the prompt text, push a
+          // drawflow-side rerender so the header label flips from
+          // "New Prompt Node" to "Prompt" the moment the editor closes.
+          // The `updateNode` above mutates the zustand store but
+          // `workflowRef.current` won't be replaced until the next
+          // React effect pass, so we synthesize the updated node
+          // locally and feed it to `rerenderDrawflowNode` directly.
+          const baseNode = workflowRef.current.nodes.find((item) => item.id === nodeId)
+          if (baseNode) {
+            rerenderDrawflowNode({
+              ...baseNode,
+              data: { ...(baseNode.data as Record<string, unknown>), prompt: newPromptValue, label: nextLabel }
+            })
+          }
+          // [PromptNodeLabelDefense] Defensive DOM patch: also update
+          // the `.df-node-title` text directly. The rerender above
+          // SHOULD have done this, but drawflow's per-node rerender
+          // occasionally no-ops (canvas null, selector miss, or
+          // a follow-up dataSignature effect overwriting with stale
+          // state). Without this fallback, the user sees the header
+          // stay on "New Prompt Node" even after commit.
+          const headerTitle = promptEl.parentElement
+            ?.parentElement
+            ?.parentElement
+            ?.querySelector<HTMLElement>('.df-node-title')
+          if (headerTitle && newPromptValue.trim()) {
+            headerTitle.textContent = 'Prompt'
+          } else if (headerTitle) {
+            headerTitle.textContent = 'New Prompt Node'
+          }
         } else {
           rerenderDrawflowNode(nodeId)
         }
       }
       const commitEdit = () => finish(true)
+      const handleEditorPointerDown = (pointerEvent: PointerEvent) => {
+        const pointerTarget = pointerEvent.target
+        if (pointerTarget instanceof Node && textarea.contains(pointerTarget)) return
+        finish(true)
+      }
       const stopEditorEvent = (editorEvent: Event) => {
         editorEvent.stopPropagation()
       }
@@ -6778,6 +7288,7 @@ const groupDragMirrorLog = (
       textarea.addEventListener('mousedown', stopEditorEvent)
       textarea.addEventListener('click', stopEditorEvent)
       textarea.addEventListener('dblclick', stopEditorEvent)
+      document.addEventListener('pointerdown', handleEditorPointerDown, true)
 
       requestAnimationFrame(() => {
         textarea.focus()
@@ -6898,8 +7409,17 @@ const groupDragMirrorLog = (
             }
           }
 
-          const finishUpload = (width?: number, height?: number, poster?: string) => {
+          const finishUpload = (width?: number, height?: number, poster?: string, duration?: number) => {
             const aspectRatio = width && height ? closestImageAspectRatio(width, height) : fileMediaType === 'video' ? '16:9' : '1:1'
+            // [WorkflowMediaFileCard] Persist the original byte size
+            // so the card footer can show KB / MB after a reload
+            // (the legacy base64 fallback only knew length, not the
+            // raw blob size). `size` is already on
+            // SAFE_MEDIA_METADATA_KEYS, so it round-trips through the
+            // importer; `mediaSize` is the per-node handle for the
+            // card reader and only needs to live in the live store.
+            const fileSize = Number.isFinite(file.size) ? file.size : 0
+            const durationSeconds = Number.isFinite(duration) && (duration as number) > 0 ? (duration as number) : undefined
             const basePatch: Record<string, unknown> = {
               mediaType: fileMediaType,
               mediaData: imageData,
@@ -6908,7 +7428,10 @@ const groupDragMirrorLog = (
               mediaMimeType: file.type,
               mediaWidth: width,
               mediaHeight: height,
+              mediaSize: fileSize,
+              size: fileSize,
               mediaPoster: fileMediaType === 'video' ? poster || '' : '',
+              ...(durationSeconds !== undefined ? { mediaDuration: durationSeconds } : {}),
               aspectRatio
             }
 
@@ -6924,7 +7447,8 @@ const groupDragMirrorLog = (
               videoName: fileMediaType === 'video' ? file.name : '',
               videoWidth: fileMediaType === 'video' ? width : undefined,
               videoHeight: fileMediaType === 'video' ? height : undefined,
-              videoPoster: fileMediaType === 'video' ? poster || '' : ''
+              videoPoster: fileMediaType === 'video' ? poster || '' : '',
+              duration: durationSeconds
             } as Partial<FlowNodeData>
             const nextNode = { ...node, data: { ...node.data, ...nextPatch } as FlowNodeData }
             const staleEdgeIds = unlinkIncompatibleConnectionsForNode(nodeId, nextNode)
@@ -6960,7 +7484,7 @@ const groupDragMirrorLog = (
 
           if (fileMediaType === 'video') {
             captureVideoPoster(imageData)
-              .then(({ width, height, poster }) => finishUpload(width, height, poster))
+              .then(({ width, height, duration, poster }) => finishUpload(width, height, poster, duration))
               .catch(() => finishUpload())
             return
           }
@@ -7040,6 +7564,7 @@ const groupDragMirrorLog = (
 
       const action = button.dataset.nodeAction
       setSelectedNode(nodeId)
+      const targetNode = workflowRef.current.nodes.find((item) => item.id === nodeId)
       if (action === 'delete') {
         closeNodePillMenu()
         deleteNode(nodeId)
@@ -7049,16 +7574,49 @@ const groupDragMirrorLog = (
         duplicateNodeWithInputs(nodeId)
       } else if (action === 'run') {
         closeNodePillMenu()
+        // [WorkflowMediaFileCard] Media nodes are source data — they
+        // never need to be re-run in isolation. Show a friendly
+        // toast instead of silently no-op'ing. The toolbar already
+        // hides the Run button for Media nodes; this branch only
+        // runs if some legacy node or stale hook sends the action
+        // here, so the visual hint is what matters.
+        if (targetNode?.type === 'image') {
+          flashTemplateToast('warning', 'Media node doesn\u2019t run on its own — just connect it to a Generate node.')
+          return
+        }
         void runGenerateNodeWithInputs(nodeId).catch((error) => {
           window.alert(error instanceof Error ? error.message : 'Unable to run node.')
         })
       } else if (action === 'settings') {
         closeNodePillMenu()
         setInspectorNodeId(nodeId)
+      } else if (action === 'expand-media') {
+        closeNodePillMenu()
+        // [WorkflowMediaFileCard] Open the same lightbox the
+        // preview-image button does, but driven from the toolbar so
+        // the user can also reach it when the card preview hasn't
+        // loaded yet (remote URL, blob not yet decoded, etc.).
+        if (!targetNode || targetNode.type !== 'image') return
+        const data = (targetNode.data || {}) as Record<string, unknown>
+        const mediaSrc = getMediaNodeSource(data)
+        if (!mediaSrc) {
+          flashTemplateToast('warning', 'No media to expand yet — upload an image or video first.')
+          return
+        }
+        const mediaType = getMediaNodeType(data)
+        const name = String(data.mediaName || data.videoName || data.imageName || data.label || 'Media')
+        setImagePreview({
+          src: mediaSrc,
+          name,
+          mediaType,
+          metadata: buildPreviewMetadata([data], mediaType),
+          zoom: 100,
+        })
       }
     }
     const handleNodeToggleClick = (event: MouseEvent) => {
-      const button = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('.df-node-toggle')
+      const button = (event.target as HTMLElement | null)
+        ?.closest<HTMLButtonElement>('.df-node-toggle')
       if (!button) return
 
       event.preventDefault()
@@ -7080,10 +7638,12 @@ const groupDragMirrorLog = (
 
       nodeEl.classList.toggle('df-node-disabled', !nextEnabled)
       nodeEl.dataset.enabled = String(nextEnabled)
-      button.classList.toggle('on', nextEnabled)
-      button.classList.toggle('off', !nextEnabled)
-      button.title = nextLabel
-      button.setAttribute('aria-label', nextLabel)
+      nodeEl.querySelectorAll<HTMLButtonElement>('.df-node-toggle').forEach((toggle) => {
+        toggle.classList.toggle('on', nextEnabled)
+        toggle.classList.toggle('off', !nextEnabled)
+        toggle.title = nextLabel
+        toggle.setAttribute('aria-label', nextLabel)
+      })
 
       requestAnimationFrame(() => {
         rerenderDrawflowNode(nodeId)
@@ -7136,16 +7696,21 @@ const groupDragMirrorLog = (
         mediaType = initialMediaType
         name = String(data.label || 'Generated output')
         if (outputUrls.length > 0 && mediaSrc) {
+          const previewGenerateData = { ...data, ...sanitizeGenerateDataPatch(data, {}) }
+          const baseMetadata = buildPreviewMetadata([previewGenerateData, output], initialMediaType)
           closeNodePillMenu()
           setSelectedNode(nodeId)
           setImagePreview({
             src: mediaSrc,
-            name,
+            name: initialItem?.name || name,
             mediaType: initialMediaType,
             outputItems,
             selectedIndex: liveIndex,
             outputName: initialItem?.name,
             downloadFilename: initialDownloadFilename,
+            baseMetadata,
+            metadata: { ...baseMetadata, ...(initialItem?.metadata || {}) },
+            zoom: 100,
           })
           return
         }
@@ -7158,7 +7723,98 @@ const groupDragMirrorLog = (
       setImagePreview({
         src: mediaSrc,
         name,
-        mediaType
+        mediaType,
+        metadata: buildPreviewMetadata([data], mediaType),
+        zoom: 100,
+      })
+    }
+    const handleMediaRemoveClick = (event: MouseEvent) => {
+      const target = event.target instanceof Element ? event.target : null
+      const button = target?.closest<HTMLButtonElement>('.workflow-media-file-remove[data-node-action="remove-media"]')
+      if (!button) return
+
+      event.preventDefault()
+      event.stopPropagation()
+
+      const nodeEl = button.closest<HTMLElement>('.df-node[data-workflow-node-id]')
+      const nodeId = nodeEl?.dataset.workflowNodeId
+      if (!nodeId) return
+
+      const node = workflowRef.current.nodes.find((item) => item.id === nodeId)
+      if (!node || node.type !== 'image') return
+
+      const data = (node.data || {}) as Record<string, unknown>
+      // [WorkflowMediaFileCard] Reset the Media node to its default
+      // (no asset, no source URL, no data URL, no poster, no metadata).
+      // Keep the human label and the enable/disable state the user
+      // already chose — only the media asset fields are cleared.
+      // `enabled` is preserved because the user explicitly toggled it;
+      // we never want a single click to also disable the node.
+      const preservedLabel = typeof data.label === 'string' ? data.label : node.data?.label
+      const preservedEnabled = data.enabled !== false
+      const defaults = coerceNodeData('image', {})
+      // [WorkflowMediaFileCard] `updateNode` in the store MERGES via
+      // `{ ...n.data, ...data }` — so leaving a field out of the patch
+      // keeps the old value. We MUST explicitly null out every asset
+      // field the renderer / `getMediaNodeSource` reads back, otherwise
+      // the previous image stays rendered and the click appears to do
+      // nothing. `undefined` keeps the patch Partial-shaped; the
+      // downstream readers (`String(...) || ''`) treat it as empty.
+      const cleared: Record<string, unknown> = {
+        // generic media fields
+        mediaUrl: undefined,
+        mediaData: undefined,
+        mediaName: undefined,
+        mediaPoster: undefined,
+        mediaType: undefined,
+        mediaAssetId: undefined,
+        mediaSize: undefined,
+        mediaWidth: undefined,
+        mediaHeight: undefined,
+        mediaDuration: undefined,
+        // image-specific
+        imageUrl: undefined,
+        imageData: undefined,
+        imageAssetId: undefined,
+        imageName: undefined,
+        imageWidth: undefined,
+        imageHeight: undefined,
+        // video-specific
+        videoUrl: undefined,
+        videoData: undefined,
+        videoPoster: undefined,
+        videoName: undefined,
+        videoWidth: undefined,
+        videoHeight: undefined,
+        // shared asset id + metadata
+        assetId: undefined,
+        posterAssetId: undefined,
+        thumbnailAssetId: undefined,
+        size: undefined,
+        width: undefined,
+        height: undefined,
+        duration: undefined,
+        mimeType: undefined,
+        // generic file aliases the renderer fallbacks read
+        fileName: undefined
+      }
+      const nextData = {
+        ...cleared,
+        ...defaults,
+        label: typeof preservedLabel === 'string' ? preservedLabel : defaults.label,
+        enabled: preservedEnabled
+      } as Partial<WorkflowNode['data']>
+
+      closeNodePillMenu()
+      // Clear any cached downstream preview pointing at this node.
+      setSelectedNode(nodeId)
+      updateNode(nodeId, nextData)
+      // Re-paint the DOM so the empty state (drop area) is visible
+      // immediately, without waiting for a drawflow `updateNode`
+      // reconciliation pass.
+      requestAnimationFrame(() => {
+        rerenderDrawflowNode(nodeId)
+        syncSelectedNodeDom()
       })
     }
     const handleOutputCarouselClick = (event: MouseEvent) => {
@@ -7392,6 +8048,7 @@ const groupDragMirrorLog = (
     canvasEl.addEventListener('click', handleNodeToolbarClick)
     canvasEl.addEventListener('click', handleNodeToggleClick)
     canvasEl.addEventListener('click', handleImagePreviewClick)
+    canvasEl.addEventListener('click', handleMediaRemoveClick)
     canvasEl.addEventListener('click', handleOutputCarouselClick)
     canvasEl.addEventListener('click', handleOutputDownloadClick)
     canvasEl.addEventListener('load', handlePreviewMediaLoaded, true)
@@ -7457,6 +8114,7 @@ const groupDragMirrorLog = (
       canvasEl.removeEventListener('click', handleNodeToolbarClick)
       canvasEl.removeEventListener('click', handleNodeToggleClick)
       canvasEl.removeEventListener('click', handleImagePreviewClick)
+      canvasEl.removeEventListener('click', handleMediaRemoveClick)
       canvasEl.removeEventListener('dragstart', preventNativeMediaDrag, true)
       canvasEl.removeEventListener('load', handlePreviewMediaLoaded, true)
       canvasEl.removeEventListener('error', handlePreviewMediaError, true)
@@ -8626,36 +9284,86 @@ const groupDragMirrorLog = (
             const lightboxOutputs = imagePreview.outputItems || []
             const lightboxHasCarousel = lightboxOutputs.length > 1
             const lightboxSelectedIndex = imagePreview.selectedIndex ?? 0
-            // Header title: when inside a Generate carousel, show
-            // the current item's name so the label tracks the
-            // visible asset. Otherwise fall back to the static
-            // preview title.
             const headerTitle =
-              lightboxHasCarousel && imagePreview.outputItems
-                ? imagePreview.outputItems[lightboxSelectedIndex]?.name || imagePreview.name
-                : imagePreview.name
-            // [Workflow] Lightbox download — enabled when there's a usable src.
-// Previously gated to `mediaType === 'image'`, which silently
-// disabled download for video outputs even though
-// `handleDownloadPreview` already handles both via the SW
-// download route + chrome.downloads fallback chain. The
-// filename is derived per-asset (`resolveGenerateOutputFilename`)
-// so a video download naturally gets `.mp4`.
-const lightboxCanDownload = Boolean(imagePreview.src) && (
-  imagePreview.mediaType === 'image' || imagePreview.mediaType === 'video'
-)
+              imagePreview.outputName
+              || imagePreview.outputItems?.[lightboxSelectedIndex]?.name
+              || imagePreview.name
+            const metadata = imagePreview.metadata || {}
+            const fileSizeText = formatMediaFileSize(metadata.size)
+            const resolutionText = metadata.width && metadata.height
+              ? `${Math.round(metadata.width)} × ${Math.round(metadata.height)}`
+              : ''
+            const durationText = imagePreview.mediaType === 'video'
+              ? formatMediaDuration(metadata.duration)
+              : ''
+            const createdAtText = formatPreviewCreatedAt(metadata.createdAt)
+            const costText = formatPreviewCost(metadata.cost)
+            const fileTypeText = formatPreviewFileType(
+              metadata,
+              headerTitle,
+              imagePreview.src,
+              imagePreview.mediaType
+            )
+            const metadataRows = [
+              { label: 'Name', value: headerTitle },
+              { label: 'Model', value: metadata.model },
+              { label: 'File type', value: fileTypeText },
+              { label: 'File size', value: fileSizeText },
+              { label: 'Resolution', value: resolutionText },
+              { label: 'Duration', value: durationText },
+              { label: 'Date created', value: createdAtText },
+              // Do not render a placeholder row when the provider
+              // did not return cost metadata.
+              { label: 'Cost', value: costText },
+              {
+                label: imagePreview.outputItems ? 'Created by' : 'Uploaded by',
+                value: metadata.createdBy
+              }
+            ].filter((row) => Boolean(row.value))
+            const zoom = Math.max(50, Math.min(300, imagePreview.zoom || 100))
+
+            const syncRenderedMediaMetadata = (width: number, height: number, duration?: number) => {
+              if (!width || !height) return
+              setImagePreview((current) => {
+                if (!current || current.src !== imagePreview.src) return current
+                const currentMetadata = current.metadata || {}
+                const nextDuration = currentMetadata.duration || duration
+                if (
+                  currentMetadata.width === width
+                  && currentMetadata.height === height
+                  && currentMetadata.duration === nextDuration
+                ) return current
+                return {
+                  ...current,
+                  metadata: {
+                    ...currentMetadata,
+                    width: currentMetadata.width || width,
+                    height: currentMetadata.height || height,
+                    ...(nextDuration ? { duration: nextDuration } : {})
+                  }
+                }
+              })
+            }
             return (
               <div
-                className="absolute inset-0 z-[70] flex flex-col bg-black/85 backdrop-blur-sm"
+                className="absolute inset-0 z-[70] flex flex-col bg-black/90 p-4 backdrop-blur-md"
                 onMouseDown={(event) => {
                   if (event.target === event.currentTarget) setImagePreview(null)
                 }}
               >
-                <div className="flex h-12 shrink-0 items-center justify-between border-b border-white/[0.08] bg-[#111111]/92 px-4">
-                  <div className="flex min-w-0 items-center gap-3 text-[11px] font-medium text-white/62">
-                    <span className="block truncate">{headerTitle}</span>
+                <div className="flex h-12 shrink-0 items-center justify-between px-1">
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      title={lightboxHasCarousel ? 'Download current output' : 'Download'}
+                      aria-label={lightboxHasCarousel ? 'Download current output' : 'Download'}
+                      onClick={handleDownloadPreview}
+                      className="flex h-9 w-9 items-center justify-center rounded-xl border border-white/[0.12] bg-white/[0.04] text-white/65 transition-colors hover:bg-white/[0.09] hover:text-white"
+                    >
+                      <Download className="h-4 w-4" />
+                    </button>
                     {lightboxHasCarousel && (
-                      <div className="flex items-center gap-1 rounded-md border border-white/[0.08] bg-white/[0.03] px-1 py-0.5 text-white/72">
+                      <div className="flex items-center gap-1 rounded-xl border border-white/[0.1] bg-white/[0.04] p-1 text-[11px] text-white/72">
                         <button
                           type="button"
                           title="Previous output"
@@ -8665,7 +9373,7 @@ const lightboxCanDownload = Boolean(imagePreview.src) && (
                         >
                           <ChevronLeft className="h-3.5 w-3.5" />
                         </button>
-                        <span className="min-w-[40px] px-1 text-center font-variant-numeric tabular-nums">
+                        <span className="min-w-[40px] px-1 text-center tabular-nums">
                           {lightboxSelectedIndex + 1} / {lightboxOutputs.length}
                         </span>
                         <button
@@ -8680,49 +9388,85 @@ const lightboxCanDownload = Boolean(imagePreview.src) && (
                       </div>
                     )}
                   </div>
-                  <div className="flex items-center gap-1">
-                    {lightboxCanDownload && (
-                      <button
-                        type="button"
-                        title={lightboxHasCarousel ? 'Download current output' : 'Download'}
-                        aria-label={lightboxHasCarousel ? 'Download current output' : 'Download'}
-                        onClick={handleDownloadPreview}
-                        className="flex h-8 w-8 items-center justify-center rounded-lg text-white/45 transition-colors hover:bg-white/[0.07] hover:text-white"
-                      >
-                        <Download className="h-4 w-4" />
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      title="Close preview"
-                      onClick={() => setImagePreview(null)}
-                      className="flex h-8 w-8 items-center justify-center rounded-lg text-white/45 transition-colors hover:bg-white/[0.07] hover:text-white"
-                    >
-                      <X className="h-4 w-4" />
-                    </button>
-                  </div>
+                  <button
+                    type="button"
+                    title="Close preview"
+                    onClick={() => setImagePreview(null)}
+                    className="flex h-9 w-9 items-center justify-center rounded-xl text-white/55 transition-colors hover:bg-white/[0.08] hover:text-white"
+                  >
+                    <X className="h-5 w-5" />
+                  </button>
                 </div>
-                <div
-                  className="flex min-h-0 flex-1 items-center justify-center p-5"
-                  onMouseDown={(event) => {
-                    if (event.target === event.currentTarget) setImagePreview(null)
-                  }}
-                >
-                  {imagePreview.mediaType === 'video' ? (
-                    <video
-                      src={imagePreview.src}
-                      controls
-                      autoPlay
-                      className="max-h-full max-w-full rounded-lg border border-white/[0.08] object-contain shadow-2xl"
-                    />
-                  ) : (
-                    <img
-                      key={imagePreview.src}
-                      src={imagePreview.src}
-                      alt={headerTitle}
-                      className="max-h-full max-w-full rounded-lg border border-white/[0.08] object-contain shadow-2xl"
-                    />
-                  )}
+                <div className="flex min-h-0 flex-1 gap-4">
+                  <div className="relative flex min-w-0 flex-1 items-center justify-center overflow-auto rounded-2xl border border-white/[0.12] bg-[#111111] shadow-2xl">
+                    {imagePreview.mediaType === 'image' && (
+                      <div className="absolute right-3 top-3 z-10 flex items-center gap-1 rounded-lg bg-black/70 p-1 text-[10px] font-medium text-white/75 backdrop-blur-sm">
+                        <button
+                          type="button"
+                          title="Zoom out"
+                          onClick={() => setImagePreview((current) => current ? { ...current, zoom: Math.max(50, (current.zoom || 100) - 25) } : current)}
+                          className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-white/[0.1] hover:text-white"
+                        >
+                          <ZoomOut className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          title="Reset zoom"
+                          onClick={() => setImagePreview((current) => current ? { ...current, zoom: 100 } : current)}
+                          className="h-7 min-w-[48px] rounded-md px-1 tabular-nums hover:bg-white/[0.1] hover:text-white"
+                        >
+                          {zoom}%
+                        </button>
+                        <button
+                          type="button"
+                          title="Zoom in"
+                          onClick={() => setImagePreview((current) => current ? { ...current, zoom: Math.min(300, (current.zoom || 100) + 25) } : current)}
+                          className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-white/[0.1] hover:text-white"
+                        >
+                          <ZoomIn className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    )}
+
+                    {imagePreview.mediaType === 'video' ? (
+                      <video
+                        key={imagePreview.src}
+                        src={imagePreview.src}
+                        controls
+                        autoPlay
+                        onLoadedMetadata={(event) => {
+                          const video = event.currentTarget
+                          syncRenderedMediaMetadata(video.videoWidth, video.videoHeight, video.duration)
+                        }}
+                        className="h-full w-full object-contain"
+                      />
+                    ) : (
+                      <img
+                        key={imagePreview.src}
+                        src={imagePreview.src}
+                        alt={headerTitle}
+                        onLoad={(event) => {
+                          const image = event.currentTarget
+                          syncRenderedMediaMetadata(image.naturalWidth, image.naturalHeight)
+                        }}
+                        style={{ transform: `scale(${zoom / 100})` }}
+                        className="max-h-full max-w-full origin-center object-contain transition-transform duration-150"
+                      />
+                    )}
+                  </div>
+
+                  <aside className="w-[220px] shrink-0 overflow-y-auto rounded-2xl border border-white/[0.06] bg-black/35 px-4 py-5">
+                    <div className="space-y-5">
+                      {metadataRows.map((row) => (
+                        <div key={row.label}>
+                          <div className="text-[10px] font-medium text-white/38">{row.label}</div>
+                          <div className="mt-1 break-words text-[11px] font-medium leading-relaxed text-white/82">
+                            {row.value}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </aside>
                 </div>
               </div>
             )

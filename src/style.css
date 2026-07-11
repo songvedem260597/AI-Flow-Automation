@@ -843,7 +843,7 @@ input::placeholder, textarea::placeholder {
 .df-node-icon.download { background: rgba(14, 165, 233, 0.15); color: #0ea5e9; }
 .df-node-icon.delay { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
 .df-node-icon.image { background: rgba(236, 72, 153, 0.15); color: #ec4899; }
-.df-node-icon.prompt { background: rgba(111, 139, 247, 0.15); color: #6f8bf7; }
+.df-node-icon.prompt { background: rgba(111, 139, 247, 0.15); color: #6f8bf7; font-weight: 600; font-size: 13px; line-height: 1; }
 .df-node-icon.note { background: rgba(139, 139, 146, 0.15); color: #8b8b92; }
 .df-node-icon.condition { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
 .df-node-icon.merge { background: rgba(168, 85, 247, 0.15); color: #a855f7; }
@@ -2640,6 +2640,266 @@ button.df-node-tag {
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
   animation: workflow-confirm-pop 0.18s cubic-bezier(0.22, 1, 0.36, 1);
   overflow: hidden;
+}
+
+/* ── Media file card (WorkflowMediaFileCard) ───────────────────── */
+/* New layout for the Media (image / video) node: header on top of
+ * the preview card, metadata badge bottom-left on the preview, and
+ * filename + size in the card footer. Scoped strictly to
+ * `.workflow-media-file-node` / `.workflow-media-file-shell` so the
+ * existing Generate / Prompt / Delay / Download nodes, the outer
+ * `.drawflow-node` port wrapper, `.input` / `.output`, and the
+ * connection `.path` styling are NOT touched. */
+.workflow-media-file-shell {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+  min-width: 280px;
+  max-width: 360px;
+}
+
+.workflow-media-file-shell .df-node-status {
+  position: absolute !important;
+  top: -10px !important;
+  left: 50% !important;
+  transform: translateX(-50%);
+  width: 60% !important;
+  height: 2px !important;
+  border-radius: 999px;
+  background: linear-gradient(90deg, transparent, rgba(168, 85, 247, 0.75), transparent);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 200ms ease;
+}
+
+/* [WorkflowMediaFileCard] The pending-status bar above the Media
+ * node is only meaningful for the "node disabled" state — the user
+ * explicitly chose to leave it gated behind the disable toggle.
+ * Earlier it also lit up on plain node selection, which read as a
+ * stray purple border on every freshly-clicked Media node. Selection
+ * already has its own outline (`.drawflow-node.selected`), so this
+ * rule intentionally drops the selected-glow override. */
+
+.ai-drawflow-canvas .drawflow-node.selected .workflow-media-file-shell .df-node-status {
+  opacity: 0;
+}
+
+.workflow-media-file-node {
+  display: block;
+  width: 100%;
+  font-family: Inter, system-ui, -apple-system, sans-serif;
+}
+
+.workflow-media-file-card {
+  background: #141416;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 9px;
+  padding: 10px 10px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: hidden;
+}
+
+.workflow-media-file-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 4px 0;
+}
+
+.workflow-media-file-icon {
+  display: inline-flex;
+  width: 22px;
+  height: 22px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  background: rgba(124, 92, 255, 0.18);
+  color: #b9a4ff;
+  flex-shrink: 0;
+}
+
+.workflow-media-file-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.workflow-media-file-label {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: #f4f4f5;
+  letter-spacing: 0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workflow-media-file-preview {
+  position: relative;
+  width: 100%;
+  background: #0c0c0e;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 10px;
+  overflow: hidden;
+  cursor: grab;
+  pointer-events: auto;
+}
+
+.workflow-media-file-preview.ratio-9-16 {
+  aspect-ratio: 9 / 16;
+}
+
+.workflow-media-file-preview.ratio-16-9 {
+  aspect-ratio: 16 / 9;
+}
+
+.workflow-media-file-preview.ratio-4-3 {
+  aspect-ratio: 4 / 3;
+}
+
+.workflow-media-file-preview.ratio-3-4 {
+  aspect-ratio: 3 / 4;
+}
+
+.workflow-media-file-preview.ratio-1-1 {
+  aspect-ratio: 1 / 1;
+}
+
+.workflow-media-file-preview .df-node-preview-media {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.workflow-media-file-preview .df-node-preview-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  height: 100%;
+  min-height: 160px;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.workflow-media-file-empty-icon {
+  display: inline-flex;
+  width: 32px;
+  height: 32px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: rgba(124, 92, 255, 0.18);
+  color: #b9a4ff;
+}
+
+.workflow-media-file-empty-icon svg {
+  width: 18px;
+  height: 18px;
+}
+
+.workflow-media-file-empty-text {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.45);
+  letter-spacing: 0.01em;
+}
+
+.workflow-media-file-meta {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  padding: 4px 8px;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fafafa;
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  border-radius: 6px;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  pointer-events: none;
+  z-index: 2;
+}
+
+.workflow-media-file-preview .workflow-media-file-remove {
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fafafa;
+  border: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 160ms ease, background-color 160ms ease;
+}
+
+.workflow-media-file-preview .workflow-media-file-remove svg {
+  width: 13px;
+  height: 13px;
+}
+
+.workflow-media-file-preview.has-image:hover .workflow-media-file-remove,
+.workflow-media-file-preview.has-image:focus-within .workflow-media-file-remove {
+  opacity: 0.95;
+  pointer-events: auto;
+}
+
+.workflow-media-file-preview .workflow-media-file-remove:hover {
+  background: rgba(220, 38, 38, 0.92);
+  color: #fff;
+}
+
+.workflow-media-file-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 4px 2px;
+  font-size: 10.5px;
+  color: rgba(255, 255, 255, 0.5);
+  letter-spacing: 0.01em;
+}
+
+.workflow-media-file-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workflow-media-file-size {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Disabled state for the new shell — body greys out, preview desaturates,
+ * footer text dims. The existing `.df-node-disabled` rules still apply to
+ * non-Media nodes untouched. */
+.ai-drawflow-canvas .drawflow-node.df-node-disabled .workflow-media-file-card {
+  opacity: 0.55;
+  filter: grayscale(0.6);
+}
+
+.workflow-media-file-shell.df-node-disabled .df-node-status {
+  background: rgba(255, 255, 255, 0.18) !important;
+  opacity: 1 !important;
 }
 
 .asset-storage-header {
