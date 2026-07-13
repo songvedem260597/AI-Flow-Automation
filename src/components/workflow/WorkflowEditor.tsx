@@ -13288,19 +13288,21 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
           onClick={() => setDeleteConfirmWorkflow(null)}
         >
           <div
-            className="workflow-confirm-modal"
+            className="workflow-confirm-modal workflow-template-delete-modal"
             onClick={(event) => event.stopPropagation()}
           >
-            <div className="workflow-confirm-icon">
-              <Trash2 className="h-4 w-4" />
-            </div>
-            <div className="workflow-confirm-body">
-              <h2 id="workflow-confirm-title" className="workflow-confirm-title">
-                Delete “{deleteConfirmWorkflow.name}”?
-              </h2>
-              <p id="workflow-confirm-desc" className="workflow-confirm-desc">
-                This action cannot be undone.
-              </p>
+            <div className="workflow-template-delete-content">
+              <div className="workflow-confirm-icon">
+                <Trash2 className="h-[18px] w-[18px]" />
+              </div>
+              <div className="workflow-confirm-body">
+                <h2 id="workflow-confirm-title" className="workflow-confirm-title">
+                  Delete {deleteConfirmWorkflow.name.replace(/\s+workflow$/i, '')} Workflow
+                </h2>
+                <p id="workflow-confirm-desc" className="workflow-confirm-desc">
+                  This workflow will be permanently removed.
+                </p>
+              </div>
             </div>
             <div className="workflow-confirm-actions">
               <button
@@ -13316,7 +13318,7 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                 onClick={handleConfirmDeleteWorkflow}
               >
                 <Trash2 className="h-4 w-4" />
-                Delete
+                Delete workflow
               </button>
             </div>
           </div>
@@ -13402,9 +13404,6 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                 <p id="template-confirm-desc" className="workflow-confirm-desc">
                   This template will be permanently removed.
                 </p>
-                <div className="workflow-confirm-target" title={deleteConfirmTemplate.name}>
-                  {deleteConfirmTemplate.name}
-                </div>
               </div>
             </div>
             <div className="workflow-confirm-actions">
@@ -13438,30 +13437,35 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
           onClick={handleCancelRenameWorkflow}
         >
           <div
-            className="workflow-confirm-modal"
+            className="workflow-confirm-modal workflow-template-delete-modal workflow-rename-modal"
             onClick={(event) => event.stopPropagation()}
           >
-            <div className="workflow-rename-icon">
-              <Pencil className="h-4 w-4" />
-            </div>
-            <div className="workflow-confirm-body">
-              <h2 id="workflow-rename-title" className="workflow-confirm-title">
-                Rename workflow
-              </h2>
-              <input
-                ref={renameInputRef}
-                type="text"
-                value={renameDraft}
-                onChange={(event) => setRenameDraft(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter') {
-                    event.stopPropagation()
-                    handleConfirmRenameWorkflow()
-                  }
-                }}
-                placeholder="Workflow name"
-                className="workflow-rename-input"
-              />
+            <div className="workflow-template-delete-content">
+              <div className="workflow-rename-icon">
+                <Pencil className="h-[18px] w-[18px]" />
+              </div>
+              <div className="workflow-confirm-body">
+                <h2 id="workflow-rename-title" className="workflow-confirm-title">
+                  Rename workflow
+                </h2>
+                <p className="workflow-confirm-desc">
+                  Enter a clear name for this workflow.
+                </p>
+                <input
+                  ref={renameInputRef}
+                  type="text"
+                  value={renameDraft}
+                  onChange={(event) => setRenameDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.stopPropagation()
+                      handleConfirmRenameWorkflow()
+                    }
+                  }}
+                  placeholder="Workflow name"
+                  className="workflow-rename-input"
+                />
+              </div>
             </div>
             <div className="workflow-confirm-actions">
               <button
@@ -13478,7 +13482,7 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                 disabled={!renameDraft.trim()}
               >
                 <Pencil className="h-4 w-4" />
-                Save
+                Save changes
               </button>
             </div>
           </div>

@@ -905,6 +905,14 @@ input::placeholder, textarea::placeholder {
   border-radius: 8px;
 }
 
+/* Match the Generate preview surface to the Media node's black canvas.
+   Keep this scoped so Prompt and other generic preview nodes retain their
+   existing neutral background. */
+.df-node[data-node-type="generate"] .df-node-preview,
+.df-node[data-node-type="generate"] .df-node-output-preview {
+  background: #0c0c0e;
+}
+
 .df-node-generate-preview-wrap::before {
   content: '';
   position: absolute;
@@ -2744,6 +2752,43 @@ button.df-node-pill-trigger {
 
 .workflow-template-delete-modal .workflow-confirm-delete:focus-visible {
   box-shadow: 0 0 0 2px rgba(220, 53, 69, 0.28);
+}
+
+.workflow-rename-modal .workflow-rename-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 11px;
+  background: rgba(124, 92, 255, 0.1);
+  border-color: rgba(124, 92, 255, 0.28);
+  color: #b8a8ff;
+}
+
+.workflow-rename-modal .workflow-rename-input {
+  height: 36px;
+  margin-top: 10px;
+  padding: 0 12px;
+  border-color: rgba(255, 255, 255, 0.09);
+  border-radius: 10px;
+  background: #121212;
+  font-size: 11px;
+}
+
+.workflow-rename-modal .workflow-confirm-delete,
+.workflow-rename-modal .workflow-confirm-delete:hover,
+.workflow-rename-modal .workflow-confirm-delete:disabled:hover {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+  box-shadow: 0 7px 20px rgba(124, 92, 255, 0.22);
+}
+
+.workflow-rename-modal .workflow-confirm-delete:hover:not(:disabled) {
+  border-color: var(--accent-hover);
+  background: var(--accent-hover);
+}
+
+.workflow-rename-modal .workflow-confirm-delete:focus-visible {
+  box-shadow: 0 0 0 2px rgba(124, 92, 255, 0.35);
 }
 
 .workflow-save-draft-modal {
