@@ -11966,6 +11966,8 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   // Templates tab so a Save-to-Template from the canvas shows up
   // without a manual reload.
   const [savedTemplates, setSavedTemplates] = useState<UserWorkflowTemplate[]>([])
+  const [templatesHydrated, setTemplatesHydrated] = useState(false)
+  const [templateSurfaceReady, setTemplateSurfaceReady] = useState(false)
   const [deleteConfirmTemplate, setDeleteConfirmTemplate] = useState<UserWorkflowTemplate | null>(null)
   const [deleteConfirmWorkflow, setDeleteConfirmWorkflow] = useState<Workflow | null>(null)
   // [WorkflowEditor] Multi-select for bulk delete. Array (not Set)
@@ -12107,6 +12109,8 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
       setSavedTemplates(list)
     } catch {
       setSavedTemplates([])
+    } finally {
+      setTemplatesHydrated(true)
     }
   }, [])
 
@@ -12334,9 +12338,76 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   const normalizedTemplateCategory: TemplateMediaFilter = TEMPLATE_MEDIA_FILTERS.includes(templateCategory as TemplateMediaFilter)
     ? templateCategory as TemplateMediaFilter
     : 'All'
-  const filteredTemplates = normalizedTemplateCategory === 'All'
-    ? combinedTemplates
-    : combinedTemplates.filter((template) => templateMatchesMediaFilter(template, normalizedTemplateCategory))
+  const filteredTemplates = useMemo(
+    () => normalizedTemplateCategory === 'All'
+      ? combinedTemplates
+      : combinedTemplates.filter((template) => templateMatchesMediaFilter(template, normalizedTemplateCategory)),
+    [combinedTemplates, normalizedTemplateCategory]
+  )
+  // [WorkflowTemplate] Do not reveal the masonry while storage data,
+  // column measurement, or thumbnail dimensions are still changing.
+  // The hidden grid remains mounted so the browser can finish layout;
+  // after every visible thumbnail has loaded/decoded, two animation
+  // frames let masonry settle before the whole surface is revealed.
+  useLayoutEffect(() => {
+    if (view !== 'templates' || !templatesHydrated) {
+      setTemplateSurfaceReady(false)
+      return
+    }
+
+    let cancelled = false
+    let firstFrame = 0
+    let secondFrame = 0
+    setTemplateSurfaceReady(false)
+
+    const waitForThumbnail = (src: string): Promise<void> => new Promise((resolve) => {
+      let settled = false
+      let timeoutId = 0
+      const finish = () => {
+        if (settled) return
+        settled = true
+        if (timeoutId) window.clearTimeout(timeoutId)
+        resolve()
+      }
+      const image = new window.Image()
+      const decodeAndFinish = () => {
+        if (typeof image.decode !== 'function') {
+          finish()
+          return
+        }
+        void image.decode().catch(() => {}).finally(finish)
+      }
+      image.onload = decodeAndFinish
+      image.onerror = finish
+      timeoutId = window.setTimeout(finish, 5000)
+      image.src = src
+      if (image.complete) {
+        if (image.naturalWidth > 0) decodeAndFinish()
+        else finish()
+      }
+    })
+
+    const thumbnails = Array.from(new Set(
+      filteredTemplates
+        .map((template) => template.thumbnail)
+        .filter((thumbnail): thumbnail is string => Boolean(thumbnail))
+    ))
+
+    void Promise.all(thumbnails.map(waitForThumbnail)).then(() => {
+      if (cancelled) return
+      firstFrame = window.requestAnimationFrame(() => {
+        secondFrame = window.requestAnimationFrame(() => {
+          if (!cancelled) setTemplateSurfaceReady(true)
+        })
+      })
+    })
+
+    return () => {
+      cancelled = true
+      if (firstFrame) window.cancelAnimationFrame(firstFrame)
+      if (secondFrame) window.cancelAnimationFrame(secondFrame)
+    }
+  }, [view, templatesHydrated, filteredTemplates, templateColumnCount])
   // [WorkflowTemplate] Distribute filtered templates into N columns
   // for the JS masonry. Round-robin so a card count `<= columnCount`
   // guarantees every column gets exactly one card (no empty column).
@@ -12754,8 +12825,23 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
               below. */}
           <div
             ref={templatesScrollRef}
-            className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden pr-1"
+            className={cn(
+              'relative min-h-0 min-w-0 flex-1 overflow-x-hidden pr-1',
+              templateSurfaceReady ? 'overflow-y-auto' : 'overflow-y-hidden'
+            )}
           >
+            {!templateSurfaceReady && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="absolute inset-0 z-10 flex min-h-[240px] items-center justify-center bg-[#0E0E0E]"
+              >
+                <div className="flex flex-col items-center gap-3 text-white/45">
+                  <LoaderCircle className="h-5 w-5 animate-spin text-[#8F73FF]" />
+                  <span className="text-[11px] font-medium">Loading templates...</span>
+                </div>
+              </div>
+            )}
             {/* [WorkflowTemplate] Inner JS masonry — a flex row of N
                 equal-width columns. Each column stacks cards top-to-
                 bottom. This replaced the previous CSS-columns
@@ -12765,7 +12851,12 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                 column 3 unused → ≈258px dead right area). Round-robin
                 distribution guarantees every column gets at least one
                 card whenever the count permits it. */}
-            <div className="templates-masonry">
+            <div
+              className={cn(
+                'templates-masonry transition-opacity duration-150',
+                templateSurfaceReady ? 'visible opacity-100' : 'invisible opacity-0'
+              )}
+            >
               {templateColumns.map((column, columnIndex) => (
                 <div
                   key={`templates-col-${columnIndex}`}
