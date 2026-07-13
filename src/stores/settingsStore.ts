@@ -2,29 +2,26 @@ import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
 import type { AppSettings, AIProvider, ActiveView, UIState } from '@/types'
 import { DEFAULT_SETTINGS } from '@/constants'
-
-const chromeStorageCache: Record<string, string | null> = {}
-const chromeStoragePending: Record<string, boolean> = {}
+import {
+  migrateLegacyPromptAssistantApiKey,
+  sanitizePersistedSettings,
+} from '@/lib/promptAssistantSecretStore'
 
 const chromeStorage = (key: string) => {
-  if (!(key in chromeStorageCache)) {
-    chromeStorageCache[key] = null
-    chromeStoragePending[key] = true
-    chrome.storage.local.get(key, (result) => {
-      chromeStorageCache[key] = result[key] ?? null
-      chromeStoragePending[key] = false
-    })
-  }
-
   return {
-    getItem: () => chromeStorageCache[key] ?? null,
-    setItem: (value: string) => {
-      chromeStorageCache[key] = value
-      chrome.storage.local.set({ [key]: value })
+    getItem: async (_storageKey: string) => {
+      const result = await chrome.storage.local.get(key)
+      const storedValue = result[key]
+      if (storedValue == null) return null
+      const value = typeof storedValue === 'string' ? storedValue : JSON.stringify(storedValue)
+      return key === 'ai-flow-settings' ? sanitizePersistedSettings(value) : value
     },
-    removeItem: () => {
-      chromeStorageCache[key] = null
-      chrome.storage.local.remove(key)
+    setItem: async (_storageKey: string, value: string) => {
+      const safeValue = key === 'ai-flow-settings' ? sanitizePersistedSettings(value) : value
+      await chrome.storage.local.set({ [key]: safeValue })
+    },
+    removeItem: async (_storageKey: string) => {
+      await chrome.storage.local.remove(key)
     }
   }
 }
@@ -55,24 +52,13 @@ export const useSettingsStore = create<SettingsState>()(
     {
       name: 'ai-flow-settings',
       storage: createJSONStorage(() => chromeStorage('ai-flow-settings')),
-      onRehydrateStorage: () => (state) => {
-        if (state) {
-          chrome.storage.local.get('ai-flow-settings', (result) => {
-            const saved = result['ai-flow-settings']
-            if (saved) {
-              try {
-                const parsed = JSON.parse(saved)
-                if (parsed.state) {
-                  Object.assign(state, parsed.state)
-                }
-              } catch {}
-            }
-          })
-        }
-      }
     }
   )
 )
+
+// Migrate settings saved by older builds before any future persistence write
+// can replace the legacy plaintext value.
+void migrateLegacyPromptAssistantApiKey().catch(() => undefined)
 
 interface UIStore extends UIState {
   setActiveView: (view: ActiveView) => void

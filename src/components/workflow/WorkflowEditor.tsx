@@ -1,28 +1,35 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import * as Select from '@radix-ui/react-select'
 import Drawflow from '@/lib/drawflow/drawflow.min.js'
 import '@/lib/drawflow/drawflow.min.css'
-import { autoUpdate, computePosition, flip, offset, shift } from '@floating-ui/dom'
+import { autoUpdate, computePosition, offset, shift } from '@floating-ui/dom'
 import { useWorkflowStore } from '@/stores/workflowStore'
 import { canvasLog } from '@/lib/canvasInvestigate'
-import { cn, usePersistedState } from '@/lib/utils'
+import { cn, formatDate, usePersistedState } from '@/lib/utils'
 import type { AIProvider, FlowNodeData, FlowNodeType, FlowVideoMode, Workflow, WorkflowEdge, WorkflowNode } from '@/types'
 import {
   ArrowLeft,
+  BookmarkPlus,
+  BookOpen,
+  Bot,
+  Box,
   Check,
-  CheckSquare,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
   Clock,
   Copy,
   Download,
+  Film,
   FileDown,
   FileText,
   FolderOpen,
   Image,
   LayoutTemplate,
   List,
+  LoaderCircle,
   Maximize2,
+  MessagesSquare,
   PanelLeft,
   PanelLeftClose,
   Pause,
@@ -30,6 +37,8 @@ import {
   Play,
   Plus,
   Search,
+  Save,
+  Send,
   Sparkles,
   Square,
   Trash2,
@@ -48,6 +57,32 @@ import { runPipeline, stopPipeline, pausePipeline, resumePipeline } from '@/pipe
 import type { PipelineCallbacks } from '@/pipeline'
 import { usePipelineStore } from '@/stores/pipelineStore'
 import { debugLog, debugWarn } from '@/lib/debug'
+import {
+  loadPromptAssistantApiModels,
+  promptAssistantProviderLabel,
+  runPromptAssistant,
+  selectPromptAssistantApiModel,
+  type PromptAssistantApiConfig,
+  type PromptAssistantApiModel,
+  type PromptAssistantMediaUpload,
+  type PromptAssistantProvider,
+} from '@/lib/promptAssistant'
+import { useSettingsStore } from '@/stores/settingsStore'
+import {
+  EMPTY_VIDEO_AGENT_SKILL_LIBRARY,
+  loadVideoAgentSkillLibrary,
+  saveVideoAgentSkillLibrary,
+  type VideoAgentSkill,
+  type VideoAgentSkillLibrary,
+} from '@/lib/videoAgentSkills'
+import {
+  createVideoAgentConversation,
+  loadVideoAgentConversationState,
+  saveVideoAgentConversation,
+  setActiveVideoAgentConversation,
+  type VideoAgentConversation,
+  type VideoAgentConversationMessage,
+} from '@/lib/videoAgentConversations'
 
 /**
  * [WorkflowRun][probe] Investigation-only source probe.
@@ -99,6 +134,7 @@ const probeRunnerState = (
 import {
   saveAssetFromFile,
   saveAssetFromBlob,
+  getAssetBlob,
   getAssetObjectUrl,
   revokeAssetObjectUrl,
   revokeAllAssetObjectUrls,
@@ -587,6 +623,127 @@ function getMediaNodePoster(data: Record<string, unknown>) {
     || data.templateImagePreview
     || ''
   )
+}
+
+interface MediaUrlProbeResult {
+  mediaType: MediaNodeType
+  width?: number
+  height?: number
+  duration?: number
+}
+
+const MEDIA_URL_IMAGE_PATTERN = /\.(png|jpe?g|webp|gif|bmp|svg|avif)(?:[?#]|$)/i
+const MEDIA_URL_VIDEO_PATTERN = /\.(mp4|mov|webm|m4v|ogv)(?:[?#]|$)/i
+
+function inferMediaUrlType(url: string): MediaNodeType | null {
+  if (/^data:video\//i.test(url) || MEDIA_URL_VIDEO_PATTERN.test(url)) return 'video'
+  if (/^data:image\//i.test(url) || MEDIA_URL_IMAGE_PATTERN.test(url)) return 'image'
+  return null
+}
+
+function validateMediaUrl(rawUrl: string): string {
+  const url = rawUrl.trim()
+  if (!url) throw new Error('Enter an image or video URL.')
+
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    throw new Error('Enter a valid absolute media URL.')
+  }
+
+  if (!['http:', 'https:', 'data:', 'blob:', 'chrome-extension:'].includes(parsed.protocol)) {
+    throw new Error('This URL protocol is not supported.')
+  }
+  return url
+}
+
+function probeImageUrl(url: string): Promise<MediaUrlProbeResult> {
+  return new Promise((resolve, reject) => {
+    const image = new window.Image()
+    const timeoutId = window.setTimeout(() => finish(new Error('Image URL timed out.')), 10000)
+    const finish = (error?: Error) => {
+      window.clearTimeout(timeoutId)
+      image.onload = null
+      image.onerror = null
+      if (error) reject(error)
+      else resolve({ mediaType: 'image', width: image.naturalWidth || undefined, height: image.naturalHeight || undefined })
+    }
+    image.onload = () => finish()
+    image.onerror = () => finish(new Error('URL is not a loadable image.'))
+    image.src = url
+  })
+}
+
+function probeVideoUrl(url: string): Promise<MediaUrlProbeResult> {
+  return new Promise((resolve, reject) => {
+    const video = document.createElement('video')
+    video.preload = 'metadata'
+    video.muted = true
+    video.playsInline = true
+    const timeoutId = window.setTimeout(() => finish(new Error('Video URL timed out.')), 10000)
+    const finish = (error?: Error) => {
+      window.clearTimeout(timeoutId)
+      video.onloadedmetadata = null
+      video.onerror = null
+      if (error) reject(error)
+      else resolve({
+        mediaType: 'video',
+        width: video.videoWidth || undefined,
+        height: video.videoHeight || undefined,
+        duration: Number.isFinite(video.duration) && video.duration > 0 ? video.duration : undefined
+      })
+    }
+    video.onloadedmetadata = () => finish()
+    video.onerror = () => finish(new Error('URL is not a loadable video.'))
+    video.src = url
+    video.load()
+  })
+}
+
+async function probeMediaUrl(url: string, preferredType: MediaNodeType): Promise<MediaUrlProbeResult> {
+  const inferredType = inferMediaUrlType(url)
+  if (inferredType) {
+    try {
+      return inferredType === 'video' ? await probeVideoUrl(url) : await probeImageUrl(url)
+    } catch {
+      // A strong URL/data MIME hint is enough to preserve authenticated
+      // or short-lived URLs whose metadata cannot be probed from the UI.
+      return { mediaType: inferredType }
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    let failedCount = 0
+    let settled = false
+    const accept = (result: MediaUrlProbeResult) => {
+      if (settled) return
+      settled = true
+      resolve(result)
+    }
+    const decline = () => {
+      failedCount += 1
+      if (!settled && failedCount === 2) {
+        settled = true
+        reject(new Error('The URL could not be identified as an image or video.'))
+      }
+    }
+    const probes = preferredType === 'video'
+      ? [probeVideoUrl(url), probeImageUrl(url)]
+      : [probeImageUrl(url), probeVideoUrl(url)]
+    probes.forEach((probe) => probe.then(accept).catch(decline))
+  })
+}
+
+function mediaFileNameFromUrl(url: string, mediaType: MediaNodeType): string {
+  try {
+    const parsed = new URL(url)
+    const segment = parsed.pathname.split('/').filter(Boolean).pop()
+    if (segment) return decodeURIComponent(segment)
+  } catch {
+    // URL validation already happened before commit; keep a safe fallback.
+  }
+  return mediaType === 'video' ? 'remote-video.mp4' : 'remote-image.png'
 }
 
 // [WorkflowMediaFileCard] Helpers used by the new Media (image /
@@ -2682,7 +2839,7 @@ function renderDrawflowMediaFileCard(
         ? (
           mediaPoster
             ? `<img class="df-node-preview-media" src="${escapeHtml(mediaPoster)}" alt="" draggable="false">`
-            : `<div class="df-node-preview-placeholder">${DF_PORT_ICONS.video}</div>`
+            : `<video class="df-node-preview-media" src="${escapeHtml(mediaSrc)}" muted playsinline preload="metadata" draggable="false" aria-label="Video preview"></video>`
         )
         : `<img class="df-node-preview-media" src="${escapeHtml(mediaSrc)}" alt="" draggable="false">`
     )
@@ -3167,18 +3324,34 @@ interface NodeInspectorProps {
   workflow: Workflow
   nodeId: string
   onClose: () => void
+  onSaveMediaUrl: (nodeId: string, url: string) => Promise<{ mediaType: MediaNodeType; unlinkedCount: number }>
 }
 
-const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, nodeId, onClose }) => {
+const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, nodeId, onClose, onSaveMediaUrl }) => {
   const updateNode = useWorkflowStore((s) => s.updateNode)
   const deleteNode = useWorkflowStore((s) => s.deleteNode)
   const node = workflow.nodes.find((item) => item.id === nodeId)
+  const nodeData = (node?.data || {}) as Record<string, unknown>
+  const persistedMediaUrl = node?.type === 'image'
+    ? String(getMediaNodeType(nodeData) === 'video' ? nodeData.videoUrl || nodeData.mediaUrl || '' : nodeData.imageUrl || nodeData.mediaUrl || '')
+    : ''
+  const [mediaUrlDraft, setMediaUrlDraft] = useState(persistedMediaUrl)
+  const [mediaUrlSaving, setMediaUrlSaving] = useState(false)
+  const [mediaUrlFeedback, setMediaUrlFeedback] = useState<{ tone: 'success' | 'error'; message: string } | null>(null)
+
+  useEffect(() => {
+    setMediaUrlDraft(persistedMediaUrl)
+  }, [nodeId, persistedMediaUrl])
+
+  useEffect(() => {
+    setMediaUrlFeedback(null)
+  }, [nodeId])
 
   if (!node) {
     return null
   }
 
-  const data = node.data as Record<string, unknown>
+  const data = nodeData
   const update = (field: string, value: unknown) => updateNode(node.id, { [field]: value } as Partial<FlowNodeData>)
   const updateGenerate = (patch: Record<string, unknown>) => {
     updateNode(node.id, sanitizeGenerateDataPatch(data, patch) as Partial<FlowNodeData>)
@@ -3204,6 +3377,26 @@ const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, nodeId, onClose
   const toggleRowClass = 'flex items-center justify-between gap-3 rounded-lg border border-white/5 bg-[#141414] px-3 py-2'
   const toggleLabelClass = 'text-[11px] font-medium text-white/50'
   const selectIconClass = 'pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-white/35'
+  const saveMediaUrl = async () => {
+    const url = mediaUrlDraft.trim()
+    if (!url || mediaUrlSaving) return
+    setMediaUrlSaving(true)
+    setMediaUrlFeedback(null)
+    try {
+      const result = await onSaveMediaUrl(node.id, url)
+      setMediaUrlFeedback({
+        tone: 'success',
+        message: `${result.mediaType === 'video' ? 'Video' : 'Image'} URL saved${result.unlinkedCount > 0 ? ` · ${result.unlinkedCount} incompatible link${result.unlinkedCount === 1 ? '' : 's'} removed` : ''}.`
+      })
+    } catch (error) {
+      setMediaUrlFeedback({
+        tone: 'error',
+        message: error instanceof Error ? error.message : 'Unable to save this media URL.'
+      })
+    } finally {
+      setMediaUrlSaving(false)
+    }
+  }
 
   return (
     <aside className="flex w-[340px] shrink-0 flex-col border-l border-white/[0.06] bg-[#111111]">
@@ -3214,7 +3407,7 @@ const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, nodeId, onClose
           </p>
           <p className="text-[10px] text-white/30">{node.type === 'image' ? 'media' : node.type}</p>
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex shrink-0 items-center gap-1">
           <button
             type="button"
             title="Delete node"
@@ -3235,14 +3428,16 @@ const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, nodeId, onClose
       </div>
 
       <div className="min-h-0 flex-1 space-y-3.5 overflow-y-auto p-4">
-        <label className="block">
-          <span className={fieldLabelClass}>Name</span>
-          <input
-            value={String(node.type === 'image' && (!data.label || data.label === 'New Image Node') ? 'New Media Node' : data.label || '')}
-            onChange={(event) => update('label', event.target.value)}
-            className={fieldControlClass}
-          />
-        </label>
+        {node.type !== 'image' && (
+          <label className="block">
+            <span className={fieldLabelClass}>Name</span>
+            <input
+              value={String(data.label || '')}
+              onChange={(event) => update('label', event.target.value)}
+              className={fieldControlClass}
+            />
+          </label>
+        )}
 
         {(node.type === 'prompt' || node.type === 'generate') && (
           <label className="block">
@@ -3414,23 +3609,42 @@ const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, nodeId, onClose
         )}
 
         {node.type === 'image' && (
-          <>
-            <label className="block">
-              <span className={fieldLabelClass}>Media URL</span>
+          <div className="block">
+            <span className={fieldLabelClass}>Media URL</span>
+            <div className="flex items-center gap-2">
               <input
-                value={String(getMediaNodeType(data) === 'video' ? data.videoUrl || data.mediaUrl || '' : data.imageUrl || data.mediaUrl || '')}
+                value={mediaUrlDraft}
                 onChange={(event) => {
-                  const mediaType = getMediaNodeType(data)
-                  updateNode(node.id, {
-                    mediaUrl: event.target.value,
-                    imageUrl: mediaType === 'image' ? event.target.value : '',
-                    videoUrl: mediaType === 'video' ? event.target.value : ''
-                  } as Partial<FlowNodeData>)
+                  setMediaUrlDraft(event.target.value)
+                  setMediaUrlFeedback(null)
                 }}
-                className={fieldControlClass}
+                onKeyDown={(event) => {
+                  if (event.key !== 'Enter') return
+                  event.preventDefault()
+                  void saveMediaUrl()
+                }}
+                placeholder="https://..."
+                className={cn(fieldControlClass, 'min-w-0 flex-1')}
               />
-            </label>
-          </>
+              <button
+                type="button"
+                disabled={!mediaUrlDraft.trim() || mediaUrlSaving}
+                onClick={() => void saveMediaUrl()}
+                className="flex h-8 shrink-0 items-center gap-1.5 rounded-lg bg-[#7C5CFF] px-3 text-[10px] font-semibold text-white transition-colors hover:bg-[#8768FF] disabled:cursor-not-allowed disabled:opacity-35"
+              >
+                {mediaUrlSaving ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                Save URL
+              </button>
+            </div>
+            {mediaUrlFeedback && (
+              <p className={cn(
+                'mt-1.5 text-[9px] leading-relaxed',
+                mediaUrlFeedback.tone === 'success' ? 'text-emerald-300/75' : 'text-red-300/80'
+              )}>
+                {mediaUrlFeedback.message}
+              </p>
+            )}
+          </div>
         )}
 
         {node.type === 'generate' && (
@@ -3548,6 +3762,1510 @@ const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, nodeId, onClose
   )
 }
 
+type VideoAgentMessage = VideoAgentConversationMessage
+
+interface VideoAgentWorkflowImageReference {
+  id: string
+  alias: string
+  name: string
+  sourceUrl: string
+  previewUrl: string
+  assetId?: string
+}
+
+function collectVideoAgentWorkflowImages(workflow: Workflow): VideoAgentWorkflowImageReference[] {
+  const images: Array<Omit<VideoAgentWorkflowImageReference, 'alias'>> = []
+
+  for (const node of workflow.nodes) {
+    const data = node.data as Record<string, unknown>
+
+    if (node.type === 'image' && getMediaNodeType(data) === 'image') {
+      const assetId = String(data.assetId || data.mediaAssetId || data.imageAssetId || '')
+      const sourceUrl = getMediaNodeSource(data)
+      if (!sourceUrl && !assetId) continue
+      images.push({
+        id: `${node.id}:media`,
+        name: getMediaCardFileName(data) || `workflow-image-${images.length + 1}.png`,
+        sourceUrl,
+        previewUrl: sourceUrl,
+        ...(assetId ? { assetId } : {}),
+      })
+      continue
+    }
+
+    if (node.type !== 'generate') continue
+    const output = data._output as Record<string, unknown> | undefined
+    const outputUrls = getGenerateOutputImageUrls(output)
+    const outputItems = buildGenerateOutputItems(output, outputUrls)
+    outputItems.forEach((item, outputIndex) => {
+      if (item.mediaType === 'video') return
+      const sourceUrl = item.previewUrl || item.url
+      if (!sourceUrl && !item.assetId) return
+      images.push({
+        id: `${node.id}:output:${outputIndex}`,
+        name: resolveGenerateOutputFilename(item, outputIndex),
+        sourceUrl,
+        previewUrl: sourceUrl,
+        ...(item.assetId ? { assetId: item.assetId } : {}),
+      })
+    })
+  }
+
+  return images.map((image, index) => ({ ...image, alias: `image${index + 1}` }))
+}
+
+function mentionedVideoAgentWorkflowImages(
+  text: string,
+  images: VideoAgentWorkflowImageReference[],
+): VideoAgentWorkflowImageReference[] {
+  const aliases = new Set(Array.from(text.matchAll(/@image\d+\b/gi), (match) => match[0].slice(1).toLowerCase()))
+  return images.filter((image) => aliases.has(image.alias.toLowerCase()))
+}
+
+function blobToPromptAssistantUpload(blob: Blob, name: string): Promise<PromptAssistantMediaUpload> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = () => reject(reader.error || new Error(`Could not read ${name}.`))
+    reader.onload = () => {
+      const dataUrl = typeof reader.result === 'string' ? reader.result : ''
+      const commaIndex = dataUrl.indexOf(',')
+      if (commaIndex < 0) {
+        reject(new Error(`Could not encode ${name}.`))
+        return
+      }
+      resolve({
+        base64: dataUrl.slice(commaIndex + 1),
+        name,
+        type: blob.type || 'image/png',
+      })
+    }
+    reader.readAsDataURL(blob)
+  })
+}
+
+async function videoAgentWorkflowImageToUpload(
+  image: VideoAgentWorkflowImageReference,
+): Promise<PromptAssistantMediaUpload> {
+  const blob = image.assetId ? await getAssetBlob(image.assetId) : null
+  const resolvedBlob = blob || (image.sourceUrl ? await fetch(image.sourceUrl).then((response) => {
+    if (!response.ok) throw new Error(`Could not load @${image.alias}.`)
+    return response.blob()
+  }) : null)
+  if (!resolvedBlob || resolvedBlob.size === 0) throw new Error(`Could not load @${image.alias}.`)
+  return blobToPromptAssistantUpload(resolvedBlob, `${image.alias}-${image.name}`)
+}
+
+function normalizeAgentSectionLabel(value: string): string {
+  return value
+    .replace(/^\s*#{1,6}\s*/, '')
+    .replace(/\*\*/g, '')
+    .trim()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+}
+
+function agentPromptSectionPriority(line: string): number {
+  const normalized = normalizeAgentSectionLabel(line)
+  if (!normalized.includes('prompt')) return 0
+  if (/prompt\s+(goc|nguon|original|source)\b/.test(normalized)) return 10
+  if (
+    /final\s+(?:ai\s+|video\s+|generation\s+)*prompt\b/.test(normalized)
+    || /(?:ai\s+video|generation)\s+prompt\b/.test(normalized)
+    || /prompt\s+(?:swap|hoan\s+chinh|cuoi(?:\s+cung)?|final)\b/.test(normalized)
+  ) return 100
+  return /^prompt\b/.test(normalized) ? 40 : 0
+}
+
+function cleanAgentPromptCandidate(value: string): string {
+  let cleaned = value
+    .replace(/^\s*```[^\n]*\n?/, '')
+    .replace(/\n?```\s*$/, '')
+    .replace(/^\s*>\s?/gm, '')
+    .replace(/\*\*/g, '')
+    .replace(/__/g, '')
+    .replace(/`([^`]+)`/g, '$1')
+    .trim()
+  if (/^\*[^*][\s\S]*[^*]\*$/.test(cleaned)) cleaned = cleaned.slice(1, -1).trim()
+  return cleaned
+}
+
+function extractAgentPromptForNode(responseText: string): string {
+  const normalizedText = responseText.replace(/\r\n?/g, '\n').trim()
+  if (!normalizedText) return ''
+  const lines = normalizedText.split('\n')
+  let selectedIndex = -1
+  let selectedPriority = 0
+
+  lines.forEach((line, index) => {
+    const priority = agentPromptSectionPriority(line)
+    if (priority >= selectedPriority && priority > 0) {
+      selectedIndex = index
+      selectedPriority = priority
+    }
+  })
+
+  if (selectedIndex >= 0) {
+    const labelLine = lines[selectedIndex]
+    const colonIndex = labelLine.indexOf(':')
+    const inlinePrompt = colonIndex >= 0
+      ? labelLine.slice(colonIndex + 1).replace(/\*\*/g, '').trim()
+      : ''
+    let cursor = selectedIndex + 1
+    while (cursor < lines.length && !lines[cursor].trim()) cursor += 1
+
+    if (cursor < lines.length && /^\s*```/.test(lines[cursor])) {
+      const fenced: string[] = []
+      cursor += 1
+      while (cursor < lines.length && !/^\s*```/.test(lines[cursor])) {
+        fenced.push(lines[cursor])
+        cursor += 1
+      }
+      const candidate = cleanAgentPromptCandidate([inlinePrompt, ...fenced].filter(Boolean).join('\n'))
+      if (candidate) return candidate
+    }
+
+    if (cursor < lines.length && /^\s*>/.test(lines[cursor])) {
+      const quoted: string[] = []
+      while (cursor < lines.length && (/^\s*>/.test(lines[cursor]) || !lines[cursor].trim())) {
+        quoted.push(lines[cursor])
+        cursor += 1
+      }
+      const candidate = cleanAgentPromptCandidate([inlinePrompt, ...quoted].filter(Boolean).join('\n'))
+      if (candidate) return candidate
+    }
+
+    const section: string[] = inlinePrompt ? [inlinePrompt] : []
+    for (; cursor < lines.length; cursor += 1) {
+      const line = lines[cursor]
+      const normalizedLine = normalizeAgentSectionLabel(line)
+      if (/^\s*---+\s*$/.test(line)) break
+      if (section.length > 0 && agentPromptSectionPriority(line) > 0) break
+      if (/^(neu ban|if you want|variants?|alternatives?|cac bien the|bien the)\b/.test(normalizedLine)) break
+      if (section.length > 0 && /^\s*#{1,6}\s+/.test(line)) break
+      section.push(line)
+    }
+    const candidate = cleanAgentPromptCandidate(section.join('\n'))
+    if (candidate) return candidate
+  }
+
+  const fencedBlocks = Array.from(normalizedText.matchAll(/```[^\n]*\n([\s\S]*?)```/g), (match) => cleanAgentPromptCandidate(match[1]))
+    .filter(Boolean)
+    .sort((left, right) => right.length - left.length)
+  if (fencedBlocks[0]) return fencedBlocks[0]
+
+  const quotedBlocks = Array.from(normalizedText.matchAll(/(?:^|\n)((?:\s*>[^\n]*(?:\n|$))+)/g), (match) => cleanAgentPromptCandidate(match[1]))
+    .filter(Boolean)
+    .sort((left, right) => right.length - left.length)
+  if (quotedBlocks[0]) return quotedBlocks[0]
+
+  const paragraphs = normalizedText.split(/\n\s*\n/).map((paragraph) => paragraph.trim()).filter(Boolean)
+  const hasStructuredResponse = paragraphs.length > 1 || /^\s*(?:#{1,6}\s|\*\*|[-*]\s|\d+[.)]\s)/m.test(normalizedText)
+  return hasStructuredResponse ? '' : cleanAgentPromptCandidate(normalizedText)
+}
+
+function renderVideoAgentComposerText(value: string): React.ReactNode {
+  return value.split(/(@image\d+\b)/gi).map((part, index) => (
+    /^@image\d+$/i.test(part)
+      ? <span key={`${index}-${part}`} className="font-semibold text-[#B8A8FF]">{part}</span>
+      : <React.Fragment key={`${index}-${part}`}>{part}</React.Fragment>
+  ))
+}
+
+function renderVideoAgentMessageText(
+  value: string,
+  images: VideoAgentWorkflowImageReference[],
+): React.ReactNode {
+  const imagesByAlias = new Map(images.map((image) => [image.alias.toLowerCase(), image]))
+
+  return value.split(/(@image\d+\b)/gi).map((part, index) => {
+    if (!/^@image\d+$/i.test(part)) {
+      return <React.Fragment key={`${index}-${part}`}>{part}</React.Fragment>
+    }
+
+    const image = imagesByAlias.get(part.slice(1).toLowerCase())
+    return (
+      <span key={`${index}-${part}`} className="inline-flex items-center gap-1 whitespace-nowrap align-middle">
+        <span className="font-semibold text-[#B8A8FF]">{part}</span>
+        {image && (
+          <span
+            title={`${part} · ${image.name}`}
+            aria-label={`${part}: ${image.name}`}
+            className="relative inline-flex h-[18px] w-[18px] shrink-0 items-center justify-center overflow-hidden rounded-[5px] border border-[#9D86FF]/45 bg-[#7C5CFF]/12 text-[#B8A8FF] shadow-[0_0_0_1px_rgba(124,92,255,0.08)]"
+          >
+            <Image className="h-2.5 w-2.5" aria-hidden="true" />
+            {image.previewUrl && (
+              <img
+                src={image.previewUrl}
+                alt=""
+                className="absolute inset-0 h-full w-full object-cover"
+                onError={(event) => { event.currentTarget.style.display = 'none' }}
+              />
+            )}
+          </span>
+        )}
+      </span>
+    )
+  })
+}
+
+function isSkillCreatorAgentResponse(messages: VideoAgentMessage[], messageIndex: number): boolean {
+  const message = messages[messageIndex]
+  if (message?.role !== 'assistant') return false
+  if (message.sourceCommand === 'skill-creator') return true
+  const previousMessage = messages[messageIndex - 1]
+  return previousMessage?.role === 'user' && /^Skill Creator(?:\r?\n|$)/i.test(previousMessage.text)
+}
+
+type VideoAgentSlashCommandId = 'skill-creator' | 'skill-installer'
+
+type VideoAgentSlashCommand = {
+  id: VideoAgentSlashCommandId
+  label: string
+  description: string
+  instruction: string
+}
+
+const VIDEO_AGENT_SKILL_COMMANDS: VideoAgentSlashCommand[] = [
+  {
+    id: 'skill-creator',
+    label: 'Skill Creator',
+    description: 'Create or update a skill',
+    instruction: 'Help the user create or update a reusable AI Idea Agent skill. Produce a concise skill name and a complete reusable instruction that can be saved with the Save skill action. Do not claim the skill has already been saved.',
+  },
+  {
+    id: 'skill-installer',
+    label: 'Skill Installer',
+    description: 'Install curated skills from openai/skills or other repos',
+    instruction: 'Help the user convert a curated skill or repository-provided skill specification into a safe local reusable AI Idea Agent skill. Ask for the source text or repository details when missing. Never claim remote code was installed or executed; return a reviewable local skill instruction that the user can save.',
+  },
+]
+
+function buildVideoAgentWorkflowContext(workflow: Workflow): string {
+  const promptNodes = workflow.nodes
+    .filter((node) => node.type === 'prompt')
+    .map((node, index) => {
+      const prompt = readNodePromptText(node).trim().slice(0, 700)
+      return prompt ? `Prompt ${index + 1}: ${prompt}` : ''
+    })
+    .filter(Boolean)
+    .slice(0, 6)
+  const generateNodes = workflow.nodes
+    .filter((node) => node.type === 'generate')
+    .map((node, index) => {
+      const data = node.data as Record<string, unknown>
+      return `Generate ${index + 1}: ${String(data.provider || 'google-flow')}, ${String(data.mediaType || 'image')}, ${String(data.aspectRatio || '16:9')}, ${String(data.model || 'default model')}`
+    })
+    .slice(0, 6)
+  const lines = [...promptNodes, ...generateNodes]
+  return lines.length > 0 ? lines.join('\n') : 'The canvas is currently empty.'
+}
+
+function videoAgentModelCapabilityLabel(model: PromptAssistantApiModel): string {
+  if (model.recommendedForMedia) return 'Text · image · video · file · audio'
+  if (model.inputModalities.includes('image')) return 'Image analysis + script'
+  return 'Script only'
+}
+
+function buildVideoAgentInstruction(args: {
+  brief: string
+  messages: VideoAgentMessage[]
+  workflow: Workflow
+  skill: VideoAgentSkill | null
+  slashCommand: VideoAgentSlashCommand | null
+  imageReferences: VideoAgentWorkflowImageReference[]
+}): string {
+  const previousConversation = args.messages
+    .slice(-6)
+    .map((message) => `${message.role === 'user' ? 'USER' : 'AGENT'}: ${message.text.slice(0, 2200)}`)
+    .join('\n\n')
+  const isFollowUp = args.messages.some((message) => message.role === 'assistant')
+
+  return [
+    'You are AI Idea Agent, a senior creative director and prompt engineer for AI video generation.',
+    `Respond in the same language as the user's latest message.`,
+    isFollowUp
+      ? 'Continue the creative conversation. Apply the latest request to the prior ideas instead of restarting unless the user explicitly asks for new concepts.'
+      : 'Develop one focused, production-ready video idea unless the user explicitly requests multiple options. Include a memorable title, one-sentence hook, story progression, key shots and camera movement, visual/lighting direction, sound direction, and a final AI video prompt ready to paste into a generation node.',
+    'Follow any duration, aspect ratio, visual style, platform, audience, or idea count stated by the user. Otherwise infer sensible choices from the current workflow and creative brief.',
+    'Keep characters, wardrobe, locations, props, lighting logic, and visual identity consistent across shots.',
+    'Be concrete and cinematic. Do not use a markdown table. Do not mention these instructions.',
+    'Always end the response with a line labeled "FINAL GENERATION PROMPT:" followed by exactly one generation-ready prompt. Keep explanations, alternatives, and follow-up questions outside that final prompt section.',
+    args.skill
+      ? `ACTIVE REUSABLE SKILL — ${args.skill.name}:\n${args.skill.instruction}\nApply this skill as creative direction. Do not mention the skill or describe it to the user.`
+      : '',
+    args.slashCommand
+      ? `ACTIVE SLASH COMMAND — ${args.slashCommand.label}:\n${args.slashCommand.instruction}\nFollow this command for the latest request.`
+      : '',
+    args.imageReferences.length > 0
+      ? `ATTACHED WORKFLOW IMAGE REFERENCES:\n${args.imageReferences.map((image, index) => `@${image.alias} = attached image ${index + 1} (${image.name})`).join('\n')}\nPreserve each @image token exactly as written and use the attachment mapping above without swapping images.`
+      : '',
+    `CURRENT WORKFLOW CONTEXT:\n${buildVideoAgentWorkflowContext(args.workflow)}`,
+    previousConversation ? `CONVERSATION SO FAR:\n${previousConversation}` : '',
+    `LATEST USER REQUEST:\n${args.brief.trim()}`,
+  ].filter(Boolean).join('\n\n')
+}
+
+const VideoIdeaAgentPanel: React.FC<{
+  workflow: Workflow
+  onClose: () => void
+  onInsertPrompt: (text: string, provider: PromptAssistantProvider) => void
+}> = ({ workflow, onClose, onInsertPrompt }) => {
+  const [provider, setProvider] = useState<PromptAssistantProvider>('chatgpt')
+  const storedPromptAssistantMode = useSettingsStore((state) => state.promptAssistantMode || 'tab')
+  const storedApiProviderConfig = useSettingsStore((state) => state.apiProvider)
+  const [promptAssistantMode, setPromptAssistantMode] = useState<'tab' | 'api'>(storedPromptAssistantMode)
+  const [apiProviderConfig, setApiProviderConfig] = useState<PromptAssistantApiConfig>(storedApiProviderConfig)
+  const [apiModels, setApiModels] = useState<PromptAssistantApiModel[]>([])
+  const [apiModelsLoading, setApiModelsLoading] = useState(false)
+  const [apiModelsError, setApiModelsError] = useState('')
+  const apiProviderReady = Boolean(
+    apiProviderConfig?.endpoint?.trim()
+    && apiProviderConfig.model?.trim()
+  )
+  const activeProvider: PromptAssistantProvider = promptAssistantMode === 'api'
+    ? 'api'
+    : provider === 'api' ? 'chatgpt' : provider
+  const [input, setInput] = useState('')
+  const [inputScrollTop, setInputScrollTop] = useState(0)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  const slashCommandMenuRef = useRef<HTMLDivElement>(null)
+  const workflowImageCandidates = useMemo(() => collectVideoAgentWorkflowImages(workflow), [workflow.nodes])
+  const [workflowImageReferences, setWorkflowImageReferences] = useState<VideoAgentWorkflowImageReference[]>(workflowImageCandidates)
+  const [imageMention, setImageMention] = useState<{ start: number; query: string } | null>(null)
+  const [imageMentionIndex, setImageMentionIndex] = useState(0)
+  const [activeSlashCommand, setActiveSlashCommand] = useState<VideoAgentSlashCommand | null>(null)
+  const [slashCommandHighlight, setSlashCommandHighlight] = useState(0)
+  const [slashMenuDismissed, setSlashMenuDismissed] = useState(false)
+  const [messages, setMessages] = useState<VideoAgentMessage[]>([])
+  const [conversationHistory, setConversationHistory] = useState<VideoAgentConversation[]>([])
+  const conversationHistoryRef = useRef<VideoAgentConversation[]>([])
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null)
+  const [conversationHistoryReady, setConversationHistoryReady] = useState(false)
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [isRunning, setIsRunning] = useState(false)
+  const [error, setError] = useState('')
+  const [insertedMessageId, setInsertedMessageId] = useState<string | null>(null)
+  const messageEndRef = useRef<HTMLDivElement>(null)
+  const historyMenuRef = useRef<HTMLDivElement>(null)
+  const skillMenuRef = useRef<HTMLDivElement>(null)
+  const [skillLibrary, setSkillLibrary] = useState<VideoAgentSkillLibrary>(EMPTY_VIDEO_AGENT_SKILL_LIBRARY)
+  const [skillsReady, setSkillsReady] = useState(false)
+  const [skillMenuOpen, setSkillMenuOpen] = useState(false)
+  const [skillEditorOpen, setSkillEditorOpen] = useState(false)
+  const [editingSkillId, setEditingSkillId] = useState<string | null>(null)
+  const [skillDraftName, setSkillDraftName] = useState('')
+  const [skillDraftInstruction, setSkillDraftInstruction] = useState('')
+  const selectedSkill = skillLibrary.skills.find((skill) => skill.id === skillLibrary.selectedSkillId) || null
+  const slashCommandMatch = input.trim().match(/^\/([^\s]*)$/)
+  const slashCommandQuery = slashCommandMatch ? slashCommandMatch[1].toLowerCase() : null
+  const filteredSkillCommands = useMemo(() => {
+    if (slashCommandQuery === null) return []
+    return VIDEO_AGENT_SKILL_COMMANDS.filter((command) => {
+      if (!slashCommandQuery) return true
+      const searchable = `${command.id} ${command.label} ${command.description}`.toLowerCase()
+      return searchable.includes(slashCommandQuery)
+    })
+  }, [slashCommandQuery])
+  const showSkillSlashMenu = !activeSlashCommand && !slashMenuDismissed && filteredSkillCommands.length > 0
+  const filteredImageMentionOptions = useMemo(() => {
+    if (!imageMention) return []
+    const query = imageMention.query.toLowerCase()
+    return workflowImageReferences.filter((image) => (
+      image.alias.toLowerCase().includes(query) || image.name.toLowerCase().includes(query)
+    ))
+  }, [imageMention, workflowImageReferences])
+  const showImageMentionMenu = imageMention !== null && filteredImageMentionOptions.length > 0
+  const hasValidInputImageMention = useMemo(() => {
+    if (!input) return false
+    const availableAliases = new Set(workflowImageReferences.map((image) => image.alias.toLowerCase()))
+    return Array.from(input.matchAll(/@image\d+\b/gi))
+      .some((match) => availableAliases.has(match[0].slice(1).toLowerCase()))
+  }, [input, workflowImageReferences])
+  const visibleApiModels = useMemo(() => {
+    const configuredId = apiProviderConfig.model?.trim()
+    if (!configuredId || apiModels.some((model) => model.id === configuredId)) return apiModels
+    return [{
+      id: configuredId,
+      name: configuredId,
+      owner: 'configured',
+      plan: 'Configured Model',
+      isFree: false,
+      inputModalities: ['text'],
+      recommendedForMedia: false,
+    }, ...apiModels]
+  }, [apiModels, apiProviderConfig.model])
+  const apiModelGroups = useMemo(() => {
+    const groups = new Map<string, PromptAssistantApiModel[]>()
+    for (const model of visibleApiModels) {
+      const group = groups.get(model.plan) || []
+      group.push(model)
+      groups.set(model.plan, group)
+    }
+    return Array.from(groups.entries())
+  }, [visibleApiModels])
+
+  const persistApiModelSelection = useCallback((modelId: string) => {
+    const normalizedModelId = modelId.trim()
+    if (!normalizedModelId) return
+    setApiProviderConfig((current) => ({ ...current, apiKey: '', model: normalizedModelId }))
+    const settingsState = useSettingsStore.getState()
+    settingsState.updateSettings({
+      apiProvider: {
+        ...settingsState.apiProvider,
+        apiKey: '',
+        model: normalizedModelId,
+      },
+    })
+  }, [])
+
+  const refreshApiModels = useCallback(async (): Promise<PromptAssistantApiModel[]> => {
+    if (!apiProviderConfig.endpoint?.trim()) {
+      setApiModels([])
+      setApiModelsError('Configure the 9Router endpoint in Settings first.')
+      return []
+    }
+    setApiModelsLoading(true)
+    setApiModelsError('')
+    try {
+      const models = await loadPromptAssistantApiModels(apiProviderConfig.endpoint)
+      setApiModels(models)
+      if (models.length === 0) setApiModelsError('9Router returned no available models.')
+      return models
+    } catch (modelError) {
+      const message = modelError instanceof Error ? modelError.message : 'Could not load models from 9Router.'
+      setApiModelsError(message)
+      return []
+    } finally {
+      setApiModelsLoading(false)
+    }
+  }, [apiProviderConfig.endpoint])
+
+  useEffect(() => {
+    setPromptAssistantMode(storedPromptAssistantMode)
+    setApiProviderConfig(storedApiProviderConfig)
+  }, [storedApiProviderConfig, storedPromptAssistantMode])
+
+  useEffect(() => {
+    if (promptAssistantMode !== 'api') return
+    void refreshApiModels()
+  }, [promptAssistantMode, refreshApiModels])
+
+  useEffect(() => {
+    if (promptAssistantMode !== 'api' || !hasValidInputImageMention || apiModels.length === 0 || isRunning) return
+    const bestModelId = selectPromptAssistantApiModel(apiModels, apiProviderConfig.model || '', true)
+    if (bestModelId && bestModelId !== apiProviderConfig.model?.trim()) {
+      persistApiModelSelection(bestModelId)
+    }
+  }, [
+    apiModels,
+    apiProviderConfig.model,
+    hasValidInputImageMention,
+    isRunning,
+    persistApiModelSelection,
+    promptAssistantMode,
+  ])
+
+  useEffect(() => {
+    let active = true
+    setWorkflowImageReferences(workflowImageCandidates)
+    void Promise.all(workflowImageCandidates.map(async (image) => {
+      if (!image.assetId) return image
+      const objectUrl = await getAssetObjectUrl(image.assetId)
+      return objectUrl
+        ? { ...image, sourceUrl: objectUrl, previewUrl: objectUrl }
+        : image
+    })).then((images) => {
+      if (active) setWorkflowImageReferences(images)
+    })
+    return () => { active = false }
+  }, [workflowImageCandidates])
+
+  useEffect(() => {
+    const applyStoredSettings = (raw: unknown) => {
+      try {
+        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
+        const state = (parsed as { state?: { promptAssistantMode?: unknown; apiProvider?: unknown } } | null)?.state
+        if (state?.promptAssistantMode === 'tab' || state?.promptAssistantMode === 'api') {
+          setPromptAssistantMode(state.promptAssistantMode)
+        }
+        if (state?.apiProvider && typeof state.apiProvider === 'object') {
+          setApiProviderConfig((current) => ({
+            ...current,
+            ...(state.apiProvider as Partial<PromptAssistantApiConfig>),
+          }))
+        }
+      } catch {
+        // Keep the already-hydrated settings when an external value is malformed.
+      }
+    }
+    void chrome.storage.local.get('ai-flow-settings').then((stored) => {
+      applyStoredSettings(stored['ai-flow-settings'])
+    }).catch(() => {})
+    const handleStorageChange = (changes: Record<string, chrome.storage.StorageChange>, areaName: string) => {
+      if (areaName !== 'local' || !changes['ai-flow-settings']) return
+      applyStoredSettings(changes['ai-flow-settings'].newValue)
+    }
+    chrome.storage.onChanged.addListener(handleStorageChange)
+    return () => chrome.storage.onChanged.removeListener(handleStorageChange)
+  }, [])
+
+  useEffect(() => {
+    messageEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+  }, [messages, isRunning])
+
+  useEffect(() => {
+    conversationHistoryRef.current = conversationHistory
+  }, [conversationHistory])
+
+  useEffect(() => {
+    let active = true
+    setConversationHistoryReady(false)
+    setHistoryOpen(false)
+    void loadVideoAgentConversationState(workflow.id)
+      .then(async (state) => {
+        if (!active) return
+        let conversations = state.conversations
+        let activeId = state.activeConversationId
+        if (!activeId) {
+          const conversation = createVideoAgentConversation(workflow.id)
+          await saveVideoAgentConversation(conversation)
+          if (!active) return
+          conversations = [conversation]
+          activeId = conversation.id
+        }
+        const activeConversation = conversations.find((conversation) => conversation.id === activeId) || conversations[0]
+        conversationHistoryRef.current = conversations
+        setConversationHistory(conversations)
+        setActiveConversationId(activeConversation?.id || null)
+        setMessages(activeConversation?.messages || [])
+        setConversationHistoryReady(true)
+      })
+      .catch(() => {
+        if (!active) return
+        setConversationHistoryReady(true)
+        setError('Could not load AI Idea Agent conversation history from IndexedDB.')
+      })
+    return () => { active = false }
+  }, [workflow.id])
+
+  useEffect(() => {
+    if (!conversationHistoryReady || !activeConversationId) return
+    const existing = conversationHistoryRef.current.find((conversation) => conversation.id === activeConversationId)
+    if (!existing) return
+    const now = Date.now()
+    const firstUserMessage = messages.find((message) => message.role === 'user')?.text
+      .replace(/\s+/g, ' ')
+      .trim()
+    const updatedConversation: VideoAgentConversation = {
+      ...existing,
+      title: firstUserMessage ? firstUserMessage.slice(0, 90) : existing.title,
+      messages,
+      updatedAt: now,
+    }
+    const nextHistory = [
+      updatedConversation,
+      ...conversationHistoryRef.current.filter((conversation) => conversation.id !== activeConversationId),
+    ].sort((left, right) => right.updatedAt - left.updatedAt)
+    conversationHistoryRef.current = nextHistory
+    setConversationHistory(nextHistory)
+    void saveVideoAgentConversation(updatedConversation).catch(() => {
+      setError('Could not save the current AI Idea Agent conversation to IndexedDB.')
+    })
+  }, [activeConversationId, conversationHistoryReady, messages])
+
+  useEffect(() => {
+    if (!historyOpen) return
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (!historyMenuRef.current?.contains(event.target as Node)) setHistoryOpen(false)
+    }
+    document.addEventListener('pointerdown', closeOnOutsidePointer)
+    return () => document.removeEventListener('pointerdown', closeOnOutsidePointer)
+  }, [historyOpen])
+
+  useEffect(() => {
+    let active = true
+    void loadVideoAgentSkillLibrary()
+      .then((library) => {
+        if (!active) return
+        setSkillLibrary(library)
+        setSkillsReady(true)
+      })
+      .catch(() => {
+        if (!active) return
+        setSkillsReady(true)
+        setError('Could not load saved AI Idea Agent skills.')
+      })
+    return () => { active = false }
+  }, [])
+
+  useEffect(() => {
+    if (!skillMenuOpen) return
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (!skillMenuRef.current?.contains(event.target as Node)) setSkillMenuOpen(false)
+    }
+    document.addEventListener('pointerdown', closeOnOutsidePointer)
+    return () => document.removeEventListener('pointerdown', closeOnOutsidePointer)
+  }, [skillMenuOpen])
+
+  useEffect(() => {
+    if (!showSkillSlashMenu) return
+    setSlashCommandHighlight(0)
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (!slashCommandMenuRef.current?.contains(event.target as Node)) setSlashMenuDismissed(true)
+    }
+    document.addEventListener('pointerdown', closeOnOutsidePointer)
+    return () => document.removeEventListener('pointerdown', closeOnOutsidePointer)
+  }, [showSkillSlashMenu, slashCommandQuery])
+
+  useEffect(() => {
+    if (!showImageMentionMenu) return
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (!slashCommandMenuRef.current?.contains(event.target as Node)) setImageMention(null)
+    }
+    document.addEventListener('pointerdown', closeOnOutsidePointer)
+    return () => document.removeEventListener('pointerdown', closeOnOutsidePointer)
+  }, [showImageMentionMenu])
+
+  useEffect(() => {
+    if (workflowImageReferences.length > 0) return
+    setImageMention(null)
+    setImageMentionIndex(0)
+  }, [workflowImageReferences.length])
+
+  const updateVideoAgentImageMention = (value: string, cursor: number) => {
+    if (workflowImageReferences.length === 0) {
+      setImageMention(null)
+      return
+    }
+    const beforeCursor = value.slice(0, cursor)
+    const match = beforeCursor.match(/@([a-zA-Z0-9]*)$/)
+    if (!match) {
+      setImageMention(null)
+      return
+    }
+    const start = beforeCursor.length - match[0].length
+    const preceding = start > 0 ? beforeCursor[start - 1] : ''
+    if (preceding && !/[\s([,{]/.test(preceding)) {
+      setImageMention(null)
+      return
+    }
+    setImageMention({ start, query: match[1] || '' })
+    setImageMentionIndex(0)
+  }
+
+  const insertVideoAgentImageMention = (alias: string) => {
+    const textarea = inputRef.current
+    const currentCursor = textarea?.selectionStart ?? input.length
+    const replaceStart = imageMention?.start ?? currentCursor
+    const before = input.slice(0, replaceStart)
+    const after = input.slice(currentCursor)
+    const needsLeadingSpace = before.length > 0 && !/\s$/.test(before)
+    const needsTrailingSpace = after.length === 0 || !/^\s/.test(after)
+    const inserted = `${needsLeadingSpace ? ' ' : ''}@${alias}${needsTrailingSpace ? ' ' : ''}`
+    const nextInput = before + inserted + after
+    const nextCursor = before.length + inserted.length
+
+    setInput(nextInput)
+    setImageMention(null)
+    setImageMentionIndex(0)
+    window.requestAnimationFrame(() => {
+      const inputElement = inputRef.current
+      if (!inputElement) return
+      inputElement.focus()
+      inputElement.setSelectionRange(nextCursor, nextCursor)
+    })
+  }
+
+  const selectSlashCommand = (command: VideoAgentSlashCommand) => {
+    setActiveSlashCommand(command)
+    setInput((current) => current.replace(/^\s*\/[^\s]*\s*$/i, ''))
+    setSlashMenuDismissed(true)
+    window.requestAnimationFrame(() => inputRef.current?.focus())
+  }
+
+  const persistConversationSnapshot = async (conversationId: string, nextMessages: VideoAgentMessage[]) => {
+    const existing = conversationHistoryRef.current.find((conversation) => conversation.id === conversationId)
+    if (!existing) throw new Error('The active AI Idea Agent conversation is unavailable.')
+    const firstUserMessage = nextMessages.find((message) => message.role === 'user')?.text
+      .replace(/\s+/g, ' ')
+      .trim()
+    const updatedConversation: VideoAgentConversation = {
+      ...existing,
+      title: firstUserMessage ? firstUserMessage.slice(0, 90) : existing.title,
+      messages: nextMessages,
+      updatedAt: Date.now(),
+    }
+    const nextHistory = [
+      updatedConversation,
+      ...conversationHistoryRef.current.filter((conversation) => conversation.id !== conversationId),
+    ].sort((left, right) => right.updatedAt - left.updatedAt)
+    conversationHistoryRef.current = nextHistory
+    setConversationHistory(nextHistory)
+    await saveVideoAgentConversation(updatedConversation)
+  }
+
+  const submit = async (seed?: string) => {
+    const brief = (seed ?? input).trim()
+    if (!brief || isRunning) return
+    if (!conversationHistoryReady || !activeConversationId) {
+      setError('AI Idea Agent conversation history is still loading. Try again in a moment.')
+      return
+    }
+    if (activeProvider === 'api' && !apiProviderReady) {
+      setError('Configure the API endpoint and model in Settings before using API mode.')
+      return
+    }
+    const availableAliases = new Set(workflowImageReferences.map((image) => image.alias.toLowerCase()))
+    const unavailableReference = Array.from(brief.matchAll(/@image\d+\b/gi), (match) => match[0])
+      .find((token) => !availableAliases.has(token.slice(1).toLowerCase()))
+    if (unavailableReference) {
+      setError(`${unavailableReference} is not available in the current workflow.`)
+      return
+    }
+    const referenceContext = [
+      ...messages.filter((message) => message.role === 'user').map((message) => message.text),
+      brief,
+    ].join('\n')
+    const imageReferences = mentionedVideoAgentWorkflowImages(referenceContext, workflowImageReferences)
+    if (imageReferences.length > 5) {
+      setError('AI Idea Agent supports up to 5 referenced workflow images per request.')
+      return
+    }
+    const slashCommand = activeSlashCommand
+    const userMessageCreatedAt = Date.now()
+    const userMessage: VideoAgentMessage = {
+      id: `video-agent-user-${userMessageCreatedAt}`,
+      role: 'user',
+      text: slashCommand ? `${slashCommand.label}\n${brief}` : brief,
+      createdAt: userMessageCreatedAt,
+    }
+    const conversation = [...messages, userMessage]
+    setMessages(conversation)
+    setInput('')
+    setInputScrollTop(0)
+    setImageMention(null)
+    setImageMentionIndex(0)
+    setActiveSlashCommand(null)
+    setSlashMenuDismissed(false)
+    setError('')
+    setIsRunning(true)
+    try {
+      await persistConversationSnapshot(activeConversationId, conversation)
+      const mediaUploads = await Promise.all(imageReferences.map(videoAgentWorkflowImageToUpload))
+      let requestModel = apiProviderConfig.model?.trim() || ''
+      if (activeProvider === 'api' && mediaUploads.length > 0) {
+        const availableModels = apiModels.length > 0 ? apiModels : await refreshApiModels()
+        requestModel = selectPromptAssistantApiModel(availableModels, requestModel, true)
+        if (requestModel && requestModel !== apiProviderConfig.model?.trim()) {
+          persistApiModelSelection(requestModel)
+        }
+      }
+      const instruction = buildVideoAgentInstruction({
+        brief,
+        messages,
+        workflow,
+        skill: selectedSkill,
+        slashCommand,
+        imageReferences,
+      })
+      const text = await runPromptAssistant(activeProvider, instruction, 120000, mediaUploads, {
+        focus: false,
+        apiModel: activeProvider === 'api' ? requestModel : undefined,
+      })
+      const assistantMessageCreatedAt = Date.now()
+      const assistantMessage: VideoAgentMessage = {
+        id: `video-agent-assistant-${assistantMessageCreatedAt}`,
+        role: 'assistant',
+        text,
+        provider: activeProvider,
+        sourceCommand: slashCommand?.id,
+        createdAt: assistantMessageCreatedAt,
+      }
+      const completedConversation = [...conversation, assistantMessage]
+      await persistConversationSnapshot(activeConversationId, completedConversation)
+      setMessages(completedConversation)
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : 'AI Idea Agent could not complete this request.')
+    } finally {
+      setIsRunning(false)
+    }
+  }
+
+  const copyMessage = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setError('')
+    } catch {
+      setError('Could not copy this idea to the clipboard.')
+    }
+  }
+
+  const persistSkillLibrary = async (nextLibrary: VideoAgentSkillLibrary) => {
+    setSkillLibrary(nextLibrary)
+    try {
+      const savedLibrary = await saveVideoAgentSkillLibrary(nextLibrary)
+      setSkillLibrary(savedLibrary)
+      setError('')
+    } catch {
+      setError('Could not save AI Idea Agent skills to extension storage.')
+    }
+  }
+
+  const openSkillEditor = (skill?: VideoAgentSkill, sourceText = '') => {
+    const suggestedName = sourceText
+      .split(/\r?\n/)
+      .map((line) => line.replace(/^\s*[-#*\d.]+\s*/, '').trim())
+      .find(Boolean)
+      ?.slice(0, 64) || ''
+    setEditingSkillId(skill?.id || null)
+    setSkillDraftName(skill?.name || suggestedName)
+    setSkillDraftInstruction(skill?.instruction || sourceText.slice(0, 12000))
+    setSkillMenuOpen(false)
+    setSkillEditorOpen(true)
+  }
+
+  const saveSkillDraft = async () => {
+    const name = skillDraftName.trim()
+    const instruction = skillDraftInstruction.trim()
+    if (!name || !instruction) return
+    const now = Date.now()
+    const existing = editingSkillId
+      ? skillLibrary.skills.find((skill) => skill.id === editingSkillId)
+      : undefined
+    const savedSkill: VideoAgentSkill = {
+      id: existing?.id || `video-agent-skill-${now}-${Math.random().toString(36).slice(2, 8)}`,
+      name,
+      instruction,
+      createdAt: existing?.createdAt || now,
+      updatedAt: now,
+    }
+    const nextSkills = existing
+      ? skillLibrary.skills.map((skill) => skill.id === existing.id ? savedSkill : skill)
+      : [savedSkill, ...skillLibrary.skills]
+    await persistSkillLibrary({ skills: nextSkills, selectedSkillId: savedSkill.id })
+    setSkillEditorOpen(false)
+    setEditingSkillId(null)
+  }
+
+  const selectSkill = (skillId: string | null) => {
+    setSkillMenuOpen(false)
+    void persistSkillLibrary({ ...skillLibrary, selectedSkillId: skillId })
+  }
+
+  const deleteSkill = (skillId: string) => {
+    const nextSkills = skillLibrary.skills.filter((skill) => skill.id !== skillId)
+    const selectedSkillId = skillLibrary.selectedSkillId === skillId ? null : skillLibrary.selectedSkillId
+    void persistSkillLibrary({ skills: nextSkills, selectedSkillId })
+  }
+
+  const startNewConversation = async () => {
+    if (isRunning || !conversationHistoryReady) return
+    const conversation = createVideoAgentConversation(workflow.id)
+    try {
+      await saveVideoAgentConversation(conversation)
+      const nextHistory = [conversation, ...conversationHistoryRef.current]
+      conversationHistoryRef.current = nextHistory
+      setConversationHistory(nextHistory)
+      setActiveConversationId(conversation.id)
+      setMessages(conversation.messages)
+      setInput('')
+      setInputScrollTop(0)
+      setActiveSlashCommand(null)
+      setSlashMenuDismissed(false)
+      setError('')
+      setInsertedMessageId(null)
+      setHistoryOpen(false)
+    } catch {
+      setError('Could not create a new AI Idea Agent conversation in IndexedDB.')
+    }
+  }
+
+  const openSavedConversation = async (conversation: VideoAgentConversation) => {
+    if (isRunning || conversation.id === activeConversationId) {
+      setHistoryOpen(false)
+      return
+    }
+    try {
+      await setActiveVideoAgentConversation(workflow.id, conversation.id)
+      setActiveConversationId(conversation.id)
+      setMessages(conversation.messages)
+      setInput('')
+      setInputScrollTop(0)
+      setActiveSlashCommand(null)
+      setSlashMenuDismissed(false)
+      setError('')
+      setInsertedMessageId(null)
+      setHistoryOpen(false)
+    } catch {
+      setError('Could not open the selected AI Idea Agent conversation.')
+    }
+  }
+
+  const suggestionPrompts = [
+    'Create a cinematic product launch concept',
+    'Turn my current workflow into a 60-second story',
+    'Plan a viral vertical short with a strong hook',
+  ]
+
+  return (
+    <aside className="relative z-[90] flex h-full w-[420px] min-w-[360px] max-w-[46vw] shrink-0 flex-col border-l border-white/[0.08] bg-[#151515] shadow-[-18px_0_48px_rgba(0,0,0,0.28)]">
+      <header className="flex h-14 shrink-0 items-center justify-between border-b border-white/[0.07] px-4">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-[#7C5CFF]/25 bg-[#7C5CFF]/12 text-[#B8A8FF]">
+            <Bot className="h-4 w-4" />
+          </span>
+          <div className="min-w-0">
+            <h2 className="truncate text-[12px] font-semibold text-white/88">AI Idea Agent</h2>
+            <p className="truncate text-[9px] text-white/30">Develop concepts, storyboards and generation prompts</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-1">
+          <div ref={historyMenuRef} className="relative">
+            <button
+              type="button"
+              title="Conversation history"
+              aria-label="Open AI Idea Agent conversation history"
+              disabled={!conversationHistoryReady}
+              onClick={() => setHistoryOpen((current) => !current)}
+              className={cn(
+                'relative flex h-8 w-8 items-center justify-center rounded-lg text-white/35 hover:bg-white/[0.06] hover:text-white/75 disabled:opacity-30',
+                historyOpen && 'bg-[#7C5CFF]/12 text-[#C8BCFF]'
+              )}
+            >
+              <MessagesSquare className="h-4 w-4" />
+              {conversationHistory.length > 1 && <span className="absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full bg-[#8E73FF]" />}
+            </button>
+
+            {historyOpen && (
+              <div className="absolute right-0 top-10 z-[200] w-[340px] overflow-hidden rounded-2xl border border-white/[0.1] bg-[#1A1A1A] shadow-[0_24px_72px_rgba(0,0,0,0.76)]">
+                <div className="flex items-center justify-between border-b border-white/[0.07] px-3.5 py-3">
+                  <div>
+                    <p className="text-[10px] font-semibold text-white/78">Conversation history</p>
+                    <p className="mt-0.5 text-[8px] text-white/28">Saved permanently in IndexedDB</p>
+                  </div>
+                  <span className="rounded-full bg-white/[0.05] px-2 py-1 text-[8px] font-medium text-white/35">{conversationHistory.length}</span>
+                </div>
+                <div className="max-h-[360px] overflow-y-auto p-1.5">
+                  {conversationHistory.map((conversation) => {
+                    const active = conversation.id === activeConversationId
+                    const preview = conversation.messages[conversation.messages.length - 1]?.text || 'Empty conversation'
+                    return (
+                      <button
+                        key={conversation.id}
+                        type="button"
+                        disabled={isRunning}
+                        onClick={() => void openSavedConversation(conversation)}
+                        className={cn(
+                          'flex w-full items-start gap-2.5 rounded-xl px-2.5 py-2.5 text-left transition-colors hover:bg-white/[0.05] disabled:cursor-not-allowed disabled:opacity-45',
+                          active && 'bg-[#7C5CFF]/10'
+                        )}
+                      >
+                        <span className={cn('mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border', active ? 'border-[#7C5CFF]/24 bg-[#7C5CFF]/12 text-[#B8A8FF]' : 'border-white/[0.07] bg-white/[0.025] text-white/28')}>
+                          <Film className="h-3.5 w-3.5" />
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className={cn('block truncate text-[10px] font-medium', active ? 'text-[#D1C8FF]' : 'text-white/62')}>{conversation.title}</span>
+                          <span className="mt-0.5 block truncate text-[8px] text-white/25">{preview}</span>
+                          <span className="mt-1 block text-[7px] text-white/18">{formatDate(conversation.updatedAt)} · {conversation.messages.length} messages</span>
+                        </span>
+                        {active && <Check className="mt-1 h-3.5 w-3.5 shrink-0 text-[#A895FF]" />}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            title="Start a new conversation without deleting history"
+            disabled={!conversationHistoryReady || isRunning}
+            onClick={() => void startNewConversation()}
+            className="h-8 shrink-0 whitespace-nowrap rounded-lg px-2.5 text-[10px] font-medium text-white/38 hover:bg-white/[0.06] hover:text-white/72 disabled:cursor-not-allowed disabled:opacity-30"
+          >
+            New chat
+          </button>
+          <button type="button" title="Close Agent" onClick={onClose} className="flex h-8 w-8 items-center justify-center rounded-lg text-white/35 hover:bg-white/[0.06] hover:text-white/75">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      </header>
+
+      <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4">
+        {messages.length === 0 && !isRunning && (
+          <div className="flex min-h-full flex-col items-center justify-center py-8 text-center">
+            <span className="flex h-12 w-12 items-center justify-center rounded-2xl border border-[#7C5CFF]/20 bg-[#7C5CFF]/10 text-[#B8A8FF] shadow-[0_12px_34px_rgba(124,92,255,0.12)]">
+              <Film className="h-5 w-5" />
+            </span>
+            <h3 className="mt-4 text-[13px] font-semibold text-white/82">Start with a rough idea</h3>
+            <p className="mt-1.5 max-w-[280px] text-[10px] leading-4 text-white/34">The Agent uses your canvas context to develop a coherent video concept and production-ready prompt.</p>
+            <div className="mt-5 flex w-full max-w-[320px] flex-col gap-2">
+              {suggestionPrompts.map((suggestion) => (
+                <button key={suggestion} type="button" disabled={!conversationHistoryReady || !activeConversationId} onClick={() => void submit(suggestion)} className="rounded-xl border border-white/[0.07] bg-white/[0.025] px-3 py-2.5 text-left text-[10px] leading-4 text-white/48 transition-colors hover:border-[#7C5CFF]/28 hover:bg-[#7C5CFF]/[0.07] hover:text-white/75 disabled:cursor-not-allowed disabled:opacity-35">
+                  {suggestion}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {messages.map((message, messageIndex) => (
+          <div key={message.id} className={cn('flex', message.role === 'user' ? 'justify-end' : 'justify-start')}>
+            <div className={cn('max-w-[94%] rounded-2xl px-3.5 py-3 text-[11px] leading-[1.65]', message.role === 'user' ? 'rounded-br-md bg-[#7C5CFF] text-white' : 'rounded-bl-md border border-white/[0.08] bg-[#1B1B1B] text-white/72')}>
+              <div className="whitespace-pre-wrap break-words">
+                {renderVideoAgentMessageText(message.text, workflowImageReferences)}
+              </div>
+              {message.role === 'assistant' && (
+                <div className="mt-3 flex items-center gap-1.5 border-t border-white/[0.07] pt-2.5">
+                   <button type="button" onClick={() => void copyMessage(message.text)} className="flex h-7 items-center gap-1.5 rounded-lg px-2 text-[9px] font-medium text-white/34 hover:bg-white/[0.06] hover:text-white/70">
+                     <Copy className="h-3 w-3" /> Copy
+                   </button>
+                   {isSkillCreatorAgentResponse(messages, messageIndex) && (
+                     <button type="button" onClick={() => openSkillEditor(undefined, message.text)} className="flex h-7 items-center gap-1.5 rounded-lg px-2 text-[9px] font-medium text-white/34 hover:bg-white/[0.06] hover:text-white/70">
+                       <BookOpen className="h-3 w-3" /> Save skill
+                     </button>
+                   )}
+                   <button
+                    type="button"
+                    onClick={() => {
+                      const promptText = extractAgentPromptForNode(message.text)
+                      if (!promptText) {
+                        setError('Could not identify a final generation prompt in this response. Ask the Agent to return a FINAL GENERATION PROMPT, then try again.')
+                        return
+                      }
+                      onInsertPrompt(promptText, message.provider || activeProvider)
+                      setError('')
+                      setInsertedMessageId(message.id)
+                      window.setTimeout(() => setInsertedMessageId((current) => current === message.id ? null : current), 1600)
+                    }}
+                    className="flex h-7 items-center gap-1.5 rounded-lg bg-[#7C5CFF]/14 px-2.5 text-[9px] font-semibold text-[#C8BCFF] hover:bg-[#7C5CFF]/22 hover:text-white"
+                  >
+                    <Plus className="h-3 w-3" /> {insertedMessageId === message.id ? 'Added to canvas' : 'Add Prompt Node'}
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+
+        {isRunning && (
+          <div className="flex justify-start">
+            <div className="flex items-center gap-2 rounded-2xl rounded-bl-md border border-white/[0.08] bg-[#1B1B1B] px-3.5 py-3 text-[10px] text-white/42">
+              <LoaderCircle className="h-3.5 w-3.5 animate-spin text-[#A895FF]" />
+              Developing video ideas with {promptAssistantProviderLabel(activeProvider)}…
+            </div>
+          </div>
+        )}
+        <div ref={messageEndRef} />
+      </div>
+
+      <div className="shrink-0 border-t border-white/[0.07] bg-[#131313] p-3.5">
+        {error && <div className="mb-2 rounded-lg border border-red-400/15 bg-red-500/[0.07] px-2.5 py-2 text-[9px] leading-4 text-red-200/75">{error}</div>}
+        <div ref={slashCommandMenuRef} className="relative rounded-2xl border border-white/[0.09] bg-[#0F0F0F] p-2.5 transition-colors focus-within:border-[#7C5CFF]/55 focus-within:ring-2 focus-within:ring-[#7C5CFF]/10">
+          {showImageMentionMenu && (
+            <div className="absolute bottom-[calc(100%+8px)] left-0 right-0 z-[205] max-h-[260px] overflow-y-auto rounded-xl border border-white/[0.1] bg-[#202020] p-1 shadow-[0_20px_58px_rgba(0,0,0,0.72)]">
+              <div className="flex items-center justify-between px-2.5 py-2">
+                <span className="text-[9px] font-semibold text-white/48">Workflow images</span>
+                <span className="text-[8px] text-white/22">{workflowImageReferences.length}</span>
+              </div>
+              {filteredImageMentionOptions.map((image, index) => (
+                <button
+                  key={image.id}
+                  type="button"
+                  onMouseEnter={() => setImageMentionIndex(index)}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => insertVideoAgentImageMention(image.alias)}
+                  className={cn(
+                    'flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left outline-none transition-colors',
+                    imageMentionIndex === index ? 'bg-[#7C5CFF]/15' : 'hover:bg-white/[0.06]'
+                  )}
+                >
+                  <span className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-white/[0.08] bg-[#111] text-white/24">
+                    {image.previewUrl
+                      ? <img src={image.previewUrl} alt="" className="h-full w-full object-cover" />
+                      : <Image className="h-4 w-4" />}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className={cn('block text-[10px] font-semibold', imageMentionIndex === index ? 'text-[#C8BCFF]' : 'text-white/68')}>@{image.alias}</span>
+                    <span className="mt-0.5 block truncate text-[8px] text-white/28">{image.name}</span>
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {showSkillSlashMenu && (
+            <div className="absolute bottom-[calc(100%+8px)] left-0 right-0 z-[205] overflow-hidden rounded-xl border border-white/[0.1] bg-[#242424] p-1 shadow-[0_20px_58px_rgba(0,0,0,0.72)]">
+              {filteredSkillCommands.map((command, index) => (
+                <button
+                  key={command.id}
+                  type="button"
+                  onMouseEnter={() => setSlashCommandHighlight(index)}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => selectSlashCommand(command)}
+                  className={cn(
+                    'flex h-10 w-full items-center gap-2.5 rounded-lg px-2.5 text-left outline-none transition-colors',
+                    slashCommandHighlight === index ? 'bg-white/[0.09]' : 'hover:bg-white/[0.06]'
+                  )}
+                >
+                  <Box className="h-3.5 w-3.5 shrink-0 text-white/55" />
+                  <span className="text-[10px] font-medium text-white/75">{command.label}</span>
+                  <span className="min-w-0 truncate text-[9px] text-white/32">{command.description}</span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {activeSlashCommand && (
+            <div className="mb-1.5 flex items-center px-1 pt-0.5">
+              <span className="inline-flex h-7 items-center gap-1.5 rounded-lg bg-[#79B8FF]/10 px-2 text-[10px] font-medium text-[#8FC4FF]">
+                <Box className="h-3.5 w-3.5" />
+                {activeSlashCommand.label}
+                <button
+                  type="button"
+                  aria-label={`Remove ${activeSlashCommand.label}`}
+                  onClick={() => {
+                    setActiveSlashCommand(null)
+                    window.requestAnimationFrame(() => inputRef.current?.focus())
+                  }}
+                  className="ml-0.5 flex h-4 w-4 items-center justify-center rounded text-[#8FC4FF]/45 hover:bg-white/[0.08] hover:text-[#B8D9FF]"
+                >
+                  <X className="h-2.5 w-2.5" />
+                </button>
+              </span>
+            </div>
+          )}
+
+          <div className="relative max-h-32 min-h-[64px] overflow-hidden">
+            {input && (
+              <div aria-hidden="true" className="pointer-events-none absolute inset-0 overflow-hidden px-1 text-[11px] leading-5 text-white/78">
+                <div
+                  className="whitespace-pre-wrap break-words"
+                  style={{ transform: `translateY(-${inputScrollTop}px)` }}
+                >
+                  {renderVideoAgentComposerText(input)}
+                  {input.endsWith('\n') ? ' ' : null}
+                </div>
+              </div>
+            )}
+            <textarea
+              ref={inputRef}
+              value={input}
+              disabled={isRunning || !conversationHistoryReady || !activeConversationId}
+              onChange={(event) => {
+                const value = event.target.value
+                setInput(value)
+                setSlashMenuDismissed(false)
+                updateVideoAgentImageMention(value, event.target.selectionStart ?? value.length)
+              }}
+              onScroll={(event) => setInputScrollTop(event.currentTarget.scrollTop)}
+              onKeyDown={(event) => {
+                if (showImageMentionMenu) {
+                  if (event.key === 'ArrowDown') {
+                    event.preventDefault()
+                    setImageMentionIndex((current) => (current + 1) % filteredImageMentionOptions.length)
+                    return
+                  }
+                  if (event.key === 'ArrowUp') {
+                    event.preventDefault()
+                    setImageMentionIndex((current) => (current - 1 + filteredImageMentionOptions.length) % filteredImageMentionOptions.length)
+                    return
+                  }
+                  if (event.key === 'Enter' || event.key === 'Tab') {
+                    event.preventDefault()
+                    const selected = filteredImageMentionOptions[Math.min(imageMentionIndex, filteredImageMentionOptions.length - 1)]
+                    if (selected) insertVideoAgentImageMention(selected.alias)
+                    return
+                  }
+                  if (event.key === 'Escape') {
+                    event.preventDefault()
+                    setImageMention(null)
+                    return
+                  }
+                }
+                if (showSkillSlashMenu) {
+                  if (event.key === 'ArrowDown') {
+                    event.preventDefault()
+                    setSlashCommandHighlight((current) => (current + 1) % filteredSkillCommands.length)
+                    return
+                  }
+                  if (event.key === 'ArrowUp') {
+                    event.preventDefault()
+                    setSlashCommandHighlight((current) => (current - 1 + filteredSkillCommands.length) % filteredSkillCommands.length)
+                    return
+                  }
+                  if (event.key === 'Enter' && !event.ctrlKey && !event.metaKey) {
+                    event.preventDefault()
+                    selectSlashCommand(filteredSkillCommands[Math.min(slashCommandHighlight, filteredSkillCommands.length - 1)])
+                    return
+                  }
+                  if (event.key === 'Escape') {
+                    event.preventDefault()
+                    setSlashMenuDismissed(true)
+                    return
+                  }
+                }
+                if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+                  event.preventDefault()
+                  void submit()
+                }
+              }}
+              rows={3}
+              placeholder={activeSlashCommand?.id === 'skill-creator'
+                ? 'Describe the skill you want to create or update…'
+                : activeSlashCommand?.id === 'skill-installer'
+                  ? 'Paste a skill specification or repository details…'
+                  : messages.length > 0
+                    ? 'Refine the idea, change a scene, or ask for another direction…'
+                    : 'Describe the video you want to create…'}
+              className="relative block max-h-32 min-h-[64px] w-full resize-none bg-transparent px-1 text-[11px] leading-5 text-transparent caret-[#E8E1FF] outline-none placeholder:text-white/22 selection:bg-[#7C5CFF]/35 disabled:opacity-45"
+            />
+          </div>
+          <div className="mt-1.5 flex items-center justify-between pl-1">
+            <div ref={skillMenuRef} className="relative min-w-0">
+              <button
+                type="button"
+                disabled={!skillsReady || isRunning}
+                onClick={() => setSkillMenuOpen((current) => !current)}
+                title={selectedSkill ? `Active skill: ${selectedSkill.name}` : 'Choose a reusable AI Idea Agent skill'}
+                className={cn(
+                  'flex h-8 max-w-[190px] items-center gap-1.5 rounded-lg px-2 text-[9px] font-medium outline-none transition-colors disabled:cursor-not-allowed disabled:opacity-35',
+                  selectedSkill
+                    ? 'bg-[#7C5CFF]/12 text-[#C8BCFF] hover:bg-[#7C5CFF]/18'
+                    : 'text-white/30 hover:bg-white/[0.05] hover:text-white/65'
+                )}
+              >
+                <BookOpen className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate">{selectedSkill?.name || 'Skill'}</span>
+                <ChevronDown className={cn('h-3 w-3 shrink-0 transition-transform', skillMenuOpen && 'rotate-180')} />
+              </button>
+
+              {skillMenuOpen && (
+                <div className="absolute bottom-10 left-0 z-[190] w-[330px] overflow-hidden rounded-2xl border border-white/[0.1] bg-[#1A1A1A] shadow-[0_22px_64px_rgba(0,0,0,0.72)]">
+                  <div className="flex items-center justify-between border-b border-white/[0.07] px-3.5 py-3">
+                    <div>
+                      <p className="text-[10px] font-semibold text-white/78">Agent skills</p>
+                      <p className="mt-0.5 text-[8px] text-white/28">Reusable creative instructions</p>
+                    </div>
+                    <button type="button" onClick={() => openSkillEditor()} className="flex h-7 items-center gap-1 rounded-lg bg-[#7C5CFF]/14 px-2 text-[9px] font-semibold text-[#C8BCFF] hover:bg-[#7C5CFF]/22">
+                      <Plus className="h-3 w-3" /> New
+                    </button>
+                  </div>
+                  <div className="max-h-[260px] overflow-y-auto p-1.5">
+                    <button
+                      type="button"
+                      onClick={() => selectSkill(null)}
+                      className={cn(
+                        'flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left transition-colors hover:bg-white/[0.05]',
+                        !selectedSkill && 'bg-[#7C5CFF]/10'
+                      )}
+                    >
+                      <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-white/[0.08] bg-white/[0.025] text-white/30"><X className="h-3.5 w-3.5" /></span>
+                      <span className="min-w-0 flex-1">
+                        <span className={cn('block text-[10px] font-medium', !selectedSkill ? 'text-[#C8BCFF]' : 'text-white/60')}>No skill</span>
+                        <span className="mt-0.5 block text-[8px] text-white/25">Use the default AI Idea Agent direction</span>
+                      </span>
+                      {!selectedSkill && <Check className="h-3.5 w-3.5 shrink-0 text-[#A895FF]" />}
+                    </button>
+
+                    {skillLibrary.skills.length === 0 ? (
+                      <div className="px-3 py-6 text-center">
+                        <BookOpen className="mx-auto h-5 w-5 text-white/18" />
+                        <p className="mt-2 text-[9px] text-white/30">No saved skills yet</p>
+                      </div>
+                    ) : skillLibrary.skills.map((skill) => {
+                      const active = skill.id === selectedSkill?.id
+                      return (
+                        <div key={skill.id} className={cn('group flex items-center gap-1 rounded-xl transition-colors hover:bg-white/[0.05]', active && 'bg-[#7C5CFF]/10')}>
+                          <button type="button" onClick={() => selectSkill(skill.id)} className="flex min-w-0 flex-1 items-center gap-2.5 px-2.5 py-2 text-left">
+                            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-[#7C5CFF]/18 bg-[#7C5CFF]/8 text-[#B8A8FF]"><BookOpen className="h-3.5 w-3.5" /></span>
+                            <span className="min-w-0 flex-1">
+                              <span className={cn('block truncate text-[10px] font-medium', active ? 'text-[#D1C8FF]' : 'text-white/62')}>{skill.name}</span>
+                              <span className="mt-0.5 block truncate text-[8px] text-white/25">{skill.instruction}</span>
+                            </span>
+                            {active && <Check className="h-3.5 w-3.5 shrink-0 text-[#A895FF]" />}
+                          </button>
+                          <button type="button" aria-label={`Edit ${skill.name}`} onClick={() => openSkillEditor(skill)} className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-white/22 opacity-0 hover:bg-white/[0.06] hover:text-white/65 group-hover:opacity-100">
+                            <Pencil className="h-3 w-3" />
+                          </button>
+                          <button type="button" aria-label={`Delete ${skill.name}`} onClick={() => deleteSkill(skill.id)} className="mr-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-white/22 opacity-0 hover:bg-red-500/10 hover:text-red-300/75 group-hover:opacity-100">
+                            <Trash2 className="h-3 w-3" />
+                          </button>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="flex items-center gap-1.5">
+              {promptAssistantMode === 'api' ? (
+                <Select.Root value={apiProviderConfig.model?.trim() || undefined} onValueChange={persistApiModelSelection} disabled={isRunning || !apiProviderConfig.endpoint?.trim()}>
+                  <Select.Trigger
+                    title={`9Router model: ${apiProviderConfig.model || 'Choose model'}`}
+                    aria-label={`Choose 9Router model. Current: ${apiProviderConfig.model || 'not configured'}`}
+                    className="relative flex h-8 w-8 items-center justify-center rounded-xl text-white/34 outline-none transition-colors hover:bg-white/[0.06] hover:text-white/70 data-[state=open]:bg-[#7C5CFF]/12 data-[state=open]:text-[#B8A8FF] disabled:cursor-not-allowed disabled:opacity-30"
+                  >
+                    <Box className="h-3.5 w-3.5" />
+                    {(isRunning || apiModelsLoading) && (
+                      <span className="absolute right-0.5 top-0.5 flex h-1.5 w-1.5">
+                        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-300 opacity-55" />
+                        <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-300 shadow-[0_0_8px_rgba(110,231,183,.8)]" />
+                      </span>
+                    )}
+                  </Select.Trigger>
+                  <Select.Portal>
+                    <Select.Content position="popper" side="top" align="end" sideOffset={8} collisionPadding={12} className="z-[170] w-[340px] overflow-hidden rounded-2xl border border-white/[0.1] bg-[#1B1B1B] p-1.5 shadow-[0_22px_68px_rgba(0,0,0,0.76)]">
+                      <div className="border-b border-white/[0.07] px-2.5 pb-2.5 pt-1.5">
+                        <p className="text-[10px] font-semibold text-white/78">9Router models</p>
+                        <p className="mt-0.5 text-[8px] text-white/28">Grouped by plan · media-capable models are prioritized</p>
+                      </div>
+                      <Select.Viewport className="max-h-[330px] py-1">
+                        {apiModelsLoading && visibleApiModels.length === 0 && (
+                          <div className="flex h-14 items-center justify-center gap-2 text-[9px] text-white/32">
+                            <LoaderCircle className="h-3.5 w-3.5 animate-spin text-[#A895FF]" /> Loading available models…
+                          </div>
+                        )}
+                        {!apiModelsLoading && apiModelsError && (
+                          <div className="px-3 py-4 text-[9px] leading-4 text-red-200/65">{apiModelsError}</div>
+                        )}
+                        {apiModelGroups.map(([plan, models]) => (
+                          <Select.Group key={plan}>
+                            <Select.Label className="px-2.5 pb-1 pt-2 text-[8px] font-semibold uppercase tracking-[0.12em] text-white/24">{plan}</Select.Label>
+                            {models.map((model) => (
+                              <Select.Item key={model.id} value={model.id} className="relative flex min-h-11 cursor-pointer select-none items-center rounded-xl py-2 pl-8 pr-2.5 outline-none data-[highlighted]:bg-[#7C5CFF]/12 data-[state=checked]:bg-[#7C5CFF]/[0.08]">
+                                <Select.ItemIndicator className="absolute left-2.5 text-[#B8A8FF]"><Check className="h-3.5 w-3.5" /></Select.ItemIndicator>
+                                <span className="min-w-0 flex-1">
+                                  <Select.ItemText>{model.name}</Select.ItemText>
+                                  <span className={cn('mt-0.5 block truncate text-[8px]', model.recommendedForMedia ? 'text-emerald-300/65' : model.inputModalities.includes('image') ? 'text-[#B8A8FF]/62' : 'text-white/25')}>
+                                    {videoAgentModelCapabilityLabel(model)}
+                                  </span>
+                                </span>
+                                {model.recommendedForMedia && <span className="ml-2 shrink-0 rounded-full bg-emerald-400/[0.08] px-1.5 py-0.5 text-[7px] font-semibold uppercase tracking-wide text-emerald-300/70">Media</span>}
+                              </Select.Item>
+                            ))}
+                          </Select.Group>
+                        ))}
+                      </Select.Viewport>
+                    </Select.Content>
+                  </Select.Portal>
+                </Select.Root>
+              ) : (
+              <Select.Root value={activeProvider} onValueChange={(value) => setProvider(value as PromptAssistantProvider)} disabled={isRunning}>
+                <Select.Trigger
+                  title={`Generate with ${promptAssistantProviderLabel(activeProvider)}`}
+                  aria-label={`Choose AI provider. Current: ${promptAssistantProviderLabel(activeProvider)}`}
+                  className="relative flex h-8 w-8 items-center justify-center rounded-xl text-white/34 outline-none transition-colors hover:bg-white/[0.06] hover:text-white/70 data-[state=open]:bg-[#7C5CFF]/12 data-[state=open]:text-[#B8A8FF] disabled:cursor-not-allowed"
+                >
+                  <Box className="h-3.5 w-3.5" />
+                  {isRunning && (
+                    <span className="absolute right-0.5 top-0.5 flex h-1.5 w-1.5">
+                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-300 opacity-55" />
+                      <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-300 shadow-[0_0_8px_rgba(110,231,183,.8)]" />
+                    </span>
+                  )}
+                </Select.Trigger>
+                <Select.Portal>
+                  <Select.Content position="popper" side="top" align="end" sideOffset={8} collisionPadding={12} className="z-[170] min-w-[150px] overflow-hidden rounded-xl border border-white/[0.1] bg-[#1B1B1B] p-1 shadow-[0_18px_48px_rgba(0,0,0,0.68)]">
+                    <Select.Viewport>
+                      {((promptAssistantMode === 'api'
+                        ? ['api']
+                        : ['chatgpt', 'gemini']) as PromptAssistantProvider[]).map((item) => {
+                        const unavailable = item === 'api' && !apiProviderReady
+                        return (
+                        <Select.Item key={item} value={item} disabled={unavailable} className="relative flex h-9 cursor-pointer select-none items-center rounded-lg pl-8 pr-3 text-[10px] font-medium text-white/55 outline-none data-[disabled]:cursor-not-allowed data-[disabled]:text-white/18 data-[highlighted]:bg-[#7C5CFF]/12 data-[highlighted]:text-white data-[state=checked]:text-[#C8BCFF]">
+                          <Select.ItemIndicator className="absolute left-2.5"><Check className="h-3.5 w-3.5" /></Select.ItemIndicator>
+                          <Select.ItemText>{promptAssistantProviderLabel(item)}{unavailable ? ' · Setup required' : ''}</Select.ItemText>
+                        </Select.Item>
+                        )
+                      })}
+                    </Select.Viewport>
+                  </Select.Content>
+                </Select.Portal>
+              </Select.Root>
+              )}
+              <button
+                type="button"
+                aria-label="Send to AI Idea Agent"
+                disabled={!input.trim() || isRunning || !conversationHistoryReady || !activeConversationId || (activeProvider === 'api' && !apiProviderReady)}
+                onClick={() => void submit()}
+                className={cn('flex h-8 w-8 items-center justify-center rounded-xl transition-all', input.trim() && !isRunning && conversationHistoryReady && activeConversationId && (activeProvider !== 'api' || apiProviderReady) ? 'bg-[#7C5CFF] text-white shadow-[0_7px_18px_rgba(124,92,255,0.28)] hover:bg-[#8768FF]' : 'cursor-not-allowed bg-white/[0.05] text-white/18')}
+              >
+                {isRunning ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {skillEditorOpen && (
+        <div className="absolute inset-0 z-[210] flex items-center justify-center bg-black/68 p-5 backdrop-blur-[2px]" onMouseDown={() => setSkillEditorOpen(false)}>
+          <div className="w-full max-w-[370px] overflow-hidden rounded-2xl border border-white/[0.1] bg-[#191919] shadow-[0_28px_90px_rgba(0,0,0,0.78)]" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="flex items-center justify-between border-b border-white/[0.07] px-4 py-3.5">
+              <div className="flex min-w-0 items-center gap-2.5">
+                <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-[#7C5CFF]/22 bg-[#7C5CFF]/10 text-[#B8A8FF]"><BookOpen className="h-4 w-4" /></span>
+                <div className="min-w-0">
+                  <h3 className="truncate text-[11px] font-semibold text-white/82">{editingSkillId ? 'Edit agent skill' : 'Create agent skill'}</h3>
+                  <p className="mt-0.5 text-[8px] text-white/28">Saved locally and reusable in future sessions</p>
+                </div>
+              </div>
+              <button type="button" onClick={() => setSkillEditorOpen(false)} className="flex h-7 w-7 items-center justify-center rounded-lg text-white/28 hover:bg-white/[0.06] hover:text-white/70"><X className="h-3.5 w-3.5" /></button>
+            </div>
+
+            <div className="space-y-3 px-4 py-4">
+              <label className="block">
+                <span className="mb-1.5 block text-[9px] font-medium text-white/42">Skill name</span>
+                <input
+                  autoFocus
+                  value={skillDraftName}
+                  maxLength={64}
+                  onChange={(event) => setSkillDraftName(event.target.value)}
+                  placeholder="e.g. Cinematic storyboard director"
+                  className="h-10 w-full rounded-xl border border-white/[0.08] bg-[#101010] px-3 text-[10px] text-white/76 outline-none placeholder:text-white/20 focus:border-[#7C5CFF]/55 focus:ring-2 focus:ring-[#7C5CFF]/10"
+                />
+              </label>
+              <label className="block">
+                <span className="mb-1.5 block text-[9px] font-medium text-white/42">Reusable instructions</span>
+                <textarea
+                  value={skillDraftInstruction}
+                  maxLength={12000}
+                  rows={9}
+                  onChange={(event) => setSkillDraftInstruction(event.target.value)}
+                  onKeyDown={(event) => {
+                    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+                      event.preventDefault()
+                      void saveSkillDraft()
+                    }
+                  }}
+                  placeholder="Describe how the agent should structure ideas, storyboards, shots, camera movement, visual direction, or output format."
+                  className="block max-h-[280px] min-h-[170px] w-full resize-y rounded-xl border border-white/[0.08] bg-[#101010] px-3 py-2.5 text-[10px] leading-[1.6] text-white/70 outline-none placeholder:text-white/20 focus:border-[#7C5CFF]/55 focus:ring-2 focus:ring-[#7C5CFF]/10"
+                />
+              </label>
+              <div className="flex items-center justify-between text-[8px] text-white/20">
+                <span>Ctrl + Enter to save</span>
+                <span>{skillDraftInstruction.length.toLocaleString()}/12,000</span>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 border-t border-white/[0.07] px-4 py-3">
+              <button type="button" onClick={() => setSkillEditorOpen(false)} className="h-9 rounded-xl px-3.5 text-[10px] font-medium text-white/40 hover:bg-white/[0.05] hover:text-white/70">Cancel</button>
+              <button
+                type="button"
+                disabled={!skillDraftName.trim() || !skillDraftInstruction.trim()}
+                onClick={() => void saveSkillDraft()}
+                className="flex h-9 items-center gap-1.5 rounded-xl bg-[#7C5CFF] px-3.5 text-[10px] font-semibold text-white shadow-[0_8px_20px_rgba(124,92,255,0.24)] hover:bg-[#8768FF] disabled:cursor-not-allowed disabled:opacity-35"
+              >
+                <Check className="h-3.5 w-3.5" /> Save skill
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </aside>
+  )
+}
+
 const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen, onToggleSidebar, onBackToDashboard, windowMode = false }) => {
   const updateWorkflow = useWorkflowStore((s) => s.updateWorkflow)
   const addNode = useWorkflowStore((s) => s.addNode)
@@ -3585,6 +5303,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const canvasRef = useRef<HTMLDivElement>(null)
   const editorRef = useRef<DrawflowInstance | null>(null)
   const workflowRef = useRef(workflow)
+  const autoFitWorkflowIdRef = useRef<string | null>(null)
   const suppressEdgeEventRef = useRef(false)
   const connectionSyncFrameRef = useRef<number | null>(null)
   const connectionRefreshFrameRef = useRef<number | null>(null)
@@ -3806,6 +5525,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
     updateWorkflow(workflow.id, { name: nextName })
   }
   const [inspectorNodeId, setInspectorNodeId] = useState<string | null>(null)
+  const [videoAgentOpen, setVideoAgentOpen] = useState(false)
   const [marqueeRect, setMarqueeRect] = useState<MarqueeRect | null>(null)
   // Multi-selection: the Set lives in a ref for hot-path reads inside
   // syncSelectedNodeDom / syncConnectionOverlays, and we mirror the
@@ -4735,7 +6455,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
       computePosition(nodePillMenu.trigger, menu, {
         placement: 'bottom-start',
         strategy: 'fixed',
-        middleware: [offset(6), flip({ padding: 8 }), shift({ padding: 8 })]
+        middleware: [offset(6), shift({ padding: 8 })]
       }).then(({ x, y }) => {
         Object.assign(menu.style, {
           left: `${x}px`,
@@ -5723,6 +7443,67 @@ const groupDragMirrorLog = (
     return staleEdges.map((edge) => edge.id)
   }
 
+  const handleSaveMediaUrl = async (nodeId: string, rawUrl: string) => {
+    const url = validateMediaUrl(rawUrl)
+    const currentNode = workflowRef.current.nodes.find((item) => item.id === nodeId)
+    if (!currentNode || currentNode.type !== 'image') {
+      throw new Error('The selected node is no longer a Media Node.')
+    }
+
+    const currentData = currentNode.data as Record<string, unknown>
+    const result = await probeMediaUrl(url, getMediaNodeType(currentData))
+    const hasDimensions = Boolean(result.width && result.height)
+    const fileName = mediaFileNameFromUrl(url, result.mediaType)
+    const aspectRatio = hasDimensions
+      ? closestImageAspectRatio(result.width as number, result.height as number)
+      : result.mediaType === 'video'
+        ? '16:9'
+        : String(currentData.aspectRatio || '1:1')
+
+    const patch = {
+      mediaType: result.mediaType,
+      mediaUrl: url,
+      mediaData: '',
+      mediaName: fileName,
+      mediaMimeType: result.mediaType === 'video' ? 'video/*' : 'image/*',
+      mediaWidth: result.width,
+      mediaHeight: result.height,
+      mediaDuration: result.mediaType === 'video' ? result.duration : undefined,
+      mediaSize: 0,
+      size: 0,
+      mediaPoster: '',
+      imageUrl: result.mediaType === 'image' ? url : '',
+      imageData: '',
+      imageName: result.mediaType === 'image' ? fileName : '',
+      imageWidth: result.mediaType === 'image' ? result.width : undefined,
+      imageHeight: result.mediaType === 'image' ? result.height : undefined,
+      videoUrl: result.mediaType === 'video' ? url : '',
+      videoData: '',
+      videoName: result.mediaType === 'video' ? fileName : '',
+      videoWidth: result.mediaType === 'video' ? result.width : undefined,
+      videoHeight: result.mediaType === 'video' ? result.height : undefined,
+      videoPoster: '',
+      duration: result.mediaType === 'video' ? result.duration : undefined,
+      aspectRatio,
+      assetId: undefined,
+      mediaAssetId: undefined,
+      imageAssetId: undefined,
+      videoAssetId: undefined,
+      posterAssetId: undefined,
+      thumbnailAssetId: undefined
+    } as Partial<FlowNodeData>
+
+    const nextNode: WorkflowNode = {
+      ...currentNode,
+      data: { ...currentNode.data, ...patch } as FlowNodeData
+    }
+    const staleEdgeIds = unlinkIncompatibleConnectionsForNode(nodeId, nextNode)
+    updateNodeAndRemoveEdges(nodeId, patch, staleEdgeIds)
+    scheduleDrawflowConnectionRefresh(nodeId)
+
+    return { mediaType: result.mediaType, unlinkedCount: staleEdgeIds.length }
+  }
+
   const syncConnectionOverlaysForSelectedIds = (selectedIds: Set<string>) => {
     const canvas = canvasRef.current
     if (!canvas) return
@@ -6311,6 +8092,12 @@ const groupDragMirrorLog = (
       return false
     }
     editor.start()
+    // Drawflow leaves transform-origin at the browser default (center).
+    // Every canvas_x/canvas_y calculation in this editor is top-left based,
+    // so establish that coordinate system before the initial auto-fit. The
+    // pan handler also sets this value; relying on it made the fitted canvas
+    // visibly jump only after the user's first pointer movement.
+    editor.precanvas.style.transformOrigin = '0 0'
 
     editor.on('nodeSelected', (id: string | number) => {
       const nodeId = String(id)
@@ -8520,7 +10307,7 @@ const groupDragMirrorLog = (
     }
   }, [])
 
-  const handleAddNode = (type: FlowNodeType) => {
+  const handleAddNode = (type: FlowNodeType, dataPatch?: Partial<FlowNodeData>) => {
     const editor = editorRef.current
     const canvas = canvasRef.current
     const rect = canvas?.getBoundingClientRect()
@@ -8540,7 +10327,10 @@ const groupDragMirrorLog = (
         : Math.round(160 + Math.random() * 160)
     const node = addNode(type, { x, y })
     nodePickerSpawnRef.current = null
-    if (node) setSelectedNode(node.id)
+    if (node) {
+      if (dataPatch) updateNode(node.id, dataPatch)
+      setSelectedNode(node.id)
+    }
     if (editor && node) {
       requestAnimationFrame(() => {
         attachNodeResizeObserver(node.id)
@@ -8599,14 +10389,19 @@ const groupDragMirrorLog = (
   const fitCanvas = () => {
     const editor = editorRef.current
     const canvas = canvasRef.current
-    if (!editor || !canvas || !editor.precanvas) return
+    if (!editor || !canvas || !editor.precanvas) return false
+    if (canvas.clientWidth <= 0 || canvas.clientHeight <= 0) return false
 
     const nodes = Array.from(canvas.querySelectorAll<HTMLElement>('.drawflow-node'))
+    const expectedNodeCount = workflowRef.current.nodes.length
+    if (nodes.length < expectedNodeCount) return false
+    if (nodes.some((node) => node.offsetWidth <= 0 || node.offsetHeight <= 0)) return false
+
     if (nodes.length === 0) {
       editor.zoom_reset()
       refreshZoom()
       scheduleConnectionSync()
-      return
+      return true
     }
 
     const bounds = nodes.reduce(
@@ -8633,10 +10428,62 @@ const groupDragMirrorLog = (
     editor.zoom_last_value = zoom
     editor.canvas_x = Math.round((canvas.clientWidth - width * zoom) / 2 - bounds.minX * zoom)
     editor.canvas_y = Math.round((canvas.clientHeight - height * zoom) / 2 - bounds.minY * zoom)
+    editor.precanvas.style.transformOrigin = '0 0'
     editor.precanvas.style.transform = `translate(${editor.canvas_x}px, ${editor.canvas_y}px) scale(${zoom})`
     refreshZoom()
     scheduleConnectionSync()
+    return true
   }
+
+  useEffect(() => {
+    const workflowId = workflow.id
+    if (autoFitWorkflowIdRef.current === workflowId) return
+
+    let stopped = false
+    let retryTimerId: number | null = null
+    let firstFrameId: number | null = null
+    let resizeObserver: ResizeObserver | null = null
+    const deadline = Date.now() + 5000
+
+    const stopScheduling = () => {
+      if (retryTimerId !== null) {
+        window.clearTimeout(retryTimerId)
+        retryTimerId = null
+      }
+      if (firstFrameId !== null) {
+        window.cancelAnimationFrame(firstFrameId)
+        firstFrameId = null
+      }
+      resizeObserver?.disconnect()
+      resizeObserver = null
+    }
+
+    const attemptInitialFit = () => {
+      if (stopped || workflowRef.current.id !== workflowId) return
+      if (fitCanvas()) {
+        autoFitWorkflowIdRef.current = workflowId
+        scheduleDrawflowConnectionRefresh(null, { all: true })
+        stopScheduling()
+        return
+      }
+      if (Date.now() < deadline) {
+        if (retryTimerId !== null) window.clearTimeout(retryTimerId)
+        retryTimerId = window.setTimeout(attemptInitialFit, 60)
+      }
+    }
+
+    const canvas = canvasRef.current
+    if (canvas && typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver(attemptInitialFit)
+      resizeObserver.observe(canvas)
+    }
+    firstFrameId = window.requestAnimationFrame(attemptInitialFit)
+
+    return () => {
+      stopped = true
+      stopScheduling()
+    }
+  }, [workflow.id])
 
   const autoLayoutCanvas = () => {
     const currentWorkflow = workflowRef.current
@@ -9052,6 +10899,25 @@ const groupDragMirrorLog = (
         </div>
 
         <div className="flex items-center gap-1">
+          {windowMode && (
+            <button
+              type="button"
+              title="AI Idea Agent"
+              onClick={() => {
+                setInspectorNodeId(null)
+                setVideoAgentOpen((current) => !current)
+              }}
+              className={cn(
+                'mr-1 flex h-9 items-center gap-2 rounded-lg border px-3 text-[11px] font-medium transition-colors',
+                videoAgentOpen
+                  ? 'border-[#7C5CFF]/45 bg-[#7C5CFF]/16 text-white'
+                  : 'border-white/[0.08] bg-white/[0.025] text-white/55 hover:border-white/[0.14] hover:bg-white/[0.06] hover:text-white'
+              )}
+            >
+              <Sparkles className="h-3.5 w-3.5 text-[#B8A8FF]" />
+              Agent
+            </button>
+          )}
           <button
             type="button"
             title="Save to Template"
@@ -9060,7 +10926,7 @@ const groupDragMirrorLog = (
             }}
             className="flex h-9 w-9 items-center justify-center rounded-lg text-white/42 transition-colors hover:bg-white/[0.06] hover:text-white"
           >
-            <LayoutTemplate className="h-4 w-4" />
+            <BookmarkPlus className="h-4 w-4" />
           </button>
           <button
             type="button"
@@ -9631,11 +11497,45 @@ const groupDragMirrorLog = (
             </div>
           )}
         </div>
+        {windowMode && videoAgentOpen && (
+          <VideoIdeaAgentPanel
+            workflow={workflow}
+            onClose={() => setVideoAgentOpen(false)}
+            onInsertPrompt={(text, provider) => {
+              const workflowProvider = provider === 'api' ? 'chatgpt' : provider as AIProvider
+              const selectedPromptNodeId = useWorkflowStore.getState().selectedNodeId
+              const selectedPromptNode = selectedPromptNodeId
+                ? workflowRef.current.nodes.find((node) => node.id === selectedPromptNodeId && node.type === 'prompt')
+                : undefined
+
+              if (selectedPromptNode) {
+                updateNode(selectedPromptNode.id, {
+                  label: 'Prompt',
+                  prompt: text,
+                  provider: workflowProvider,
+                  enabled: true,
+                } as Partial<FlowNodeData>)
+                flashTemplateToast('success', 'Selected Prompt Node updated with the Agent prompt.')
+                return
+              }
+
+              handleAddNode('prompt', {
+                label: 'Prompt',
+                prompt: text,
+                // API is a Prompt Assistant transport, not a workflow execution provider.
+                provider: workflowProvider,
+                enabled: true,
+              } as Partial<FlowNodeData>)
+              flashTemplateToast('success', 'Agent idea added as a Prompt Node.')
+            }}
+          />
+        )}
         {windowMode && inspectorNodeId && (
           <NodeInspector
             workflow={workflow}
             nodeId={inspectorNodeId}
             onClose={() => setInspectorNodeId(null)}
+            onSaveMediaUrl={handleSaveMediaUrl}
           />
         )}
         {/* [WorkflowTemplate] Save-to-Template toast. Sits inside the
@@ -9678,21 +11578,36 @@ const groupDragMirrorLog = (
     </div>
   )
 }
-async function openWorkflowEditorWindow(workflow: Workflow) {
+async function openWorkflowEditorWindow(
+  workflow: Workflow,
+  options: { fromTemplate?: boolean } = {}
+) {
   await chrome.storage.local.set({
     _pendingWorkflowEditor: {
       workflow,
       workflowId: workflow.id,
+      fromTemplate: options.fromTemplate === true,
       timestamp: Date.now()
     }
   })
 
   await chrome.runtime.sendMessage({
     action: 'OPEN_WORKFLOW_EDITOR_WINDOW',
-    payload: { workflowId: workflow.id },
+    payload: {
+      workflowId: workflow.id,
+      fromTemplate: options.fromTemplate === true
+    },
     timestamp: Date.now()
   })
 }
+
+const templateDraftSnapshot = (workflow: Workflow): string => JSON.stringify({
+  name: workflow.name,
+  description: workflow.description || '',
+  nodes: workflow.nodes,
+  edges: workflow.edges,
+  tags: workflow.tags || []
+})
 
 // [AssetGC] Phase 5 — Asset Storage report modal.
 // Owned by WorkflowEditor; never touches Flow / ChatGPT / runner
@@ -9994,7 +11909,7 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   const importWorkflow = useWorkflowStore((s) => s.importWorkflow)
   const setActiveWorkflow = useWorkflowStore((s) => s.setActiveWorkflow)
 
-  const [view, setView] = usePersistedState<WorkflowShellView>('workflow.view', workflows.length > 0 ? 'workflows' : 'templates')
+  const [view, setView] = usePersistedState<WorkflowShellView>('workflow.view', workflows.some((workflow) => !workflow.isTemplateDraft) ? 'workflows' : 'templates')
   const [templateCategory, setTemplateCategory] = usePersistedState<string>('workflow.templateCategory', 'All')
   const [workflowSearch, setWorkflowSearch] = useState('')
   // [WorkflowTemplate] JS masonry: ref to the templates scroll
@@ -10388,6 +12303,10 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   }, [view, workflows.length, activeWorkflowId])
 
   const activeWorkflow = workflows.find((workflow) => workflow.id === activeWorkflowId) || workflows[0] || null
+  const visibleWorkflows = useMemo(
+    () => workflows.filter((workflow) => !workflow.isTemplateDraft),
+    [workflows]
+  )
   // [WorkflowTemplate] Combine built-in templates with user-saved
   // templates into a single render list. Saved templates sort before
   // built-in ones (newest first by createdAt desc) so a freshly saved
@@ -10447,7 +12366,7 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   // is already in insertion order) so the policy remains explicit.
   const filteredWorkflows = useMemo(() => {
     const lowerSearch = workflowSearch.toLowerCase()
-    const filtered = workflows.filter((workflow) =>
+    const filtered = visibleWorkflows.filter((workflow) =>
       workflow.name.toLowerCase().includes(lowerSearch)
     )
     const sorted = [...filtered].sort((a, b) => {
@@ -10473,10 +12392,10 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
       console.debug('[WorkflowList][sortPolicy]', JSON.stringify({ policy: 'createdAt-desc' }))
     }
     return sorted
-  }, [workflows, workflowSearch])
+  }, [visibleWorkflows, workflowSearch])
 
   const handleCreateBlank = async () => {
-    const workflow = createWorkflow(`Workflow ${workflows.length + 1}`)
+    const workflow = createWorkflow(`Workflow ${visibleWorkflows.length + 1}`)
     setActiveWorkflow(workflow.id)
     await openWorkflowEditorWindow(workflow)
   }
@@ -10487,7 +12406,7 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
     // `template.workflow.nodes/edges` and renames the new workflow
     // to match the saved entry). Built-in templates keep the
     // existing path verbatim.
-    const workflow = template.source === 'user'
+    const instantiatedWorkflow = template.source === 'user'
       ? instantiateUserTemplate(savedTemplates.find((t) => t.id === template.id) || {
           id: template.id,
           name: template.name,
@@ -10500,8 +12419,13 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
           ...(template.thumbnail ? { thumbnail: template.thumbnail } : {})
         })
       : instantiateTemplate(template)
+    const workflow: Workflow = {
+      ...instantiatedWorkflow,
+      isTemplateDraft: true,
+      sourceTemplateId: template.id
+    }
     importWorkflow(workflow)
-    await openWorkflowEditorWindow(workflow)
+    await openWorkflowEditorWindow(workflow, { fromTemplate: true })
   }
 
   // [WorkflowTemplate] Delete a saved template from chrome.storage.
@@ -10737,7 +12661,7 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
           </div>
           <div className="min-w-0">
             <h2 className="truncate text-[12px] font-medium text-white/80">Workflow</h2>
-            <p className="truncate text-[11px] text-white/30">{workflows.length} saved flows</p>
+            <p className="truncate text-[11px] text-white/30">{visibleWorkflows.length} saved flows</p>
           </div>
         </div>
 
@@ -11166,29 +13090,33 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
             const visibleIds = filteredWorkflows.map((w) => w.id)
             const allVisibleSelected = visibleIds.length > 0
               && visibleIds.every((id) => selectedWorkflowIds.includes(id))
+            const visibleSelectedCount = visibleIds.filter((id) => selectedWorkflowIds.includes(id)).length
             return (
-              <div className="flex items-center gap-2">
+              <div className="flex min-h-8 items-center gap-3">
                 <button
                   type="button"
                   onClick={() => toggleSelectAllVisible(visibleIds)}
                   aria-pressed={allVisibleSelected}
                   className={cn(
-                    'flex h-7 items-center gap-1.5 rounded-md border px-2 text-[11px] font-medium transition-colors',
+                    'group flex h-8 items-center gap-2 rounded-md px-0.5 text-[11px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-[#7C5CFF]/30',
                     allVisibleSelected
-                      ? 'border-[#7C5CFF]/45 bg-[#7C5CFF]/15 text-[#B8A8FF]'
-                      : 'border-white/[0.06] bg-[#171717] text-white/55 hover:border-white/15 hover:text-white/75'
+                      ? 'text-[#C8BCFF]'
+                      : 'text-white/45 hover:text-white/72'
                   )}
                 >
-                  {allVisibleSelected ? (
-                    <CheckSquare className="h-3.5 w-3.5" />
-                  ) : (
-                    <Square className="h-3.5 w-3.5" />
-                  )}
+                  <span className={cn(
+                    'flex h-6 w-6 shrink-0 items-center justify-center rounded-md border transition-all',
+                    allVisibleSelected
+                      ? 'border-[#8D73FF] bg-[#7C5CFF] text-white shadow-[0_0_12px_rgba(124,92,255,0.22)]'
+                      : 'border-white/20 bg-transparent text-transparent group-hover:border-white/35'
+                  )}>
+                    <Check className="h-3.5 w-3.5" strokeWidth={3} />
+                  </span>
                   {allVisibleSelected ? 'Deselect all' : 'Select all'}
                 </button>
-                {selectedWorkflowIds.length > 0 && (
-                  <span className="text-[11px] text-white/35">
-                    of {filteredWorkflows.length} visible
+                {visibleSelectedCount > 0 && (
+                  <span className="text-[10px] font-medium text-white/25">
+                    {visibleSelectedCount} of {visibleIds.length} selected
                   </span>
                 )}
               </div>
@@ -11460,19 +13388,24 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
           onClick={() => setDeleteConfirmTemplate(null)}
         >
           <div
-            className="workflow-confirm-modal"
+            className="workflow-confirm-modal workflow-template-delete-modal"
             onClick={(event) => event.stopPropagation()}
           >
-            <div className="workflow-confirm-icon">
-              <Trash2 className="h-4 w-4" />
-            </div>
-            <div className="workflow-confirm-body">
-              <h2 id="template-confirm-title" className="workflow-confirm-title">
-                Delete “{deleteConfirmTemplate.name}”?
-              </h2>
-              <p id="template-confirm-desc" className="workflow-confirm-desc">
-                This action cannot be undone.
-              </p>
+            <div className="workflow-template-delete-content">
+              <div className="workflow-confirm-icon">
+                <Trash2 className="h-[18px] w-[18px]" />
+              </div>
+              <div className="workflow-confirm-body">
+                <h2 id="template-confirm-title" className="workflow-confirm-title">
+                  Delete {deleteConfirmTemplate.name.replace(/\s+template$/i, '')} Template
+                </h2>
+                <p id="template-confirm-desc" className="workflow-confirm-desc">
+                  This template will be permanently removed.
+                </p>
+                <div className="workflow-confirm-target" title={deleteConfirmTemplate.name}>
+                  {deleteConfirmTemplate.name}
+                </div>
+              </div>
             </div>
             <div className="workflow-confirm-actions">
               <button
@@ -11490,7 +13423,7 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
                 }}
               >
                 <Trash2 className="h-4 w-4" />
-                Delete
+                Delete template
               </button>
             </div>
           </div>
@@ -11578,10 +13511,18 @@ export const WorkflowEditorWindow: React.FC = () => {
   const hydrateFromStorage = useWorkflowStore((s) => s.hydrateFromStorage)
   const createWorkflow = useWorkflowStore((s) => s.createWorkflow)
   const importWorkflow = useWorkflowStore((s) => s.importWorkflow)
+  const updateWorkflow = useWorkflowStore((s) => s.updateWorkflow)
+  const deleteWorkflow = useWorkflowStore((s) => s.deleteWorkflow)
   const setActiveWorkflow = useWorkflowStore((s) => s.setActiveWorkflow)
 
   const [isReady, setIsReady] = useState(false)
   const [workflowId, setWorkflowId] = useState<string | null>(null)
+  const [saveDraftOpen, setSaveDraftOpen] = useState(false)
+  const [saveDraftName, setSaveDraftName] = useState('')
+  const saveDraftInputRef = useRef<HTMLInputElement>(null)
+  const allowWindowCloseRef = useRef(false)
+  const initialTemplateDraftSnapshotRef = useRef<string | null>(null)
+  const openedFromTemplateRef = useRef(false)
 
   useEffect(() => {
     let cancelled = false
@@ -11591,20 +13532,26 @@ export const WorkflowEditorWindow: React.FC = () => {
 
       const params = new URLSearchParams(window.location.search)
       let nextWorkflowId = params.get('workflowId')
+      openedFromTemplateRef.current = params.get('fromTemplate') === '1'
 
       try {
         const pending = await chrome.storage.local.get('_pendingWorkflowEditor')
         const pendingData = pending._pendingWorkflowEditor as {
           workflow?: Workflow
           workflowId?: string
+          fromTemplate?: boolean
           timestamp?: number
         } | undefined
         const isFresh = pendingData?.timestamp && Date.now() - pendingData.timestamp < 5 * 60 * 1000
         const matchesQuery = !nextWorkflowId || pendingData?.workflowId === nextWorkflowId
 
         if (pendingData?.workflow && isFresh && matchesQuery) {
-          importWorkflow(pendingData.workflow)
-          nextWorkflowId = pendingData.workflow.id
+          const pendingWorkflow: Workflow = pendingData.fromTemplate
+            ? { ...pendingData.workflow, isTemplateDraft: true }
+            : pendingData.workflow
+          openedFromTemplateRef.current = pendingData.fromTemplate === true || pendingWorkflow.isTemplateDraft === true
+          importWorkflow(pendingWorkflow)
+          nextWorkflowId = pendingWorkflow.id
           await chrome.storage.local.remove('_pendingWorkflowEditor')
         }
       } catch {
@@ -11624,6 +13571,12 @@ export const WorkflowEditorWindow: React.FC = () => {
 
       setActiveWorkflow(nextWorkflowId)
 
+      const openedWorkflow = useWorkflowStore.getState().workflows.find((item) => item.id === nextWorkflowId)
+      openedFromTemplateRef.current = openedFromTemplateRef.current || openedWorkflow?.isTemplateDraft === true
+      initialTemplateDraftSnapshotRef.current = openedFromTemplateRef.current && openedWorkflow
+        ? templateDraftSnapshot(openedWorkflow)
+        : null
+
       if (!cancelled) {
         setWorkflowId(nextWorkflowId)
         setIsReady(true)
@@ -11642,6 +13595,78 @@ export const WorkflowEditorWindow: React.FC = () => {
     || workflows[0]
     || null
 
+  const closeWindowAfterPersist = useCallback(() => {
+    allowWindowCloseRef.current = true
+    window.setTimeout(() => window.close(), 180)
+  }, [])
+
+  const requestEditorClose = useCallback(() => {
+    const current = useWorkflowStore.getState().workflows.find((item) => item.id === workflowId)
+      || useWorkflowStore.getState().workflows.find((item) => item.id === activeWorkflowId)
+    if (current && (openedFromTemplateRef.current || current.isTemplateDraft)) {
+      const changed = initialTemplateDraftSnapshotRef.current !== templateDraftSnapshot(current)
+      if (changed) {
+        setSaveDraftName(current.name)
+        setSaveDraftOpen(true)
+        return
+      }
+      deleteWorkflow(current.id)
+      closeWindowAfterPersist()
+      return
+    }
+    allowWindowCloseRef.current = true
+    window.close()
+  }, [activeWorkflowId, closeWindowAfterPersist, deleteWorkflow, workflowId])
+
+  const saveTemplateDraftToWorkflows = useCallback(() => {
+    if (!workflowId || !saveDraftName.trim()) return
+    updateWorkflow(workflowId, {
+      name: saveDraftName.trim(),
+      isTemplateDraft: false,
+      sourceTemplateId: undefined
+    })
+    setSaveDraftOpen(false)
+    closeWindowAfterPersist()
+  }, [closeWindowAfterPersist, saveDraftName, updateWorkflow, workflowId])
+
+  const discardTemplateDraft = useCallback(() => {
+    if (!workflowId) return
+    deleteWorkflow(workflowId)
+    setSaveDraftOpen(false)
+    closeWindowAfterPersist()
+  }, [closeWindowAfterPersist, deleteWorkflow, workflowId])
+
+  useEffect(() => {
+    if (!saveDraftOpen) return
+    const timer = window.setTimeout(() => {
+      saveDraftInputRef.current?.focus()
+      saveDraftInputRef.current?.select()
+    }, 30)
+    return () => window.clearTimeout(timer)
+  }, [saveDraftOpen])
+
+  useEffect(() => {
+    const protectTemplateDraft = (event: BeforeUnloadEvent) => {
+      if (allowWindowCloseRef.current) return
+      const current = useWorkflowStore.getState().workflows.find((item) => item.id === workflowId)
+      if (!current || (!openedFromTemplateRef.current && !current.isTemplateDraft)) return
+      if (initialTemplateDraftSnapshotRef.current === templateDraftSnapshot(current)) return
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    const discardDraftAfterNativeClose = () => {
+      if (allowWindowCloseRef.current) return
+      const current = useWorkflowStore.getState().workflows.find((item) => item.id === workflowId)
+      if (current && (openedFromTemplateRef.current || current.isTemplateDraft)) deleteWorkflow(current.id)
+    }
+    window.addEventListener('beforeunload', protectTemplateDraft)
+    window.addEventListener('pagehide', discardDraftAfterNativeClose)
+    return () => {
+      window.removeEventListener('beforeunload', protectTemplateDraft)
+      window.removeEventListener('pagehide', discardDraftAfterNativeClose)
+    }
+  }, [deleteWorkflow, workflowId])
+
   if (!isReady || !workflow) {
     return (
       <div className="flex h-screen w-screen items-center justify-center bg-[#0F0F0F] text-white/45">
@@ -11654,12 +13679,70 @@ export const WorkflowEditorWindow: React.FC = () => {
   }
 
   return (
-    <WorkflowCanvas
-      workflow={workflow}
-      isSidebarOpen={false}
-      onToggleSidebar={() => {}}
-      onBackToDashboard={() => window.close()}
-      windowMode
-    />
+    <div className="relative h-screen w-screen overflow-hidden">
+      <WorkflowCanvas
+        workflow={workflow}
+        isSidebarOpen={false}
+        onToggleSidebar={() => {}}
+        onBackToDashboard={requestEditorClose}
+        windowMode
+      />
+
+      {saveDraftOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="save-template-draft-title"
+          className="workflow-confirm-overlay"
+        >
+          <div className="workflow-save-draft-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="workflow-save-draft-content">
+              <div className="workflow-save-draft-icon">
+                <HardDrive className="h-[18px] w-[18px]" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <h2 id="save-template-draft-title" className="workflow-save-draft-title">Save this workflow?</h2>
+                <p className="workflow-save-draft-desc">
+                  You changed a workflow created from a template. Save it to the Workflow tab before closing.
+                </p>
+              </div>
+            </div>
+
+            <label className="workflow-save-draft-field">
+              <span>Workflow name</span>
+              <input
+                ref={saveDraftInputRef}
+                value={saveDraftName}
+                maxLength={120}
+                onChange={(event) => setSaveDraftName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && saveDraftName.trim()) saveTemplateDraftToWorkflows()
+                  if (event.key === 'Escape') setSaveDraftOpen(false)
+                }}
+                placeholder="Enter workflow name"
+              />
+            </label>
+
+            <div className="workflow-save-draft-actions">
+              <button type="button" className="workflow-save-draft-cancel" onClick={() => setSaveDraftOpen(false)}>
+                Continue editing
+              </button>
+              <button type="button" className="workflow-save-draft-discard" onClick={discardTemplateDraft}>
+                Don’t save
+              </button>
+              <button
+                type="button"
+                className="workflow-save-draft-save"
+                disabled={!saveDraftName.trim()}
+                onClick={saveTemplateDraftToWorkflows}
+              >
+                <HardDrive className="h-3.5 w-3.5" />
+                Save & close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   )
 }

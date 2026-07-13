@@ -4,12 +4,13 @@ import { AnimatePresence, motion } from 'framer-motion'
 import {
   Upload, Bookmark, Minus, Plus, Trash2,
   Image as ImageIcon, Video, ChevronDown, Download, RotateCcw,
-  Search, X, FileText, GripVertical, WandSparkles, Check, ChevronUp, LoaderCircle,
+  Search, X, FileText, GripVertical, WandSparkles, Check, ChevronUp, LoaderCircle, Copy, ArrowLeft,
   Globe2, AlignLeft, Palette, Sun, Camera, Clock3, Activity, RectangleHorizontal
 } from 'lucide-react'
 import { cn, usePersistedState } from '@/lib/utils'
-import { runPromptAssistant, type PromptAssistantMediaUpload, type PromptAssistantProvider } from '@/lib/promptAssistant'
+import { promptAssistantProviderLabel, runPromptAssistant, type PromptAssistantMediaUpload, type PromptAssistantProvider } from '@/lib/promptAssistant'
 import { PROMPT_ASSISTANT_STYLE_THUMBNAIL_URLS } from '@/lib/promptAssistantStyleThumbnails'
+import { useSettingsStore } from '@/stores/settingsStore'
 import { usePromptStore } from '@/stores/dataStore'
 
 // ─── Flow Model Constants ───────────────────────────────────────────────────────
@@ -288,6 +289,7 @@ interface PromptAssistantResult {
   text: string
   mediaType: GenMode
   aspectRatio: AspectRatio
+  multiPrompt: boolean
 }
 
 interface PromptAssistantReferenceImage {
@@ -311,6 +313,45 @@ function promptAssistantFileToUpload(file: File): Promise<PromptAssistantMediaUp
     reader.onerror = () => reject(new Error(`Could not read ${file.name || 'reference image'}.`))
     reader.readAsDataURL(file)
   })
+}
+
+function remapPromptAssistantReferenceTokensAfterRemoval(text: string, removedNumber: number): string {
+  return text
+    .replace(/@image(\d+)\b/gi, (token, rawNumber: string) => {
+      const number = Number(rawNumber)
+      if (number === removedNumber) return ''
+      if (number > removedNumber) return `@image${number - 1}`
+      return token.toLowerCase()
+    })
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\s+([,.;:!?])/g, '$1')
+    .trim()
+}
+
+function invalidPromptAssistantReferenceToken(text: string, availableCount: number): string | null {
+  for (const match of text.matchAll(/@image(\d+)\b/gi)) {
+    const number = Number(match[1])
+    if (!Number.isInteger(number) || number < 1 || number > availableCount) return match[0].toLowerCase()
+  }
+  return null
+}
+
+function parsePromptAssistantResult(text: string, expectedCount: number): string[] {
+  const normalized = text.replace(/\r\n?/g, '\n').trim()
+  if (!normalized) return []
+  if (expectedCount <= 1) {
+    return [normalized.replace(/^\s*\d+[.)]\s+/, '').trim()]
+  }
+
+  const numberedBlocks = normalized
+    .split(/\n+(?=\s*\d+[.)]\s+)/)
+    .map((block) => block.trim())
+    .filter(Boolean)
+  const blocks = numberedBlocks.length > 1
+    ? numberedBlocks
+    : normalized.split(/\n\s*\n+/).map((block) => block.trim()).filter(Boolean)
+
+  return blocks.map((block) => block.replace(/^\s*\d+[.)]\s+/, '').trim()).filter(Boolean)
 }
 
 const PROMPT_ASSISTANT_STYLE_CATEGORIES = ['Animation', 'Storytelling', 'Lifestyle', 'Education', 'Relax', 'Fitness'] as const
@@ -374,18 +415,56 @@ const PROMPT_ASSISTANT_STYLE_ADDONS: PromptAssistantStyleAddon[] = [
 ]
 
 const PROMPT_ASSISTANT_STYLE_THUMBNAILS_KEY = 'promptAssistantStyleThumbnailsV1'
-const PROMPT_ASSISTANT_STYLE_PROMPTS_KEY = 'promptAssistantStylePromptsV1'
+const PROMPT_ASSISTANT_STYLE_PROMPTS_KEY = 'promptAssistantStylePromptsV2'
+const PROMPT_ASSISTANT_STYLE_PROMPTS_LEGACY_KEY = 'promptAssistantStylePromptsV1'
+
+const PROMPT_ASSISTANT_STYLE_CONTENT: Record<string, string> = {
+  'doodle-dreams': 'Restyle the image as a whimsical hand-drawn doodle illustration. Use playful black ink linework, imperfect sketch contours, simple lavender accents, paper texture, tiny imaginative symbols, and a charming storybook mood. Keep the subject immediately recognizable and the composition uncluttered.',
+  '3d-family': 'Restyle the image as a premium family-friendly 3D animated film frame. Use rounded facial forms, expressive eyes, soft realistic materials, warm skin shading, carefully groomed hair, gentle depth of field, and inviting cinematic lighting. Preserve the subject’s identity, pose, and emotional expression.',
+  'kids-nursery': 'Restyle the image as a soft children’s nursery illustration with plush toy materials, rounded shapes, pastel blue and warm cream colors, friendly proportions, gentle diffuse light, and a safe comforting mood. Keep details simple, readable, and suitable for young children.',
+  'anime-manga': 'Restyle the image as a polished modern anime and manga key visual. Use elegant linework, expressive eyes, refined facial anatomy, layered hair strands, cinematic cel shading, controlled highlights, atmospheric depth, and a dynamic but balanced composition. Preserve identity, clothing, pose, and scene logic.',
+  'ghibli-watercolor': 'Restyle the image as a hand-painted Japanese animation background with delicate watercolor washes, softly textured brushwork, lush natural detail, warm sunlight, atmospheric perspective, and a quiet poetic mood. Keep the subject grounded in the environment with believable scale and lighting.',
+  'clay-story': 'Restyle the image as handcrafted stop-motion clay animation. Use visible sculpted clay texture, rounded handmade forms, subtle fingerprints, miniature set construction, warm practical lighting, shallow depth of field, and expressive character posing. Preserve the original subject and narrative action.',
+  'paper-cut': 'Restyle the image as layered paper-cut artwork. Build the scene from clean stacked paper shapes, tactile fibers, precise cut edges, soft cast shadows between layers, restrained colors, and clear foreground-to-background separation. Preserve the subject silhouette and essential composition.',
+  'cinematic-story': 'Restyle the image as a premium cinematic story frame. Use purposeful visual hierarchy, realistic production design, motivated lighting, controlled contrast, atmospheric depth, nuanced color grading, and a clear emotional focal point. Preserve identity and continuity while strengthening the scene’s narrative meaning.',
+  documentary: 'Restyle the image as authentic observational documentary photography. Use natural available light, believable environmental context, candid framing, realistic skin and material texture, restrained color grading, and subtle lens imperfections. Avoid glamour retouching or artificial posing; preserve factual visual details.',
+  storybook: 'Restyle the image as an illustrated storybook page with painterly shapes, expressive characters, warm narrative lighting, handcrafted texture, gentle color harmony, and clear visual storytelling. Preserve the subject and action while simplifying distracting background details.',
+  'fantasy-quest': 'Restyle the image as epic fantasy quest concept art. Use monumental environmental scale, rich world-building, dramatic atmospheric perspective, heroic lighting, weathered materials, cinematic depth, and a strong adventure focal point. Preserve the subject’s identity and pose while adapting wardrobe and surroundings only when requested.',
+  'editorial-fashion': 'Restyle the image as a high-end editorial fashion photograph. Use refined wardrobe texture, confident posing, sophisticated set design, sculpted studio lighting, realistic skin, subtle luxury color grading, and magazine-quality composition. Preserve facial identity, garment construction, body proportions, and natural anatomy.',
+  'product-studio': 'Restyle the image as premium studio product photography. Use a clean controlled backdrop, precise edge definition, realistic material response, softbox reflections, balanced contrast, commercial retouching, and intentional negative space. Preserve product geometry, colors, labels, and functional details exactly.',
+  'cozy-home': 'Restyle the image as warm aspirational home-lifestyle photography. Use natural wood and fabric textures, soft practical lamps, gentle window light, warm neutral colors, lived-in details, and an intimate comfortable composition. Preserve the subject and make the environment believable rather than staged.',
+  'travel-diary': 'Restyle the image as an authentic travel-diary photograph. Use vivid local atmosphere, natural daylight, environmental depth, candid composition, realistic weather and textures, restrained film color, and a strong sense of place. Preserve landmarks, cultural details, and the subject’s identity accurately.',
+  'learning-lab': 'Restyle the image as a friendly educational learning-lab visual. Use an immediately readable subject, organized supporting objects, bright but controlled colors, accurate real-world details, clean spatial hierarchy, and approachable lighting. Keep the composition informative without adding unnecessary text.',
+  'science-explainer': 'Restyle the image as a polished scientific explainer visual. Use accurate structures, clear scale relationships, luminous analytical accents, clean background separation, controlled depth, and a strong central concept. Preserve scientific correctness and avoid decorative elements that could imply false information.',
+  'history-story': 'Restyle the image as an immersive historical narrative scene. Use period-appropriate architecture, clothing, tools, materials, weathering, naturalistic light, and cinematic atmosphere. Preserve the original action while ensuring details are coherent with the intended time and place.',
+  infographic: 'Restyle the image as a clean three-dimensional infographic visual. Use simplified geometric forms, clear grouping, strong hierarchy, accessible color contrast, precise spacing, and an uncluttered neutral background. Communicate the core idea visually without inventing statistics or adding unreadable text.',
+  'dreamy-pastel': 'Restyle the image with a dreamy pastel aesthetic. Use soft lavender, blush, peach, and sky-blue transitions, diffused glowing light, gentle atmospheric haze, delicate textures, and a serene romantic composition. Preserve facial identity, anatomy, and the main subject’s clarity.',
+  'nature-calm': 'Restyle the image as tranquil nature-focused artwork. Use organic green and earth tones, soft natural light, subtle mist, realistic foliage and water texture, spacious composition, and quiet atmospheric depth. Preserve the subject while integrating it naturally into the environment.',
+  'lofi-night': 'Restyle the image as a cozy lo-fi night illustration. Use deep indigo and muted violet colors, warm desk or window light, gentle rain or city ambience when appropriate, soft grain, intimate framing, and a calm reflective mood. Preserve the subject’s activity and recognizable features.',
+  'soft-watercolor': 'Restyle the image as delicate traditional watercolor artwork. Use translucent pigment washes, softly bleeding edges, visible paper grain, restrained linework, subtle color blooms, and generous breathing space. Preserve the subject silhouette and essential details without over-rendering.',
+  'sports-energy': 'Restyle the image as a high-impact professional sports campaign visual. Use dynamic action framing, realistic motion cues, crisp directional stadium light, controlled sweat and fabric detail, powerful contrast, and energetic color grading. Preserve athlete identity, anatomy, equipment, and sport-specific technique.',
+  'yoga-flow': 'Restyle the image as premium wellness and yoga photography. Use calm natural light, balanced composition, realistic anatomy, breathable neutral colors, soft material texture, and a focused peaceful mood. Preserve the exact pose and ensure joints, hands, and body alignment remain physically credible.',
+  'running-campaign': 'Restyle the image as an aspirational running campaign photograph. Use authentic stride mechanics, dynamic environmental perspective, sunrise or golden-hour light, realistic performance clothing, subtle motion, and motivational cinematic grading. Preserve athlete identity, body proportions, footwear, and natural movement.',
+  'gym-editorial': 'Restyle the image as a sophisticated gym editorial photograph. Use sculpted but realistic directional light, dark premium training space, accurate anatomy, detailed performance fabrics, restrained contrast, and confident composition. Preserve identity and exercise form without exaggerating muscles or body proportions.',
+}
 
 function getDefaultStyleEditPrompt(addon: PromptAssistantStyleAddon): string {
-  const categoryDirection: Record<PromptAssistantStyleCategory, string> = {
-    Animation: 'Transform the image into a polished animated illustration with expressive shapes, clean silhouettes, rich color harmony, and production-quality character styling.',
-    Storytelling: 'Reframe the image as a cinematic storytelling scene with clear visual hierarchy, environmental depth, purposeful lighting, and an emotionally readable focal subject.',
-    Lifestyle: 'Restyle the image as premium lifestyle editorial photography with natural materials, refined composition, believable lighting, and tasteful commercial polish.',
-    Education: 'Turn the image into a clear educational visual with an immediately readable subject, organized composition, friendly color contrast, and accurate supporting details.',
-    Relax: 'Create a calm atmospheric interpretation with soft color transitions, gentle natural light, uncluttered composition, and soothing tactile detail.',
-    Fitness: 'Create a high-energy fitness visual with a strong athletic focal subject, dynamic composition, crisp directional light, and realistic motion or muscle detail.',
-  }
-  return `${categoryDirection[addon.category]} Apply the specific visual identity of “${addon.name}”. Preserve the original subject and core composition. No text, logo, watermark, border, badge, or UI element.`
+  return PROMPT_ASSISTANT_STYLE_CONTENT[addon.id]
+    || `Apply the complete visual identity of “${addon.name}” while preserving the original subject, anatomy, composition, and scene logic. Keep the result production-ready and free of logos, watermarks, borders, badges, and UI elements.`
+}
+
+function contextualizeStylePrompt(prompt: string, hasReferenceImages: boolean): string {
+  const normalized = prompt.trim()
+  if (hasReferenceImages) return normalized
+
+  return normalized
+    .replace(/^Restyle the image as (?:an?|the)\s+/i, 'Create an original ')
+    .replace(/^Transform the image into (?:an?|the)\s+/i, 'Create an original ')
+    .replace(/^Reframe the image as (?:an?|the)\s+/i, 'Create an original ')
+    .replace(/^Turn the image into (?:an?|the)\s+/i, 'Create an original ')
+    .replace(/(^|\s)Preserve [^.]*\.\s*/gi, '$1')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
 }
 
 const PromptAssistantStyleThumbnailImage: React.FC<{
@@ -567,6 +646,9 @@ function buildPromptAssistantInstruction(args: {
     `The intended aspect ratio is ${args.aspectRatio}.`,
     `Timing target: ${args.totalSeconds} seconds total, approximately ${args.secondsPerImage} seconds per image or shot.`,
     args.referenceImageCount > 0 ? `Use the ${args.referenceImageCount} attached reference image(s) in their displayed order.` : '',
+    args.referenceImageCount > 0
+      ? `Reference mapping is strict: ${Array.from({ length: args.referenceImageCount }, (_, index) => `@image${index + 1} = attached image ${index + 1}`).join(', ')}. Never swap or renumber these references.`
+      : '',
     args.sequential ? 'Arrange the output as a sequential storyboard with clear progression.' : '',
     args.keepConsistent ? 'Keep characters, wardrobe, locations, lighting logic, and visual identity consistent across prompts.' : '',
     args.numbered ? 'Number each prompt in sequence.' : 'Do not number the prompts.',
@@ -640,6 +722,12 @@ const PromptAssistantModal: React.FC<{
 }> = ({ initialIdea, initialMediaType, initialAspectRatio, referenceAliases, onClose, onApply }) => {
   const [idea, setIdea] = useState(initialIdea)
   const [assistantProvider, setAssistantProvider] = useState<PromptAssistantProvider>('chatgpt')
+  const promptAssistantMode = useSettingsStore((state) => state.promptAssistantMode || 'tab')
+  const apiProviderConfig = useSettingsStore((state) => state.apiProvider)
+  const apiProviderReady = Boolean(
+    apiProviderConfig?.endpoint?.trim()
+    && apiProviderConfig.model?.trim()
+  )
   const [mediaType, setMediaType] = useState<GenMode>(initialMediaType)
   const [count, setCount] = useState(1)
   const [language, setLanguage] = useState<PromptAssistantLanguage>('English')
@@ -660,6 +748,10 @@ const PromptAssistantModal: React.FC<{
   const [assistantAspectRatio, setAssistantAspectRatio] = useState<AspectRatio>(initialAspectRatio)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [isGeneratingPrompt, setIsGeneratingPrompt] = useState(false)
+  const [generatedPrompts, setGeneratedPrompts] = useState<string[]>([])
+  const [resultCopied, setResultCopied] = useState(false)
+  const [assistantImageMention, setAssistantImageMention] = useState<{ start: number; query: string } | null>(null)
+  const [assistantImageMentionIndex, setAssistantImageMentionIndex] = useState(0)
   const [assistantError, setAssistantError] = useState('')
   const [styleThumbnailOverrides, setStyleThumbnailOverrides] = useState<Record<string, string>>({})
   const [styleThumbnailManagerOpen, setStyleThumbnailManagerOpen] = useState(false)
@@ -673,12 +765,26 @@ const PromptAssistantModal: React.FC<{
   const styleThumbnailTargetRef = useRef<string | null>(null)
   const styleThumbnailManagerRef = useRef<HTMLDivElement>(null)
   const assistantReferenceInputRef = useRef<HTMLInputElement>(null)
+  const assistantIdeaTextareaRef = useRef<HTMLTextAreaElement>(null)
   const assistantReferenceImagesRef = useRef<PromptAssistantReferenceImage[]>([])
   const visibleStyleAddons = PROMPT_ASSISTANT_STYLE_ADDONS.filter((addon) => addon.category === styleCategory)
+  const promptAssistantReferenceAliases = assistantReferenceImages.length > 0
+    ? assistantReferenceImages.map((_, index) => `image${index + 1}`)
+    : referenceAliases
+  const assistantImageMentionOptions = assistantReferenceImages.map((image, index) => ({
+    image,
+    alias: `image${index + 1}`,
+  }))
+  const filteredAssistantImageMentionOptions = assistantImageMention
+    ? assistantImageMentionOptions.filter((option) => {
+        const query = assistantImageMention.query.toLowerCase()
+        return option.alias.includes(query) || option.image.file.name.toLowerCase().includes(query)
+      })
+    : []
 
   useEffect(() => {
     if (!chrome?.storage?.local) return
-    chrome.storage.local.get([PROMPT_ASSISTANT_STYLE_THUMBNAILS_KEY, PROMPT_ASSISTANT_STYLE_PROMPTS_KEY]).then((stored) => {
+    chrome.storage.local.get([PROMPT_ASSISTANT_STYLE_THUMBNAILS_KEY, PROMPT_ASSISTANT_STYLE_PROMPTS_KEY, PROMPT_ASSISTANT_STYLE_PROMPTS_LEGACY_KEY]).then((stored) => {
       const value = stored?.[PROMPT_ASSISTANT_STYLE_THUMBNAILS_KEY]
       if (value && typeof value === 'object' && !Array.isArray(value)) {
         setStyleThumbnailOverrides(value as Record<string, string>)
@@ -686,6 +792,26 @@ const PromptAssistantModal: React.FC<{
       const promptValue = stored?.[PROMPT_ASSISTANT_STYLE_PROMPTS_KEY]
       if (promptValue && typeof promptValue === 'object' && !Array.isArray(promptValue)) {
         setStylePromptOverrides(promptValue as Record<string, string>)
+      } else {
+        const legacyValue = stored?.[PROMPT_ASSISTANT_STYLE_PROMPTS_LEGACY_KEY]
+        if (legacyValue && typeof legacyValue === 'object' && !Array.isArray(legacyValue)) {
+          const oldGeneratedPrefixes = [
+            'Transform the image into a polished animated illustration',
+            'Reframe the image as a cinematic storytelling scene',
+            'Restyle the image as premium lifestyle editorial photography',
+            'Turn the image into a clear educational visual',
+            'Create a calm atmospheric interpretation',
+            'Create a high-energy fitness visual',
+          ]
+          const preservedCustomPrompts = Object.fromEntries(
+            Object.entries(legacyValue as Record<string, unknown>)
+              .filter(([, prompt]) => typeof prompt === 'string' && !oldGeneratedPrefixes.some((prefix) => prompt.startsWith(prefix)))
+          ) as Record<string, string>
+          setStylePromptOverrides(preservedCustomPrompts)
+          if (Object.keys(preservedCustomPrompts).length > 0) {
+            void chrome.storage.local.set({ [PROMPT_ASSISTANT_STYLE_PROMPTS_KEY]: preservedCustomPrompts })
+          }
+        }
       }
     }).catch(() => {})
   }, [])
@@ -693,6 +819,14 @@ const PromptAssistantModal: React.FC<{
   useEffect(() => {
     assistantReferenceImagesRef.current = assistantReferenceImages
   }, [assistantReferenceImages])
+
+  useEffect(() => {
+    setAssistantProvider((current) => {
+      if (promptAssistantMode === 'api') return 'api'
+      return current === 'api' ? 'chatgpt' : current
+    })
+    setAssistantError('')
+  }, [promptAssistantMode])
 
   useEffect(() => {
     if (!styleThumbnailManagerOpen) return
@@ -807,8 +941,12 @@ const PromptAssistantModal: React.FC<{
 
   const removeAssistantReferenceImage = (id: string) => {
     setAssistantReferenceImages((current) => {
+      const removedIndex = current.findIndex((image) => image.id === id)
       const removed = current.find((image) => image.id === id)
       if (removed) URL.revokeObjectURL(removed.previewUrl)
+      if (removedIndex >= 0) {
+        setIdea((currentIdea) => remapPromptAssistantReferenceTokensAfterRemoval(currentIdea, removedIndex + 1))
+      }
       return current.filter((image) => image.id !== id)
     })
   }
@@ -819,14 +957,99 @@ const PromptAssistantModal: React.FC<{
     setIdea((current) => `${current.trim()}${current.trim() ? ' ' : ''}${token}`)
   }
 
+  const updateAssistantImageMention = (value: string, cursor: number) => {
+    if (assistantReferenceImages.length === 0) {
+      setAssistantImageMention(null)
+      return
+    }
+    const beforeCursor = value.slice(0, cursor)
+    const match = beforeCursor.match(/@([a-zA-Z0-9]*)$/)
+    if (!match) {
+      setAssistantImageMention(null)
+      return
+    }
+    const start = beforeCursor.length - match[0].length
+    const preceding = start > 0 ? beforeCursor[start - 1] : ''
+    if (preceding && !/[\s([,{]/.test(preceding)) {
+      setAssistantImageMention(null)
+      return
+    }
+    setAssistantImageMention({ start, query: match[1] || '' })
+    setAssistantImageMentionIndex(0)
+  }
+
+  const insertAssistantImageMention = (alias: string) => {
+    const textarea = assistantIdeaTextareaRef.current
+    const currentCursor = textarea?.selectionStart ?? idea.length
+    const replaceStart = assistantImageMention?.start ?? currentCursor
+    const before = idea.slice(0, replaceStart)
+    const after = idea.slice(currentCursor)
+    const needsLeadingSpace = before.length > 0 && !/\s$/.test(before)
+    const needsTrailingSpace = after.length === 0 || !/^\s/.test(after)
+    const inserted = `${needsLeadingSpace ? ' ' : ''}@${alias}${needsTrailingSpace ? ' ' : ''}`
+    const nextIdea = before + inserted + after
+    const nextCursor = before.length + inserted.length
+
+    setIdea(nextIdea)
+    setAssistantImageMention(null)
+    setAssistantImageMentionIndex(0)
+    requestAnimationFrame(() => {
+      const input = assistantIdeaTextareaRef.current
+      if (!input) return
+      input.focus()
+      input.setSelectionRange(nextCursor, nextCursor)
+    })
+  }
+
+  const handleAssistantIdeaKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (assistantImageMention && filteredAssistantImageMentionOptions.length > 0) {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault()
+        setAssistantImageMentionIndex((current) => (current + 1) % filteredAssistantImageMentionOptions.length)
+        return
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault()
+        setAssistantImageMentionIndex((current) => (current - 1 + filteredAssistantImageMentionOptions.length) % filteredAssistantImageMentionOptions.length)
+        return
+      }
+      if (event.key === 'Enter' || event.key === 'Tab') {
+        event.preventDefault()
+        const selected = filteredAssistantImageMentionOptions[assistantImageMentionIndex] || filteredAssistantImageMentionOptions[0]
+        if (selected) insertAssistantImageMention(selected.alias)
+        return
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setAssistantImageMention(null)
+        return
+      }
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+      event.preventDefault()
+      void applyAssistant()
+    }
+  }
+
   const applyAssistant = async () => {
     if (!idea.trim() || isGeneratingPrompt) return
+    const availableReferenceCount = assistantReferenceImages.length > 0
+      ? assistantReferenceImages.length
+      : referenceAliases.length
+    const invalidReferenceToken = invalidPromptAssistantReferenceToken(idea, availableReferenceCount)
+    if (invalidReferenceToken) {
+      setAssistantError(`${invalidReferenceToken} does not have a matching uploaded reference image.`)
+      return
+    }
     setIsGeneratingPrompt(true)
     setAssistantError('')
     try {
       const selectedStyleAddon = PROMPT_ASSISTANT_STYLE_ADDONS.find((addon) => addon.name === style)
+      const selectedStylePrompt = selectedStyleAddon
+        ? stylePromptOverrides[selectedStyleAddon.id] || getDefaultStyleEditPrompt(selectedStyleAddon)
+        : ''
       const styleDirection = selectedStyleAddon
-        ? `${selectedStyleAddon.name}. ${stylePromptOverrides[selectedStyleAddon.id] || getDefaultStyleEditPrompt(selectedStyleAddon)}`
+        ? `${selectedStyleAddon.name}. ${contextualizeStylePrompt(selectedStylePrompt, assistantReferenceImages.length > 0)}`
         : style
       const instruction = buildPromptAssistantInstruction({
         idea,
@@ -849,13 +1072,40 @@ const PromptAssistantModal: React.FC<{
         negativePrompt,
         referenceImageCount: assistantReferenceImages.length,
       })
-      const mediaUploads = await Promise.all(assistantReferenceImages.map((image) => promptAssistantFileToUpload(image.file)))
+      const mediaUploads = await Promise.all(assistantReferenceImages.map(async (image, index) => {
+        const upload = await promptAssistantFileToUpload(image.file)
+        return { ...upload, name: `image${index + 1}-${upload.name}` }
+      }))
       const text = await runPromptAssistant(assistantProvider, instruction, 90000, mediaUploads)
-      onApply({ text, mediaType, aspectRatio: assistantAspectRatio })
+      const parsedPrompts = parsePromptAssistantResult(text, count)
+      if (parsedPrompts.length === 0) throw new Error('The AI provider returned an empty prompt result.')
+      setGeneratedPrompts(parsedPrompts)
+      setResultCopied(false)
     } catch (error) {
       setAssistantError(error instanceof Error ? error.message : 'Prompt Assistant failed. Please try again.')
     } finally {
       setIsGeneratingPrompt(false)
+    }
+  }
+
+  const sendGeneratedPromptsToPrompt = () => {
+    if (generatedPrompts.length === 0) return
+    onApply({
+      text: generatedPrompts.join('\n\n'),
+      mediaType,
+      aspectRatio: assistantAspectRatio,
+      multiPrompt: generatedPrompts.length > 1,
+    })
+  }
+
+  const copyGeneratedPrompts = async () => {
+    if (generatedPrompts.length === 0) return
+    try {
+      await navigator.clipboard.writeText(generatedPrompts.join('\n\n'))
+      setResultCopied(true)
+      window.setTimeout(() => setResultCopied(false), 1500)
+    } catch {
+      setAssistantError('Could not copy prompts to the clipboard.')
     }
   }
 
@@ -893,26 +1143,98 @@ const PromptAssistantModal: React.FC<{
           </button>
         </header>
 
+        {generatedPrompts.length > 0 && (
+          <div className="absolute inset-x-0 bottom-0 top-16 z-[75] flex flex-col bg-[#181818]">
+            <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-[12px] font-semibold text-white/75">Generated {generatedPrompts.length} {generatedPrompts.length === 1 ? 'prompt' : 'prompts'}</p>
+                  <p className="mt-0.5 text-[9px] text-white/28">Review the AI response before sending it to the Prompt field.</p>
+                </div>
+                {generatedPrompts.length > 1 && (
+                  <span className="rounded-lg border border-[#7C5CFF]/20 bg-[#7C5CFF]/10 px-2 py-1 text-[9px] font-semibold text-[#C8BCFF]">Multi Prompt</span>
+                )}
+              </div>
+
+              <div className="space-y-2">
+                {generatedPrompts.map((generatedPrompt, index) => (
+                  <div key={`${index}-${generatedPrompt.slice(0, 24)}`} className="flex gap-2.5 rounded-xl border border-white/[0.08] bg-[#1E1E1E] px-3 py-2.5">
+                    <span className="mt-0.5 shrink-0 text-[11px] font-bold text-[#8EBBFF]">{index + 1}.</span>
+                    <p className="whitespace-pre-wrap text-[11px] leading-[1.55] text-white/72">{generatedPrompt}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="shrink-0 border-t border-white/[0.07] bg-[#151515] p-4">
+              <button
+                type="button"
+                onClick={sendGeneratedPromptsToPrompt}
+                className="flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-[#7C5CFF] text-[12px] font-semibold text-white shadow-[0_9px_28px_rgba(124,92,255,0.28)] transition-colors hover:bg-[#896BFF]"
+              >
+                <WandSparkles className="h-4 w-4" />
+                Send to Prompt
+              </button>
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                <button type="button" onClick={() => void copyGeneratedPrompts()} className="flex h-9 items-center justify-center gap-2 rounded-xl border border-white/[0.08] bg-[#171717] text-[10px] font-medium text-white/45 hover:border-white/[0.14] hover:text-white/70">
+                  {resultCopied ? <Check className="h-3.5 w-3.5 text-emerald-300" /> : <Copy className="h-3.5 w-3.5" />}
+                  {resultCopied ? 'Copied' : 'Copy'}
+                </button>
+                <button type="button" onClick={() => { setGeneratedPrompts([]); setAssistantError('') }} className="flex h-9 items-center justify-center gap-2 rounded-xl border border-white/[0.08] bg-[#171717] text-[10px] font-medium text-white/45 hover:border-white/[0.14] hover:text-white/70">
+                  <ArrowLeft className="h-3.5 w-3.5" />
+                  Back
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
           <section>
             <div className="mb-2 flex items-end justify-between gap-4">
               <label className="text-[12px] font-semibold text-white/70">What do you want to create?</label>
               <span className="text-[10px] text-white/25">Idea, scene, script, or shot list</span>
             </div>
-            <div className="rounded-2xl border border-white/[0.08] bg-[#111111] p-1.5 transition-colors focus-within:border-[#7C5CFF]/55 focus-within:ring-2 focus-within:ring-[#7C5CFF]/10">
+            <div className="relative rounded-2xl border border-white/[0.08] bg-[#111111] p-1.5 transition-colors focus-within:border-[#7C5CFF]/55 focus-within:ring-2 focus-within:ring-[#7C5CFF]/10">
               <textarea
+                ref={assistantIdeaTextareaRef}
                 autoFocus
                 value={idea}
-                onChange={(event) => setIdea(event.target.value)}
-                onKeyDown={(event) => {
-                  if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
-                    event.preventDefault()
-                    void applyAssistant()
-                  }
+                onChange={(event) => {
+                  const value = event.target.value
+                  setIdea(value)
+                  updateAssistantImageMention(value, event.target.selectionStart ?? value.length)
                 }}
+                onKeyDown={handleAssistantIdeaKeyDown}
                 placeholder="Describe the result you want. Mention references with @image1, @image2..."
                 className="min-h-[138px] w-full resize-y bg-transparent px-3 py-2.5 text-[13px] leading-6 text-white/80 outline-none placeholder:text-white/22"
               />
+
+              {assistantImageMention && filteredAssistantImageMentionOptions.length > 0 && (
+                <div className="absolute bottom-10 left-3 z-50 max-h-40 w-64 overflow-y-auto rounded-xl border border-white/10 bg-[#1A1A1A] py-1 shadow-2xl">
+                  {filteredAssistantImageMentionOptions.map((option, optionIndex) => (
+                    <button
+                      key={option.image.id}
+                      type="button"
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => insertAssistantImageMention(option.alias)}
+                      className={cn(
+                        'flex w-full items-center gap-2.5 px-2.5 py-2 text-left transition-colors',
+                        optionIndex === assistantImageMentionIndex
+                          ? 'bg-[#7C5CFF]/15 text-[#C8BCFF]'
+                          : 'text-white/60 hover:bg-white/5 hover:text-white'
+                      )}
+                    >
+                      <img src={option.image.previewUrl} alt="" className="h-9 w-9 shrink-0 rounded-lg object-cover" />
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-[11px] font-semibold">@{option.alias}</span>
+                        <span className="mt-0.5 block truncate text-[9px] text-white/30">{option.image.file.name}</span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
               <div className="flex min-h-8 items-center gap-2 border-t border-white/[0.05] px-2 pt-1.5">
                 <WandSparkles className="h-3.5 w-3.5 text-[#8F76F5]" />
                 <span className="text-[10px] text-white/28">Assistant keeps your intent and adds visual direction.</span>
@@ -920,10 +1242,10 @@ const PromptAssistantModal: React.FC<{
             </div>
           </section>
 
-          {referenceAliases.length > 0 && (
+          {promptAssistantReferenceAliases.length > 0 && (
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <span className="text-[10px] font-medium text-white/30">References</span>
-              {referenceAliases.map((alias) => (
+              {promptAssistantReferenceAliases.map((alias) => (
                 <button
                   key={alias}
                   type="button"
@@ -939,36 +1261,54 @@ const PromptAssistantModal: React.FC<{
           <section className="mt-4 flex flex-col gap-2.5 rounded-2xl border border-white/[0.07] bg-[#141414] p-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <p className="text-[11px] font-semibold text-white/65">Generate with</p>
-              <p className="mt-0.5 text-[9px] text-white/25">Uses your signed-in provider tab and returns the finished text here.</p>
+              <p className="mt-0.5 text-[9px] text-white/25">
+                {promptAssistantMode === 'api'
+                  ? 'Uses the API configured in Settings and keeps provider tabs closed.'
+                  : 'Uses your signed-in ChatGPT or Gemini tab and returns the finished text here.'}
+              </p>
             </div>
             <div className="flex items-center gap-2">
-              {(['chatgpt', 'gemini'] as PromptAssistantProvider[]).map((provider) => {
+              {((promptAssistantMode === 'api'
+                ? ['api']
+                : ['chatgpt', 'gemini']) as PromptAssistantProvider[]
+              ).map((provider) => {
                 const selected = assistantProvider === provider
                 const running = selected && isGeneratingPrompt
+                const unavailable = provider === 'api' && !apiProviderReady
                 return (
                   <button
                     key={provider}
                     type="button"
                     aria-pressed={selected}
-                    disabled={isGeneratingPrompt}
+                    disabled={isGeneratingPrompt || unavailable}
+                    title={unavailable ? 'Configure and enable API Provider in Settings first.' : `Generate with ${promptAssistantProviderLabel(provider)}`}
                     onClick={() => {
                       setAssistantProvider(provider)
                       setAssistantError('')
                     }}
                     className={cn(
                       'flex h-8 items-center gap-2 rounded-lg border px-3 text-[11px] font-medium transition-all disabled:cursor-not-allowed',
-                      running
+                      unavailable
+                        ? 'cursor-not-allowed border-white/[0.06] bg-[#101010] text-white/18'
+                        : running
                         ? 'border-white/[0.1] bg-emerald-500/12 text-emerald-300'
                         : selected
                           ? 'border-[#7C5CFF]/45 bg-[#7C5CFF]/16 text-[#D0C6FF]'
                           : 'border-white/[0.09] bg-[#121212] text-white/45 hover:border-white/[0.16] hover:text-white/70'
                     )}
                   >
-                    <span className={cn(
-                      'h-2 w-2 rounded-full transition-colors',
-                      running ? 'bg-emerald-400' : selected ? 'bg-[#9F87FF]' : 'bg-white/30'
-                    )} />
-                    {provider === 'chatgpt' ? 'ChatGPT' : 'Gemini'}
+                    {running ? (
+                      <span className="relative flex size-2.5 shrink-0" aria-label="Provider running">
+                        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-300 opacity-55" />
+                        <span className="relative inline-flex size-2.5 rounded-full bg-emerald-300 shadow-[0_0_12px_rgba(110,231,183,.8)]" />
+                      </span>
+                    ) : (
+                      <span className={cn(
+                        'h-2 w-2 shrink-0 rounded-full transition-colors',
+                        selected ? 'bg-[#9F87FF]' : 'bg-white/30'
+                      )} />
+                    )}
+                    {promptAssistantProviderLabel(provider)}
                   </button>
                 )
               })}
@@ -1052,8 +1392,8 @@ const PromptAssistantModal: React.FC<{
                       ? 'border-[#7C5CFF] ring-1 ring-[#7C5CFF]/30'
                       : 'border-white/[0.1] group-hover:border-white/25 group-hover:text-white/55'
                   )}>
-                    <span className="relative h-7 w-7 rounded-full border-2 border-current">
-                      <span className="absolute left-1/2 top-1/2 h-0.5 w-8 -translate-x-1/2 -translate-y-1/2 -rotate-45 rounded-full bg-current" />
+                    <span className="relative h-5 w-5 rounded-full border-[1.5px] border-current">
+                      <span className="absolute left-1/2 top-1/2 h-[1.5px] w-6 -translate-x-1/2 -translate-y-1/2 -rotate-45 rounded-full bg-current" />
                     </span>
                   </span>
                   <span className="block truncate px-1 pt-1.5 text-center text-[9px] font-semibold text-white/55">None</span>
@@ -1089,18 +1429,19 @@ const PromptAssistantModal: React.FC<{
             </div>
           </section>
 
-          <section className="mt-5 rounded-2xl border border-white/[0.07] bg-[#141414] p-4">
-            <div className="w-full sm:w-1/2">
-              <span className={advancedLabelClass}><AlignLeft className="h-3 w-3" />Count</span>
-              <div className="flex h-10 w-full items-center rounded-xl border border-white/[0.08] bg-[#121212] p-1 transition-colors focus-within:border-[#7C5CFF]/70 focus-within:ring-2 focus-within:ring-[#7C5CFF]/10">
+          <section className="mt-5 rounded-2xl border border-white/[0.07] bg-[#141414] p-3">
+            <div className="flex min-w-0 items-center gap-3">
+              <div className="flex shrink-0 items-center gap-2">
+                <span className="flex items-center gap-1.5 whitespace-nowrap text-[9px] font-medium text-white/35"><AlignLeft className="h-3 w-3" />Count</span>
+                <div className="flex h-8 w-[112px] items-center rounded-lg border border-white/[0.08] bg-[#121212] p-0.5 transition-colors focus-within:border-[#7C5CFF]/70 focus-within:ring-2 focus-within:ring-[#7C5CFF]/10">
                 <button
                   type="button"
                   onClick={() => setCount((current) => Math.max(1, current - 1))}
                   disabled={count <= 1}
-                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-white/45 transition-colors hover:bg-white/[0.06] hover:text-white disabled:cursor-not-allowed disabled:text-white/12 disabled:hover:bg-transparent"
+                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-white/45 transition-colors hover:bg-white/[0.06] hover:text-white disabled:cursor-not-allowed disabled:text-white/12 disabled:hover:bg-transparent"
                   aria-label="Decrease prompt count"
                 >
-                  <Minus className="h-3.5 w-3.5" />
+                  <Minus className="h-3 w-3" />
                 </button>
                 <input
                   type="number"
@@ -1108,27 +1449,23 @@ const PromptAssistantModal: React.FC<{
                   max="10"
                   value={count}
                   onChange={(event) => setCount(Math.max(1, Math.min(10, Number(event.target.value) || 1)))}
-                  className="h-full min-w-0 flex-1 appearance-none bg-transparent text-center text-[12px] font-semibold text-white/75 outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                  className="h-full min-w-0 flex-1 appearance-none bg-transparent text-center text-[11px] font-semibold text-white/75 outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
                   aria-label="Number of prompts to return"
                 />
                 <button
                   type="button"
                   onClick={() => setCount((current) => Math.min(10, current + 1))}
                   disabled={count >= 10}
-                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-white/45 transition-colors hover:bg-white/[0.06] hover:text-white disabled:cursor-not-allowed disabled:text-white/12 disabled:hover:bg-transparent"
+                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-white/45 transition-colors hover:bg-white/[0.06] hover:text-white disabled:cursor-not-allowed disabled:text-white/12 disabled:hover:bg-transparent"
                   aria-label="Increase prompt count"
                 >
-                  <Plus className="h-3.5 w-3.5" />
+                  <Plus className="h-3 w-3" />
                 </button>
+                </div>
               </div>
-              <p className="mt-1 text-[9px] text-white/24">Number of prompts ChatGPT or Gemini must return.</p>
-            </div>
 
-            <div className="mt-4">
-              <div className="mb-2 flex items-center justify-between">
-                <span className={advancedLabelClass}><ImageIcon className="h-3 w-3" />Reference images</span>
-                <span className="text-[9px] font-medium text-white/28">{assistantReferenceImages.length}/5</span>
-              </div>
+              <div className="h-5 w-px shrink-0 bg-white/[0.07]" />
+
               <input
                 ref={assistantReferenceInputRef}
                 type="file"
@@ -1140,6 +1477,7 @@ const PromptAssistantModal: React.FC<{
                   event.target.value = ''
                 }}
               />
+              <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[9px] font-medium text-white/35"><ImageIcon className="h-3 w-3" />Reference images</span>
               <button
                 type="button"
                 onClick={() => assistantReferenceInputRef.current?.click()}
@@ -1162,7 +1500,7 @@ const PromptAssistantModal: React.FC<{
                 }}
                 disabled={assistantReferenceImages.length >= 5}
                 className={cn(
-                  'flex h-10 w-full items-center justify-center gap-2 rounded-xl border bg-[#121212] text-[10px] font-medium transition-colors',
+                  'flex h-8 min-w-0 flex-1 items-center justify-center gap-2 rounded-lg border bg-[#121212] text-[9px] font-medium transition-colors',
                   referenceDropActive
                     ? 'border-[#7C5CFF]/70 bg-[#7C5CFF]/10 text-[#D0C6FF]'
                     : 'border-white/[0.09] text-white/35 hover:border-white/[0.16] hover:text-white/60',
@@ -1172,26 +1510,27 @@ const PromptAssistantModal: React.FC<{
                 <Upload className="h-3.5 w-3.5" />
                 Select / Drag image
               </button>
-
-              {assistantReferenceImages.length > 0 && (
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {assistantReferenceImages.map((image, index) => (
-                    <div key={image.id} className="group relative h-12 w-12 overflow-visible rounded-lg border border-white/[0.1] bg-[#101010]">
-                      <img src={image.previewUrl} alt={`Reference ${index + 1}`} className="h-full w-full rounded-[7px] object-cover" />
-                      <span className="absolute bottom-0.5 left-0.5 rounded bg-black/70 px-1 text-[8px] font-semibold text-white/75">{index + 1}</span>
-                      <button
-                        type="button"
-                        onClick={() => removeAssistantReferenceImage(image.id)}
-                        className="absolute -right-1.5 -top-1.5 flex h-4 w-4 items-center justify-center rounded-full border border-[#141414] bg-[#282828] text-white/60 opacity-0 transition-all hover:bg-red-500 hover:text-white group-hover:opacity-100"
-                        title="Remove reference"
-                      >
-                        <X className="h-2 w-2" />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
+              <span className="shrink-0 text-[9px] font-semibold text-white/30">{assistantReferenceImages.length}/5</span>
             </div>
+
+            {assistantReferenceImages.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-2 border-t border-white/[0.06] pt-3">
+                {assistantReferenceImages.map((image, index) => (
+                  <div key={image.id} className="group relative h-12 w-12 overflow-visible rounded-lg border border-white/[0.1] bg-[#101010]">
+                    <img src={image.previewUrl} alt={`Reference ${index + 1}`} className="h-full w-full rounded-[7px] object-cover" />
+                    <span className="absolute bottom-0.5 left-0.5 rounded bg-black/75 px-1 text-[8px] font-semibold text-[#C9BEFF]">@image{index + 1}</span>
+                    <button
+                      type="button"
+                      onClick={() => removeAssistantReferenceImage(image.id)}
+                      className="absolute -right-1.5 -top-1.5 flex h-4 w-4 items-center justify-center rounded-full border border-[#141414] bg-[#282828] text-white/60 opacity-0 transition-all hover:bg-red-500 hover:text-white group-hover:opacity-100"
+                      title="Remove reference"
+                    >
+                      <X className="h-2 w-2" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
           </section>
 
           <button
@@ -1389,7 +1728,7 @@ const PromptAssistantModal: React.FC<{
 
         <footer className="flex shrink-0 items-center gap-3 border-t border-white/[0.07] bg-[#151515] px-5 py-3.5">
           <div className="hidden min-w-0 flex-1 sm:block">
-            <p className="truncate text-[11px] font-medium text-white/45">{count} {count === 1 ? 'prompt' : 'prompts'} · {mediaType} · {assistantAspectRatio} · {assistantProvider === 'chatgpt' ? 'ChatGPT' : 'Gemini'}</p>
+            <p className="truncate text-[11px] font-medium text-white/45">{count} {count === 1 ? 'prompt' : 'prompts'} · {mediaType} · {assistantAspectRatio} · {promptAssistantProviderLabel(assistantProvider)}</p>
             <p className="mt-0.5 text-[9px] text-white/22">Your current prompt is replaced only after the AI response is complete.</p>
           </div>
           <button type="button" onClick={onClose} className="h-10 rounded-xl px-4 text-[12px] font-semibold text-white/40 transition-colors hover:bg-white/[0.05] hover:text-white/75">
@@ -1398,16 +1737,20 @@ const PromptAssistantModal: React.FC<{
           <button
             type="button"
             onClick={applyAssistant}
-            disabled={!idea.trim() || isGeneratingPrompt}
+            disabled={!idea.trim() || isGeneratingPrompt || (assistantProvider === 'api' && !apiProviderReady)}
             className={cn(
               'flex h-10 min-w-[170px] items-center justify-center gap-2 rounded-xl px-5 text-[12px] font-semibold transition-all',
-              idea.trim() && !isGeneratingPrompt
+              idea.trim() && !isGeneratingPrompt && (assistantProvider !== 'api' || apiProviderReady)
                 ? 'bg-[#7C5CFF] text-white shadow-[0_8px_24px_rgba(124,92,255,0.28)] hover:bg-[#8768FF] active:translate-y-px'
                 : 'cursor-not-allowed bg-white/5 text-white/20'
             )}
           >
             {isGeneratingPrompt ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <WandSparkles className="h-4 w-4" />}
-            {isGeneratingPrompt ? `Waiting for ${assistantProvider === 'chatgpt' ? 'ChatGPT' : 'Gemini'}...` : 'Generate prompts'}
+            {assistantProvider === 'api' && !apiProviderReady
+              ? 'Configure API in Settings'
+              : isGeneratingPrompt
+                ? `Waiting for ${promptAssistantProviderLabel(assistantProvider)}...`
+                : 'Generate prompts'}
           </button>
         </footer>
       </motion.div>
@@ -2823,10 +3166,10 @@ const handleGenerate = useCallback(async () => {
 
             {/* Quantity — Google Flow only */}
             {activeProvider === 'flow' && (
-              <div className="flex items-center gap-0.5 bg-[#141414] rounded-lg border border-white/5 px-1">
+              <div className="flex h-[30px] items-center gap-0.5 rounded-lg border border-white/5 bg-[#141414] px-1">
                 <button
                   onClick={() => setQuantity((q) => Math.max(1, q - 1))}
-                  className="w-6 h-6 flex items-center justify-center rounded text-white/40 hover:text-white hover:bg-white/5 transition-colors text-sm font-medium"
+                  className="flex h-7 w-6 items-center justify-center rounded text-sm font-medium text-white/40 transition-colors hover:bg-white/5 hover:text-white"
                 >
                   -
                 </button>
@@ -2840,7 +3183,7 @@ const handleGenerate = useCallback(async () => {
                 />
                 <button
                   onClick={() => setQuantity((q) => Math.min(4, q + 1))}
-                  className="w-6 h-6 flex items-center justify-center rounded text-white/40 hover:text-white hover:bg-white/5 transition-colors text-sm font-medium"
+                  className="flex h-7 w-6 items-center justify-center rounded text-sm font-medium text-white/40 transition-colors hover:bg-white/5 hover:text-white"
                 >
                   +
                 </button>
@@ -3215,6 +3558,7 @@ const handleGenerate = useCallback(async () => {
               setPrompt(result.text)
               handleModeChange(result.mediaType)
               setAspectRatio(result.aspectRatio)
+              if (activeProvider === 'flow') setMultiPrompt(result.multiPrompt)
               setPromptAssistantOpen(false)
             }}
           />

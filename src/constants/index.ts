@@ -42,6 +42,13 @@ export const DEFAULT_SETTINGS = {
   autoDownload: true,
   downloadFormat: 'png' as const,
   defaultProvider: 'chatgpt' as const,
+  promptAssistantMode: 'tab' as const,
+  apiProvider: {
+    enabled: false,
+    endpoint: 'http://localhost:20128/v1',
+    apiKey: '',
+    model: 'gpt-4o-mini'
+  },
   maxRetries: 3,
   retryDelay: 2000,
   timeoutDuration: 300000,

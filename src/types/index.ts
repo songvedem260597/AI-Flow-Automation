@@ -184,6 +184,8 @@ export interface Workflow {
   createdAt: number
   updatedAt: number
   isTemplate?: boolean
+  isTemplateDraft?: boolean
+  sourceTemplateId?: string
   tags?: string[]
 }
 
@@ -254,6 +256,13 @@ export interface AppSettings {
   defaultProvider: AIProvider
   defaultModel?: string
   defaultAspectRatio?: string
+  promptAssistantMode: 'tab' | 'api'
+  apiProvider: {
+    enabled: boolean
+    endpoint: string
+    apiKey: string
+    model: string
+  }
   maxRetries: number
   retryDelay: number
   timeoutDuration: number

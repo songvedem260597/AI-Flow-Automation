@@ -113,6 +113,7 @@ input::placeholder, textarea::placeholder {
 .ai-drawflow-canvas .drawflow {
   min-width: 2400px;
   min-height: 1600px;
+  transform-origin: 0 0;
 }
 
 .ai-drawflow-canvas .drawflow .drawflow-node {
@@ -876,7 +877,19 @@ input::placeholder, textarea::placeholder {
 
 .df-node[data-node-type="generate"] .df-node-body {
   min-height: 0;
-  padding-bottom: 0;
+  padding: 8px 10px 10px;
+}
+
+/* Generate nodes use the outer Drawflow shell as their only frame.
+   Remove the duplicate card border and structural dividers inside it. */
+.df-node[data-node-type="generate"],
+.df-node[data-node-type="generate"] .df-node-header,
+.df-node[data-node-type="generate"] .df-node-generate-preview-wrap,
+.df-node[data-node-type="generate"] .df-node-output-preview,
+.df-node[data-node-type="generate"] .df-node-preview {
+  border: 0;
+  outline: 0;
+  box-shadow: none;
 }
 
 .df-node-preview-wrap {
@@ -886,9 +899,10 @@ input::placeholder, textarea::placeholder {
 }
 
 .df-node-generate-preview-wrap {
+  width: 100%;
+  margin: 0;
   overflow: hidden;
-  border-bottom-left-radius: 8px;
-  border-bottom-right-radius: 8px;
+  border-radius: 8px;
 }
 
 .df-node-generate-preview-wrap::before {
@@ -1655,6 +1669,16 @@ button.df-node-tag {
   animation: aiNodeFailedGlow 1.4s ease-in-out infinite !important;
 }
 
+/* The outer Drawflow shell already carries execution feedback. Avoid a
+   second animated ring inside Generate nodes. */
+.ai-drawflow-canvas .drawflow .df-node[data-node-type="generate"].ai-node-running,
+.ai-drawflow-canvas .drawflow .df-node[data-node-type="generate"].ai-node-completed,
+.ai-drawflow-canvas .drawflow .df-node[data-node-type="generate"].ai-node-failed {
+  animation: none !important;
+  border: 0 !important;
+  box-shadow: none !important;
+}
+
 /* ── Edge flow animation ────────────────────────────────────────── */
 
 @keyframes aiEdgeFlow {
@@ -2068,6 +2092,12 @@ button.df-node-tag {
   font-weight: 500;
   line-height: 1;
   color: rgba(255, 255, 255, 0.45);
+}
+
+button.df-node-pill-trigger {
+  font-size: 12px;
+  line-height: 16px;
+  color: rgba(255, 255, 255, 0.78);
 }
 
 .df-node-tag-mode-image {
@@ -2609,6 +2639,258 @@ button.df-node-tag {
 
 .workflow-confirm-delete:active {
   transform: translateY(1px);
+}
+
+/* Template delete dialog: keep destructive intent clear without making the
+ * entire surface visually aggressive. */
+.workflow-template-delete-modal {
+  width: min(520px, calc(100vw - 32px));
+  padding: 0;
+  display: block;
+  overflow: hidden;
+  border-color: rgba(255, 255, 255, 0.1);
+  border-radius: 16px;
+  background: #191919;
+  box-shadow: 0 24px 72px rgba(0, 0, 0, 0.68), 0 0 0 1px rgba(255, 255, 255, 0.02) inset;
+}
+
+.workflow-template-delete-content {
+  display: flex;
+  align-items: flex-start;
+  gap: 13px;
+  padding: 18px 18px 16px;
+}
+
+.workflow-template-delete-modal .workflow-confirm-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 11px;
+  background: rgba(239, 68, 68, 0.1);
+  border-color: rgba(248, 113, 113, 0.24);
+  color: #fb7185;
+}
+
+.workflow-template-delete-modal .workflow-confirm-body {
+  flex: 1;
+  gap: 4px;
+  padding-top: 1px;
+}
+
+.workflow-template-delete-modal .workflow-confirm-title {
+  font-size: 13px;
+  line-height: 1.35;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.workflow-template-delete-modal .workflow-confirm-desc {
+  color: rgba(255, 255, 255, 0.42);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.workflow-confirm-target {
+  max-width: 100%;
+  margin-top: 7px;
+  padding: 8px 10px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.025);
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workflow-template-delete-modal > .workflow-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 11px 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.065);
+  background: #161616;
+}
+
+.workflow-template-delete-modal .workflow-confirm-cancel,
+.workflow-template-delete-modal .workflow-confirm-delete {
+  height: 34px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.workflow-template-delete-modal .workflow-confirm-cancel {
+  padding: 0 14px;
+  border-color: rgba(255, 255, 255, 0.09);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.workflow-template-delete-modal .workflow-confirm-delete {
+  padding: 0 14px;
+  border-color: #dc3545;
+  background: #dc3545;
+  color: #fff;
+  box-shadow: 0 7px 20px rgba(220, 53, 69, 0.2);
+}
+
+.workflow-template-delete-modal .workflow-confirm-delete:hover {
+  border-color: #e04454;
+  background: #e04454;
+}
+
+.workflow-template-delete-modal .workflow-confirm-delete:focus-visible {
+  box-shadow: 0 0 0 2px rgba(220, 53, 69, 0.28);
+}
+
+.workflow-save-draft-modal {
+  width: min(440px, calc(100vw - 32px));
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 16px;
+  background: #191919;
+  color: var(--text-primary);
+  box-shadow: 0 24px 72px rgba(0, 0, 0, 0.68), 0 0 0 1px rgba(255, 255, 255, 0.02) inset;
+  animation: workflow-confirm-pop 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.workflow-save-draft-content {
+  display: flex;
+  align-items: flex-start;
+  gap: 13px;
+  padding: 18px 18px 12px;
+}
+
+.workflow-save-draft-icon {
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(124, 92, 255, 0.25);
+  border-radius: 11px;
+  background: rgba(124, 92, 255, 0.11);
+  color: #b8a8ff;
+}
+
+.workflow-save-draft-title {
+  margin: 1px 0 0;
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+}
+
+.workflow-save-draft-desc {
+  margin: 4px 0 0;
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.workflow-save-draft-field {
+  display: block;
+  padding: 0 18px 18px;
+}
+
+.workflow-save-draft-field > span {
+  display: block;
+  margin-bottom: 6px;
+  color: rgba(255, 255, 255, 0.36);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.workflow-save-draft-field input {
+  width: 100%;
+  height: 38px;
+  padding: 0 12px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 10px;
+  background: #111;
+  color: rgba(255, 255, 255, 0.78);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.workflow-save-draft-field input:focus {
+  border-color: rgba(124, 92, 255, 0.7);
+  box-shadow: 0 0 0 2px rgba(124, 92, 255, 0.12);
+}
+
+.workflow-save-draft-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 11px 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.065);
+  background: #161616;
+}
+
+.workflow-save-draft-actions button {
+  height: 34px;
+  padding: 0 13px;
+  border-radius: 10px;
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+}
+
+.workflow-save-draft-cancel {
+  margin-right: auto;
+  border: 0;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.38);
+}
+
+.workflow-save-draft-cancel:hover {
+  background: rgba(255, 255, 255, 0.045);
+  color: rgba(255, 255, 255, 0.68);
+}
+
+.workflow-save-draft-discard {
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.workflow-save-draft-discard:hover {
+  border-color: rgba(248, 113, 113, 0.25);
+  background: rgba(239, 68, 68, 0.08);
+  color: #fda4af;
+}
+
+.workflow-save-draft-save {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #7c5cff;
+  background: #7c5cff;
+  color: #fff;
+  box-shadow: 0 7px 20px rgba(124, 92, 255, 0.22);
+}
+
+.workflow-save-draft-save:hover {
+  border-color: #896bff;
+  background: #896bff;
+}
+
+.workflow-save-draft-save:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
 }
 
 @keyframes workflow-confirm-fade {

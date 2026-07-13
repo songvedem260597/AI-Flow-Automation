@@ -493,7 +493,8 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
       return showNotification(message.payload as { title: string; message: string; type?: string })
 
     case 'OPEN_WORKFLOW_EDITOR_WINDOW':
-      return openWorkflowEditorWindow(message.payload as { workflowId?: string } | undefined)
+      // owner: shared — opens the workflow editor and preserves template-draft origin.
+      return openWorkflowEditorWindow(message.payload as { workflowId?: string; fromTemplate?: boolean } | undefined)
 
     case 'REGISTER_WORKFLOW_EDITOR_TAB': {
       const tab = sender.tab
@@ -678,10 +679,13 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
 }
 
 async function openWorkflowEditorWindow(
-  payload?: { workflowId?: string }
+  payload?: { workflowId?: string; fromTemplate?: boolean }
 ): Promise<{ success: boolean; windowId?: number; error?: string }> {
   const workflowId = payload?.workflowId || ''
-  const query = workflowId ? `?workflowId=${encodeURIComponent(workflowId)}` : ''
+  const queryParams = new URLSearchParams()
+  if (workflowId) queryParams.set('workflowId', workflowId)
+  if (payload?.fromTemplate) queryParams.set('fromTemplate', '1')
+  const query = queryParams.size > 0 ? `?${queryParams.toString()}` : ''
   const url = chrome.runtime.getURL(`tabs/workflow-editor.html${query}`)
 
   const focusExisting = async (windowId: number) => {
@@ -1724,16 +1728,27 @@ function resolveChatGPTContentScriptFile(): string | null {
   return null
 }
 
+// owner: chatgpt — validates only the tab selected for RUN_CHATGPT_PROMPT.
 async function ensureChatGPTContentReady(tabId: number): Promise<void> {
   var tab = await chrome.tabs.get(tabId)
-  if (!tab || !tab.url || !tab.url.startsWith('https://chatgpt.com/')) {
-    throw new Error('ChatGPT tab url mismatch: ' + (tab && tab.url ? tab.url : '(no url)'))
+  var tabUrl = String(tab?.url || tab?.pendingUrl || '')
+  if (tabUrl && !tabUrl.startsWith('https://chatgpt.com/')) {
+    throw new Error('ChatGPT tab url mismatch: ' + tabUrl)
   }
 
   console.log('[ChatGPT][Background] ensuring content script tabId=' + tabId + ' status=' + tab.status)
 
   if (tab.status !== 'complete') {
     await waitForTabComplete(tabId, 30000)
+  }
+
+  // A newly-created Chrome tab commonly exposes only `pendingUrl` while
+  // loading. Validate the final URL after the wait instead of rejecting the
+  // correct ChatGPT tab as `(no url)` before navigation has committed.
+  tab = await chrome.tabs.get(tabId)
+  tabUrl = String(tab?.url || tab?.pendingUrl || '')
+  if (!tabUrl.startsWith('https://chatgpt.com/')) {
+    throw new Error('ChatGPT tab url mismatch: ' + (tabUrl || '(no url)'))
   }
 
   for (var prePingI = 0; prePingI < 3; prePingI++) {

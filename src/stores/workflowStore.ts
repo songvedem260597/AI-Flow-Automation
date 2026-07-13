@@ -13,6 +13,12 @@ const HISTORY_LIMIT = 80
 
 const cloneWorkflow = (workflow: Workflow): Workflow => JSON.parse(JSON.stringify(workflow)) as Workflow
 
+const capitalizeWorkflowName = (name: string): string => {
+  const firstCharacterIndex = name.search(/\S/)
+  if (firstCharacterIndex === -1) return name
+  return `${name.slice(0, firstCharacterIndex)}${name.charAt(firstCharacterIndex).toLocaleUpperCase()}${name.slice(firstCharacterIndex + 1)}`
+}
+
 const workflowSnapshotKey = (workflow: Workflow): string =>
   JSON.stringify({
     id: workflow.id,
@@ -591,8 +597,13 @@ const sanitizePersistValue = (value: unknown): unknown => {
   return out
 }
 
-const sanitizeWorkflowForPersist = (workflow: Workflow): Workflow =>
-  sanitizePersistValue(workflow) as Workflow
+const sanitizeWorkflowForPersist = (workflow: Workflow): Workflow => {
+  const sanitized = sanitizePersistValue(workflow) as Workflow
+  return {
+    ...sanitized,
+    name: capitalizeWorkflowName(String(sanitized.name || 'Untitled Workflow'))
+  }
+}
 
 const sanitizeWorkflowsForPersist = (workflows: Workflow[] = []): Workflow[] =>
   workflows.map(sanitizeWorkflowForPersist)
@@ -720,7 +731,7 @@ export const useWorkflowStore = create<WorkflowState>()(
       createWorkflow: (name) => {
         const workflow: Workflow = {
           id: uuid(),
-          name: name || 'Untitled Workflow',
+          name: capitalizeWorkflowName(name || 'Untitled Workflow'),
           nodes: [],
           edges: [],
           createdAt: Date.now(),
@@ -736,10 +747,13 @@ export const useWorkflowStore = create<WorkflowState>()(
       },
 
       updateWorkflow: (id, updates) => {
+        const normalizedUpdates = typeof updates.name === 'string'
+          ? { ...updates, name: capitalizeWorkflowName(updates.name) }
+          : updates
         set((state) => ({
           history: pushWorkflowHistory(state, id),
           workflows: state.workflows.map((w) =>
-            w.id === id ? { ...w, ...updates, updatedAt: Date.now() } : w
+            w.id === id ? { ...w, ...normalizedUpdates, updatedAt: Date.now() } : w
           ),
           isDirty: true
         }))
@@ -765,7 +779,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         const duplicate: Workflow = {
           ...JSON.parse(JSON.stringify(wf)),
           id: uuid(),
-          name: `${wf.name} (Copy)`,
+          name: capitalizeWorkflowName(`${wf.name} (Copy)`),
           createdAt: Date.now(),
           updatedAt: Date.now()
         }
@@ -1102,7 +1116,11 @@ export const useWorkflowStore = create<WorkflowState>()(
       importWorkflow: (workflow) => {
         set((state) => {
           const idx = state.workflows.findIndex((w) => w.id === workflow.id)
-          const updated = { ...workflow, updatedAt: Date.now() }
+          const updated = {
+            ...workflow,
+            name: capitalizeWorkflowName(String(workflow.name || 'Untitled Workflow')),
+            updatedAt: Date.now()
+          }
           return {
             workflows: idx !== -1
               ? state.workflows.map((w, i) => (i === idx ? updated : w))
