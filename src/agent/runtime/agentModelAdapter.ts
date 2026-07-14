@@ -16,6 +16,7 @@ export interface PromptAssistantAgentAdapterOptions {
   provider: PromptAssistantProvider
   apiModel?: string
   mediaUploads?: PromptAssistantMediaUpload[]
+  signal?: AbortSignal
 }
 
 const safeJson = (value: unknown): string => JSON.stringify(sanitizeAgentValue(value), null, 2)
@@ -97,7 +98,7 @@ export class PromptAssistantAgentModelAdapter implements AgentModelAdapter {
       buildTurnPrompt(input),
       120_000,
       this.options.mediaUploads || [],
-      { focus: false, apiModel: this.options.apiModel },
+      { focus: false, apiModel: this.options.apiModel, signal: this.options.signal },
     )
     return parseAgentTurnResult(rawText)
   }
@@ -108,7 +109,7 @@ export class PromptAssistantAgentModelAdapter implements AgentModelAdapter {
       buildTurnPrompt(input, input.toolResults),
       120_000,
       [],
-      { focus: false, apiModel: this.options.apiModel },
+      { focus: false, apiModel: this.options.apiModel, signal: this.options.signal },
     )
     return parseAgentTurnResult(rawText)
   }

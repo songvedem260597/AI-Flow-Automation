@@ -296,13 +296,25 @@ async function requestOpenAICompatiblePrompt(
   instruction: string,
   timeoutMs: number,
   mediaUploads: PromptAssistantMediaUpload[],
+  externalSignal?: AbortSignal,
 ): Promise<string> {
   const endpoint = normalizeApiUrl(config.endpoint, 'chat/completions')
   if (!endpoint) throw new Error('API endpoint is not configured. Open Settings and add an OpenAI-compatible endpoint.')
   if (!config.model.trim()) throw new Error('API model is not configured. Open Settings and enter a model name.')
+  if (externalSignal?.aborted) {
+    const error = new Error('AI request stopped by the user.')
+    error.name = 'AbortError'
+    throw error
+  }
 
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), Math.max(5000, timeoutMs))
+  let timedOut = false
+  const onExternalAbort = () => controller.abort()
+  externalSignal?.addEventListener('abort', onExternalAbort, { once: true })
+  const timer = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, Math.max(5000, timeoutMs))
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   if (config.apiKey.trim()) headers.Authorization = `Bearer ${config.apiKey.trim()}`
   const content = mediaUploads.length > 0
@@ -350,17 +362,52 @@ async function requestOpenAICompatiblePrompt(
     }
     return text
   } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') {
+    if (controller.signal.aborted && externalSignal?.aborted) {
+      const stoppedError = new Error('AI request stopped by the user.')
+      stoppedError.name = 'AbortError'
+      throw stoppedError
+    }
+    if (timedOut || error instanceof DOMException && error.name === 'AbortError') {
       throw new Error(`API request timed out after ${Math.round(timeoutMs / 1000)} seconds.`)
     }
     throw error
   } finally {
     clearTimeout(timer)
+    externalSignal?.removeEventListener('abort', onExternalAbort)
   }
 }
 
 export async function testPromptAssistantApi(config: PromptAssistantApiConfig): Promise<string> {
   return requestOpenAICompatiblePrompt(config, 'Reply with exactly: API connection successful', 30000, [])
+}
+
+function createPromptAssistantAbortError(): Error {
+  const error = new Error('AI request stopped by the user.')
+  error.name = 'AbortError'
+  return error
+}
+
+function waitWithPromptAssistantAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise
+  if (signal.aborted) return Promise.reject(createPromptAssistantAbortError())
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      cleanup()
+      reject(createPromptAssistantAbortError())
+    }
+    const cleanup = () => signal.removeEventListener('abort', onAbort)
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(
+      (value) => {
+        cleanup()
+        resolve(value)
+      },
+      (error) => {
+        cleanup()
+        reject(error)
+      },
+    )
+  })
 }
 
 function sleep(ms: number): Promise<void> {
@@ -461,22 +508,28 @@ export async function runPromptAssistant(
   instruction: string,
   timeoutMs = 90000,
   mediaUploads: PromptAssistantMediaUpload[] = [],
-  options: { focus?: boolean; apiModel?: string } = {},
+  options: { focus?: boolean; apiModel?: string; signal?: AbortSignal } = {},
 ): Promise<string> {
   if (provider === 'api') {
     const storedConfig = await readLatestApiConfig()
     const config = options.apiModel?.trim()
       ? { ...storedConfig, model: options.apiModel.trim() }
       : storedConfig
-    return requestOpenAICompatiblePrompt(config, instruction, timeoutMs, mediaUploads)
+    return requestOpenAICompatiblePrompt(config, instruction, timeoutMs, mediaUploads, options.signal)
   }
-  const tabId = await findOrCreateProviderTab(provider, options.focus !== false)
-  await ensurePromptAssistantListener(tabId, provider)
+  const tabId = await waitWithPromptAssistantAbort(
+    findOrCreateProviderTab(provider, options.focus !== false),
+    options.signal,
+  )
+  await waitWithPromptAssistantAbort(ensurePromptAssistantListener(tabId, provider), options.signal)
 
-  const response = await chrome.tabs.sendMessage(tabId, {
-    action: 'PROMPT_ASSISTANT_SUBMIT_TEXT',
-    payload: { provider, instruction, timeoutMs, mediaUploads: mediaUploads.slice(0, 5) },
-  }) as PromptAssistantResponse
+  const response = await waitWithPromptAssistantAbort(
+    chrome.tabs.sendMessage(tabId, {
+      action: 'PROMPT_ASSISTANT_SUBMIT_TEXT',
+      payload: { provider, instruction, timeoutMs, mediaUploads: mediaUploads.slice(0, 5) },
+    }) as Promise<PromptAssistantResponse>,
+    options.signal,
+  )
 
   if (!response?.success || !response.text?.trim()) {
     throw new Error(response?.message || response?.error || 'The AI provider returned an empty prompt.')

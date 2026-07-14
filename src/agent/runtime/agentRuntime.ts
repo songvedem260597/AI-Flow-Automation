@@ -16,6 +16,7 @@ export interface RunFilmAgentTurnInput {
   /** undefined = legacy workflow context, null = start without a persisted FilmProject. */
   projectId?: string | null
   conversationId?: string
+  signal?: AbortSignal
   mode: AgentMode
   adapter: AgentModelAdapter
 }
@@ -76,10 +77,18 @@ const shouldRecoverFromPassiveClarification = (
 }
 
 export const runFilmAgentTurn = async (input: RunFilmAgentTurnInput): Promise<RunFilmAgentTurnResult> => {
+  const throwIfStopped = () => {
+    if (!input.signal?.aborted) return
+    const error = new Error('AI Idea Agent request stopped by the user.')
+    error.name = 'AbortError'
+    throw error
+  }
+  throwIfStopped()
   await Promise.all([
     useFilmProjectStore.getState().hydrate(),
     useAgentStore.getState().hydrate(),
   ])
+  throwIfStopped()
   const filmStore = useFilmProjectStore.getState()
   const initialProject = input.projectId === undefined
     ? filmStore.getProjectForWorkflow(input.workflow.id)
@@ -101,7 +110,9 @@ export const runFilmAgentTurn = async (input: RunFilmAgentTurnInput): Promise<Ru
   }
 
   const firstTurn = await input.adapter.createTurn(turnInput)
+  throwIfStopped()
   const firstExecution = await executeAgentToolCalls(firstTurn.toolCalls, executionContext)
+  throwIfStopped()
   let message = firstTurn.message
   let conversationSummary = firstTurn.conversationSummary
   let toolResults = firstExecution.results
@@ -117,8 +128,10 @@ export const runFilmAgentTurn = async (input: RunFilmAgentTurnInput): Promise<Ru
       projectContext: currentProject,
       toolResults: firstExecution.results,
     })
+    throwIfStopped()
     const remainingCalls = continuation.toolCalls.slice(0, 20 - firstTurn.toolCalls.length)
     const secondExecution = await executeAgentToolCalls(remainingCalls, executionContext)
+    throwIfStopped()
     message = continuation.message || message
     conversationSummary = continuation.conversationSummary || conversationSummary
     toolResults = [...toolResults, ...secondExecution.results]
@@ -138,6 +151,7 @@ export const runFilmAgentTurn = async (input: RunFilmAgentTurnInput): Promise<Ru
       arguments: {},
       idempotencyKey: 'autonomy-recovery-project-read',
     }], executionContext)
+    throwIfStopped()
     const currentProject = executionContext.projectId
       ? useFilmProjectStore.getState().getProjectById(executionContext.projectId)
       : null
@@ -147,7 +161,9 @@ export const runFilmAgentTurn = async (input: RunFilmAgentTurnInput): Promise<Ru
       projectContext: currentProject,
       toolResults: recoveryRead.results,
     })
+    throwIfStopped()
     const secondExecution = await executeAgentToolCalls(continuation.toolCalls.slice(0, 19), executionContext)
+    throwIfStopped()
     message = continuation.message || message
     conversationSummary = continuation.conversationSummary || conversationSummary
     toolResults = [...toolResults, ...recoveryRead.results, ...secondExecution.results]

@@ -1170,6 +1170,26 @@ function templateMatchesMediaFilter(template: WorkflowTemplate, filter: Template
   return templateHasImageMedia(template) && !templateHasVideoMedia(template)
 }
 
+function sameSavedTemplateSnapshot(
+  current: UserWorkflowTemplate[],
+  next: UserWorkflowTemplate[],
+): boolean {
+  if (current.length !== next.length) return false
+  return current.every((template, index) => {
+    const candidate = next[index]
+    return Boolean(candidate)
+      && template.id === candidate.id
+      && template.name === candidate.name
+      && template.description === candidate.description
+      && template.thumbnail === candidate.thumbnail
+      && template.thumbnailSourceNodeId === candidate.thumbnailSourceNodeId
+      && template.nodeCount === candidate.nodeCount
+      && template.edgeCount === candidate.edgeCount
+      && template.createdAt === candidate.createdAt
+      && template.updatedAt === candidate.updatedAt
+  })
+}
+
 // [WorkflowTemplate] JS-masonry constants. The card width target is
 // shared between the runtime ResizeObserver (which decides how many
 // columns to render) and the e2e test (which asserts the column
@@ -4146,6 +4166,7 @@ const FilmProductionAgentPanel: React.FC<{
   const [historyOpen, setHistoryOpen] = useState(false)
   const [deleteConversationId, setDeleteConversationId] = useState<string | null>(null)
   const [isRunning, setIsRunning] = useState(false)
+  const agentAbortControllerRef = useRef<AbortController | null>(null)
   const [error, setError] = useState('')
   const [insertedMessageId, setInsertedMessageId] = useState<string | null>(null)
   const messageEndRef = useRef<HTMLDivElement>(null)
@@ -4356,6 +4377,11 @@ const FilmProductionAgentPanel: React.FC<{
   useEffect(() => {
     messageEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
   }, [messages, isRunning])
+
+  useEffect(() => () => {
+    agentAbortControllerRef.current?.abort()
+    agentAbortControllerRef.current = null
+  }, [workflow.id])
 
   useEffect(() => {
     conversationHistoryRef.current = conversationHistory
@@ -4622,10 +4648,13 @@ const FilmProductionAgentPanel: React.FC<{
     setActiveSlashCommand(null)
     setSlashMenuDismissed(false)
     setError('')
+    const requestController = new AbortController()
+    agentAbortControllerRef.current = requestController
     setIsRunning(true)
     try {
       await persistConversationSnapshot(activeConversationId, conversation)
       const mediaUploads = await Promise.all(imageReferences.map(videoAgentWorkflowImageToUpload))
+      if (requestController.signal.aborted) throw new Error('AI request stopped by the user.')
       let requestModel = apiProviderConfig.model?.trim() || ''
       if (activeProvider === 'api' && mediaUploads.length > 0) {
         const availableModels = apiModels.length > 0 ? apiModels : await refreshApiModels()
@@ -4655,13 +4684,16 @@ const FilmProductionAgentPanel: React.FC<{
         conversationSummary: durableConversationContext,
         projectId: requestConversation.filmProjectId,
         conversationId: activeConversationId,
+        signal: requestController.signal,
         mode: agentMode,
         adapter: new PromptAssistantAgentModelAdapter({
           provider: activeProvider,
           apiModel: activeProvider === 'api' ? requestModel : undefined,
           mediaUploads,
+          signal: requestController.signal,
         }),
       })
+      if (requestController.signal.aborted) throw new Error('AI request stopped by the user.')
       const text = runtimeResult.message
       if (runtimeResult.validationErrors.length > 0) {
         setError(runtimeResult.validationErrors.slice(0, 4).join(' '))
@@ -4680,10 +4712,21 @@ const FilmProductionAgentPanel: React.FC<{
       await persistConversationSnapshot(activeConversationId, completedConversation, resolvedProjectId)
       setMessages(completedConversation)
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : 'AI Idea Agent could not complete this request.')
+      setError(requestController.signal.aborted
+        ? 'AI Idea Agent request stopped. A provider tab may continue processing a request it already received.'
+        : submitError instanceof Error ? submitError.message : 'AI Idea Agent could not complete this request.')
     } finally {
-      setIsRunning(false)
+      if (agentAbortControllerRef.current === requestController) {
+        agentAbortControllerRef.current = null
+        setIsRunning(false)
+      }
     }
+  }
+
+  const stopAgentRun = () => {
+    const controller = agentAbortControllerRef.current
+    if (!controller || controller.signal.aborted) return
+    controller.abort()
   }
 
   const copyMessage = async (text: string) => {
@@ -5643,12 +5686,20 @@ const FilmProductionAgentPanel: React.FC<{
               )}
               <button
                 type="button"
-                aria-label="Send to AI Idea Agent"
-                disabled={!input.trim() || isRunning || !conversationHistoryReady || !activeConversationId || (activeProvider === 'api' && !apiProviderReady)}
-                onClick={() => void submit()}
-                className={cn('flex h-8 w-8 items-center justify-center rounded-xl transition-all', input.trim() && !isRunning && conversationHistoryReady && activeConversationId && (activeProvider !== 'api' || apiProviderReady) ? 'bg-[#7C5CFF] text-white shadow-[0_7px_18px_rgba(124,92,255,0.28)] hover:bg-[#8768FF]' : 'cursor-not-allowed bg-white/[0.05] text-white/18')}
+                aria-label={isRunning ? 'Stop AI Idea Agent' : 'Send to AI Idea Agent'}
+                title={isRunning ? 'Stop current request' : 'Send'}
+                disabled={!isRunning && (!input.trim() || !conversationHistoryReady || !activeConversationId || (activeProvider === 'api' && !apiProviderReady))}
+                onClick={() => isRunning ? stopAgentRun() : void submit()}
+                className={cn(
+                  'flex h-8 w-8 items-center justify-center rounded-xl transition-all',
+                  isRunning
+                    ? 'bg-red-500/15 text-red-200 hover:bg-red-500/25 hover:text-white'
+                    : input.trim() && conversationHistoryReady && activeConversationId && (activeProvider !== 'api' || apiProviderReady)
+                      ? 'bg-[#7C5CFF] text-white shadow-[0_7px_18px_rgba(124,92,255,0.28)] hover:bg-[#8768FF]'
+                      : 'cursor-not-allowed bg-white/[0.05] text-white/18'
+                )}
               >
-                {isRunning ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
+                {isRunning ? <Square className="h-3 w-3 fill-current" /> : <Send className="h-3.5 w-3.5" />}
               </button>
             </div>
           </div>
@@ -12608,9 +12659,9 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   const refreshSavedTemplates = useCallback(async () => {
     try {
       const list = await listWorkflowTemplates()
-      setSavedTemplates(list)
+      setSavedTemplates((current) => sameSavedTemplateSnapshot(current, list) ? current : list)
     } catch {
-      setSavedTemplates([])
+      setSavedTemplates((current) => current.length === 0 ? current : [])
     } finally {
       setTemplatesHydrated(true)
     }
@@ -12621,7 +12672,7 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
   useEffect(() => {
     void refreshSavedTemplates()
     const unsubscribe = onWorkflowTemplatesChanged((next) => {
-      setSavedTemplates(next)
+      setSavedTemplates((current) => sameSavedTemplateSnapshot(current, next) ? current : next)
     })
     return unsubscribe
   }, [refreshSavedTemplates])
@@ -12857,6 +12908,12 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
       return
     }
 
+    // Loading is an initial-hydration/layout gate, not a transition
+    // between already-rendered filters. Hiding the whole masonry on
+    // every All/Image/Video change (or an identical focus refresh)
+    // caused the gallery to flash out and back in.
+    if (templateSurfaceReady) return
+
     let cancelled = false
     let firstFrame = 0
     let secondFrame = 0
@@ -12909,7 +12966,7 @@ export const WorkflowEditor: React.FC<WorkflowEditorProps> = ({ isSidebarOpen, o
       if (firstFrame) window.cancelAnimationFrame(firstFrame)
       if (secondFrame) window.cancelAnimationFrame(secondFrame)
     }
-  }, [view, templatesHydrated, filteredTemplates, templateColumnCount])
+  }, [view, templatesHydrated, filteredTemplates, templateColumnCount, templateSurfaceReady])
   // [WorkflowTemplate] Distribute filtered templates into N columns
   // for the JS masonry. Round-robin so a card count `<= columnCount`
   // guarantees every column gets exactly one card (no empty column).

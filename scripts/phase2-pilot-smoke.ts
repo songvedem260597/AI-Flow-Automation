@@ -384,7 +384,46 @@ const main = async () => {
   assert.equal(autonomyResult.project?.brief.targetDurationSec, 240)
   assert.equal(autonomyResult.project?.brief.aspectRatio, '16:9')
 
-  console.log('Phase 2 pilot smoke tests passed: isolation, persisted reservation, freshness rejection, gates, image/video, failure preservation, reload interruption, fresh conversation context, autonomy recovery.')
+  const cancelledWorkflow = makeWorkflow('wf-agent-cancel', 'project-agent-cancel', 'SHOT-CANCEL')
+  const agentAbortController = new AbortController()
+  await assert.rejects(
+    runFilmAgentTurn({
+      workflow: cancelledWorkflow,
+      projectId: null,
+      conversationId: 'conversation-agent-cancel',
+      userMessage: 'Create a short science-fiction film.',
+      mode: 'plan-only',
+      signal: agentAbortController.signal,
+      adapter: {
+        createTurn: async () => {
+          agentAbortController.abort()
+          return {
+            message: 'Creating the project.',
+            conversationSummary: '',
+            toolCalls: [{
+              id: 'cancelled-create-project',
+              name: 'film.create_project',
+              arguments: { title: 'Must Not Be Created' },
+              idempotencyKey: 'cancelled-create-project',
+            }],
+            validationErrors: [],
+            rawText: '',
+          }
+        },
+        continueWithToolResults: async () => {
+          throw new Error('A stopped turn must not continue.')
+        },
+      },
+    }),
+    /stopped by the user/i,
+  )
+  assert.equal(
+    useFilmProjectStore.getState().getProjectForWorkflow(cancelledWorkflow.id),
+    null,
+    'stopping after the provider response must prevent pending Agent tools from executing',
+  )
+
+  console.log('Phase 2 pilot smoke tests passed: isolation, persisted reservation, freshness rejection, gates, image/video, failure preservation, reload interruption, fresh conversation context, autonomy recovery, Agent cancellation gate.')
 }
 
 void main().catch((error) => {
