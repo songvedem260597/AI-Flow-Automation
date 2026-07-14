@@ -4182,15 +4182,9 @@ const FilmProductionAgentPanel: React.FC<{
   const selectedSkill = skillLibrary.skills.find((skill) => skill.id === skillLibrary.selectedSkillId) || null
   const filmProjects = useFilmProjectStore((state) => state.projects)
   const activeConversation = conversationHistory.find((conversation) => conversation.id === activeConversationId) || null
-  const legacyActiveFilmProjectId = useFilmProjectStore((state) => state.activeProjectByWorkflow[workflow.id])
-  const legacyFilmProject = filmProjects.find((project) => project.id === legacyActiveFilmProjectId)
-    || filmProjects.find((project) => project.workflowId === workflow.id)
-    || null
-  const filmProject = activeConversation?.filmProjectId === undefined
-    ? legacyFilmProject
-    : activeConversation.filmProjectId
-      ? filmProjects.find((project) => project.id === activeConversation.filmProjectId) || null
-      : null
+  const filmProject = activeConversation?.filmProjectId
+    ? filmProjects.find((project) => project.id === activeConversation.filmProjectId) || null
+    : null
   const activeAgentTab = useAgentStore((state) => state.activeTab)
   const agentMode = useAgentStore((state) => state.modesByWorkflow[workflow.id] || 'run-with-approval')
   const workflowPendingPatch = useAgentStore((state) => state.pendingPatchesByWorkflow[workflow.id] || null)
@@ -4405,19 +4399,8 @@ const FilmProductionAgentPanel: React.FC<{
           conversations = [conversation]
           activeId = conversation.id
         }
-        let activeConversation = conversations.find((conversation) => conversation.id === activeId) || conversations[0]
-        if (activeConversation?.filmProjectId === undefined) {
-          const legacyProjectId = useFilmProjectStore.getState().getProjectForWorkflow(workflow.id)?.id || null
-          activeConversation = { ...activeConversation, filmProjectId: legacyProjectId, updatedAt: Date.now() }
-          conversations = conversations.map((conversation) => conversation.id === activeConversation?.id
-            ? activeConversation as VideoAgentConversation
-            : conversation)
-          await saveVideoAgentConversation(activeConversation)
-          if (!active) return
-        }
-        if (activeConversation?.filmProjectId !== undefined) {
-          useFilmProjectStore.getState().setActiveProject(workflow.id, activeConversation.filmProjectId)
-        }
+        const activeConversation = conversations.find((conversation) => conversation.id === activeId) || conversations[0]
+        useFilmProjectStore.getState().setActiveProject(workflow.id, activeConversation?.filmProjectId || null)
         conversationHistoryRef.current = conversations
         setConversationHistory(conversations)
         setActiveConversationId(activeConversation?.id || null)
@@ -4828,13 +4811,12 @@ const FilmProductionAgentPanel: React.FC<{
       const resolvedConversation = conversation.filmProjectId === undefined
         ? { ...conversation, filmProjectId: null, updatedAt: Date.now() }
         : conversation
+      await setActiveVideoAgentConversation(workflow.id, resolvedConversation.id)
       if (resolvedConversation !== conversation) {
         await saveVideoAgentConversation(resolvedConversation)
         const nextHistory = conversationHistoryRef.current.map((item) => item.id === resolvedConversation.id ? resolvedConversation : item)
         conversationHistoryRef.current = nextHistory
         setConversationHistory(nextHistory)
-      } else {
-        await setActiveVideoAgentConversation(workflow.id, resolvedConversation.id)
       }
       setActiveConversationId(resolvedConversation.id)
       useFilmProjectStore.getState().setActiveProject(workflow.id, resolvedConversation.filmProjectId)
@@ -5615,33 +5597,42 @@ const FilmProductionAgentPanel: React.FC<{
                     )}
                   </Select.Trigger>
                   <Select.Portal>
-                    <Select.Content position="popper" side="top" align="end" sideOffset={8} collisionPadding={12} className="z-[170] w-[340px] overflow-hidden rounded-2xl border border-white/[0.1] bg-[#1B1B1B] p-1.5 shadow-[0_22px_68px_rgba(0,0,0,0.76)]">
-                      <div className="border-b border-white/[0.07] px-2.5 pb-2.5 pt-1.5">
-                        <p className="text-[10px] font-semibold text-white/78">9Router models</p>
-                        <p className="mt-0.5 text-[8px] text-white/28">Grouped by plan · media-capable models are prioritized</p>
+                    <Select.Content position="popper" side="top" align="end" sideOffset={8} collisionPadding={12} className="z-[170] w-[360px] overflow-hidden rounded-[14px] border border-white/[0.09] bg-[#171717] shadow-[0_24px_72px_rgba(0,0,0,0.72)]">
+                      <div className="border-b border-white/[0.06] px-4 py-3">
+                        <p className="text-[11px] font-medium leading-4 text-white/88">9Router models</p>
+                        <p className="mt-0.5 text-[10px] font-normal leading-4 text-white/40">Grouped by plan · media-capable models first</p>
                       </div>
-                      <Select.Viewport className="max-h-[330px] py-1">
+                      <Select.Viewport className="max-h-[330px] p-1.5">
                         {apiModelsLoading && visibleApiModels.length === 0 && (
-                          <div className="flex h-14 items-center justify-center gap-2 text-[10px] text-white/32">
+                          <div className="flex h-14 items-center justify-center gap-2 text-[10px] leading-4 text-white/42">
                             <LoaderCircle className="h-3.5 w-3.5 animate-spin text-[#A895FF]" /> Loading available models…
                           </div>
                         )}
                         {!apiModelsLoading && apiModelsError && (
-                          <div className="px-3 py-4 text-[10px] leading-4 text-red-200/65">{apiModelsError}</div>
+                          <div className="px-3 py-4 text-[10px] leading-4 text-red-200/75">{apiModelsError}</div>
                         )}
                         {apiModelGroups.map(([plan, models]) => (
-                          <Select.Group key={plan}>
-                            <Select.Label className="px-2.5 pb-1 pt-2 text-[8px] font-semibold uppercase tracking-[0.12em] text-white/24">{plan}</Select.Label>
+                          <Select.Group key={plan} className="pb-1 last:pb-0">
+                            <Select.Label className="px-2.5 pb-1 pt-2.5 text-[10px] font-medium uppercase leading-4 tracking-[0.08em] text-white/36">{plan}</Select.Label>
                             {models.map((model) => (
-                              <Select.Item key={model.id} value={model.id} className="relative flex min-h-11 cursor-pointer select-none items-center rounded-xl py-2 pl-8 pr-2.5 outline-none data-[highlighted]:bg-[#7C5CFF]/12 data-[state=checked]:bg-[#7C5CFF]/[0.08]">
-                                <Select.ItemIndicator className="absolute left-2.5 text-[#B8A8FF]"><Check className="h-3.5 w-3.5" /></Select.ItemIndicator>
+                              <Select.Item key={model.id} value={model.id} className="relative flex min-h-[46px] cursor-pointer select-none items-center rounded-[9px] px-3 py-1.5 pr-9 text-left outline-none transition-colors data-[highlighted]:bg-white/[0.045] data-[state=checked]:bg-[#7C5CFF]/[0.09] data-[state=checked]:shadow-[inset_0_0_0_1px_rgba(124,92,255,0.18)]">
                                 <span className="min-w-0 flex-1">
-                                  <Select.ItemText>{model.name}</Select.ItemText>
-                                  <span className={cn('mt-0.5 block truncate text-[8px]', model.recommendedForMedia ? 'text-emerald-300/65' : model.inputModalities.includes('image') ? 'text-[#B8A8FF]/62' : 'text-white/25')}>
+                                  <span className="flex min-w-0 items-center gap-2">
+                                    <span className="min-w-0 truncate text-[11px] font-medium leading-4 text-white/84">
+                                      <Select.ItemText>{model.name}</Select.ItemText>
+                                    </span>
+                                    {model.recommendedForMedia && (
+                                      <span className="inline-flex shrink-0 items-center gap-1 text-[9px] font-medium leading-4 text-emerald-300/62">
+                                        <span className="h-1 w-1 rounded-full bg-emerald-300/70" />
+                                        Media
+                                      </span>
+                                    )}
+                                  </span>
+                                  <span className="mt-px block truncate text-[9px] font-normal leading-[14px] text-[#57C8A6]/70">
                                     {videoAgentModelCapabilityLabel(model)}
                                   </span>
                                 </span>
-                                {model.recommendedForMedia && <span className="ml-2 shrink-0 rounded-full bg-emerald-400/[0.08] px-1.5 py-0.5 text-[7px] font-semibold uppercase tracking-wide text-emerald-300/70">Media</span>}
+                                <Select.ItemIndicator className="absolute right-3 text-[#B8A8FF]"><Check className="h-3.5 w-3.5" /></Select.ItemIndicator>
                               </Select.Item>
                             ))}
                           </Select.Group>

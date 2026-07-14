@@ -13,9 +13,12 @@ export interface VideoAgentConversation {
   id: string
   workflowId: string
   /**
-   * undefined = legacy conversation not migrated yet
-   * null = explicitly fresh conversation with no FilmProject context
+   * null = conversation has no FilmProject context
    * string = FilmProject owned by this conversation
+   *
+   * Legacy records without this field are normalized to null. They must
+   * never inherit the workflow's last active project because that leaks
+   * scenes, shots, and tasks from an unrelated conversation.
    */
   filmProjectId?: string | null
   title: string
@@ -111,15 +114,13 @@ function normalizeConversation(value: unknown): VideoAgentConversation | null {
   const title = typeof candidate.title === 'string' && candidate.title.trim()
     ? candidate.title.trim().slice(0, 90)
     : 'New conversation'
-  const filmProjectId = candidate.filmProjectId === null
-    ? null
-    : typeof candidate.filmProjectId === 'string' && candidate.filmProjectId.trim()
-      ? candidate.filmProjectId.trim()
-      : undefined
+  const filmProjectId = typeof candidate.filmProjectId === 'string' && candidate.filmProjectId.trim()
+    ? candidate.filmProjectId.trim()
+    : null
   return {
     id,
     workflowId,
-    ...(filmProjectId !== undefined ? { filmProjectId } : {}),
+    filmProjectId,
     title,
     messages,
     createdAt,

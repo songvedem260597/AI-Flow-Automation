@@ -344,35 +344,11 @@ const main = async () => {
         autonomyContinuationCalls += 1
         assert.deepEqual(turn.toolResults[0].result, { project: null }, 'autonomy recovery must use a verified empty project read')
         assert.match(turn.userMessage, /INTERNAL AUTONOMY RECOVERY/, 'autonomy retry must explicitly instruct the model to proceed')
+        assert.equal(turn.availableTools.some((tool) => tool.name === 'film.create_project'), false, 'a rough idea must not expose mutating project tools before confirmation')
         return {
-          message: 'Tôi đã chủ động dựng dự án phim du hành thời gian 4 phút với các giả định phù hợp cho YouTube.',
+          message: 'Đề xuất: Vệt Nứt Thời Gian — phim khoa học viễn tưởng 4 phút về một nhà thám hiểm truy tìm nhánh lịch sử đã xóa mình khỏi hiện tại. Bạn có muốn chốt hướng này không?',
           conversationSummary: 'Phim khoa học viễn tưởng 4 phút, YouTube 16:9.',
-          toolCalls: [
-            {
-              id: 'autonomy-create-project',
-              name: 'film.create_project',
-              arguments: { title: 'Vệt Nứt Thời Gian' },
-              idempotencyKey: 'autonomy-project',
-            },
-            {
-              id: 'autonomy-update-brief',
-              name: 'film.update_brief',
-              arguments: {
-                brief: {
-                  logline: 'Một nhà thám hiểm truy tìm nhánh lịch sử đã xóa mình khỏi hiện tại.',
-                  genre: 'Khoa học viễn tưởng phiêu lưu',
-                  audience: 'Khán giả YouTube yêu thích bí ẩn',
-                  targetDurationSec: 240,
-                  aspectRatio: '16:9',
-                  visualStyle: 'Cinematic',
-                  language: 'Vietnamese',
-                  platform: 'YouTube',
-                  constraints: [],
-                },
-              },
-              idempotencyKey: 'autonomy-brief',
-            },
-          ],
+          toolCalls: [],
           validationErrors: [],
           rawText: '',
         }
@@ -380,9 +356,44 @@ const main = async () => {
     },
   })
   assert.equal(autonomyContinuationCalls, 1, 'a passive clarification must get exactly one autonomy retry')
-  assert.ok(autonomyResult.project, 'autonomy recovery must create a FilmProject instead of asking the same checklist again')
-  assert.equal(autonomyResult.project?.brief.targetDurationSec, 240)
-  assert.equal(autonomyResult.project?.brief.aspectRatio, '16:9')
+  assert.equal(autonomyResult.project, null, 'a useful proposal must not be persisted before the user confirms it')
+  assert.match(autonomyResult.message, /Vệt Nứt Thời Gian/, 'autonomy recovery must still return a concrete creative proposal')
+
+  const committedWorkflow = makeWorkflow('wf-explicit-commit', 'project-explicit-commit', 'SHOT-COMMIT')
+  const committedResult = await runFilmAgentTurn({
+    workflow: committedWorkflow,
+    projectId: null,
+    conversationId: 'conversation-explicit-commit',
+    userMessage: 'Chốt hướng này, tạo dự án đi.',
+    mode: 'plan-only',
+    adapter: {
+      createTurn: async (turn) => {
+        assert.equal(turn.availableTools.some((tool) => tool.name === 'film.create_project'), true, 'explicit confirmation must expose project creation tools')
+        assert.equal(turn.availableTools.some((tool) => tool.name === 'film.select_pilot_shot'), false, 'project confirmation alone must not expose pilot selection')
+        return {
+          message: 'Đang tạo dự án đã chốt.',
+          conversationSummary: 'Dự án Vệt Nứt Thời Gian đã được chốt.',
+          toolCalls: [{
+            id: 'commit-create-project',
+            name: 'film.create_project',
+            arguments: { title: 'Vệt Nứt Thời Gian' },
+            idempotencyKey: 'commit-create-project',
+          }],
+          validationErrors: [],
+          rawText: '',
+        }
+      },
+      continueWithToolResults: async () => ({
+        message: 'Đã tạo dự án Vệt Nứt Thời Gian.',
+        conversationSummary: 'Dự án Vệt Nứt Thời Gian đã được chốt.',
+        toolCalls: [],
+        validationErrors: [],
+        rawText: '',
+      }),
+    },
+  })
+  assert.equal(committedResult.project?.title, 'Vệt Nứt Thời Gian', 'explicit confirmation must create the requested project')
+  assert.equal(committedResult.project?.pilotShotId, undefined, 'pilot selection must remain empty without an explicit pilot request')
 
   const cancelledWorkflow = makeWorkflow('wf-agent-cancel', 'project-agent-cancel', 'SHOT-CANCEL')
   const agentAbortController = new AbortController()
@@ -423,7 +434,7 @@ const main = async () => {
     'stopping after the provider response must prevent pending Agent tools from executing',
   )
 
-  console.log('Phase 2 pilot smoke tests passed: isolation, persisted reservation, freshness rejection, gates, image/video, failure preservation, reload interruption, fresh conversation context, autonomy recovery, Agent cancellation gate.')
+  console.log('Phase 2 pilot smoke tests passed: isolation, persisted reservation, freshness rejection, gates, image/video, failure preservation, reload interruption, fresh conversation context, proposal confirmation gate, pilot selection gate, Agent cancellation gate.')
 }
 
 void main().catch((error) => {
