@@ -867,14 +867,6 @@ input::placeholder, textarea::placeholder {
   flex-direction: column;
 }
 
-/* When body has no settings bar (media node), let children control
-   height entirely — the min-height was leaving a black strip below
-   the preview once the aspect ratio settings bar was removed. */
-.df-node-body:not(:has(.df-node-settings-bar)) {
-  min-height: 0;
-  padding-bottom: 0;
-}
-
 .df-node[data-node-type="generate"] .df-node-body {
   min-height: 0;
   padding: 8px 10px 10px;
@@ -923,10 +915,9 @@ input::placeholder, textarea::placeholder {
   z-index: 2;
   pointer-events: none;
   background: linear-gradient(
-    180deg,
-    rgba(15, 15, 15, 0) 0%,
-    rgba(15, 15, 15, 0.62) 44%,
-    rgba(15, 15, 15, 0.94) 100%
+    #0f0f0f00 0%,
+    #0f0f0f78 44%,
+    #0f0f0fbd 100%
   );
 }
 

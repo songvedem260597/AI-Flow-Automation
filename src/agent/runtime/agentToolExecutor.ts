@@ -35,6 +35,10 @@ import {
 export interface AgentToolExecutionContext {
   workflow: Workflow
   mode: AgentMode
+  /** undefined keeps legacy workflow fallback; null is an explicitly fresh conversation. */
+  projectId?: string | null
+  /** Keeps idempotent tool results isolated between separate conversations. */
+  scopeId?: string
 }
 
 export interface AgentToolExecutionSummary {
@@ -120,7 +124,7 @@ const executeOne = async (
   context: AgentToolExecutionContext,
 ): Promise<AgentToolResult> => {
   const agentState = useAgentStore.getState()
-  const scopedIdempotencyKey = `${context.workflow.id}:${call.idempotencyKey}`
+  const scopedIdempotencyKey = `${context.workflow.id}:${context.scopeId || 'workflow'}:${call.idempotencyKey}`
   const definition = AGENT_TOOL_REGISTRY[call.name]
   if (!definition) return { toolCallId: call.id, name: call.name, success: false, error: 'Tool is not allowlisted.' }
   const memoizeResult = definition.sideEffect || call.name === 'workflow.create_patch' || call.name === 'approval.request'
@@ -152,7 +156,9 @@ const executeOne = async (
   }
 
   const filmStore = useFilmProjectStore.getState()
-  let project = filmStore.getProjectForWorkflow(context.workflow.id)
+  let project = context.projectId === undefined
+    ? filmStore.getProjectForWorkflow(context.workflow.id)
+    : context.projectId ? filmStore.getProjectById(context.projectId) : null
   let result: unknown
 
   switch (call.name) {
@@ -162,6 +168,7 @@ const executeOne = async (
     case 'film.create_project': {
       project = createFilmProjectFromTool(context.workflow.id, call.arguments, project)
       filmStore.upsertProject(project)
+      context.projectId = project.id
       result = projectSummary(project)
       break
     }
@@ -352,11 +359,14 @@ export const executeAgentToolCalls = async (
 ): Promise<AgentToolExecutionSummary> => {
   const results: AgentToolResult[] = []
   const validationErrors: string[] = []
+  const projectForContext = (): FilmProject | null => context.projectId === undefined
+    ? useFilmProjectStore.getState().getProjectForWorkflow(context.workflow.id)
+    : context.projectId ? useFilmProjectStore.getState().getProjectById(context.projectId) : null
   for (const call of calls.slice(0, 20)) {
-    const activityId = `activity-${context.workflow.id}-${call.idempotencyKey}`
+    const activityId = `activity-${context.workflow.id}-${context.scopeId || 'workflow'}-${call.idempotencyKey}`
     useAgentStore.getState().addActivity({
       id: activityId,
-      projectId: useFilmProjectStore.getState().getProjectForWorkflow(context.workflow.id)?.id,
+      projectId: projectForContext()?.id,
       toolName: call.name,
       status: 'running',
       summary: call.name,
@@ -368,7 +378,7 @@ export const executeAgentToolCalls = async (
       if (!result.success && result.error) validationErrors.push(result.error)
       useAgentStore.getState().addActivity({
         id: activityId,
-        projectId: useFilmProjectStore.getState().getProjectForWorkflow(context.workflow.id)?.id,
+        projectId: projectForContext()?.id,
         toolName: call.name,
         status: result.success ? 'completed' : 'failed',
         summary: result.success ? `${call.name} completed` : result.error || `${call.name} failed`,
@@ -380,7 +390,7 @@ export const executeAgentToolCalls = async (
       validationErrors.push(message)
       useAgentStore.getState().addActivity({
         id: activityId,
-        projectId: useFilmProjectStore.getState().getProjectForWorkflow(context.workflow.id)?.id,
+        projectId: projectForContext()?.id,
         toolName: call.name,
         status: 'failed',
         summary: message,
@@ -390,7 +400,7 @@ export const executeAgentToolCalls = async (
   }
   return {
     results,
-    project: useFilmProjectStore.getState().getProjectForWorkflow(context.workflow.id),
+    project: projectForContext(),
     pendingPatch: useAgentStore.getState().pendingPatchesByWorkflow[context.workflow.id] || null,
     validationErrors,
   }

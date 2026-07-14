@@ -170,6 +170,7 @@ export const createShotPipelinePatch = (
   return {
     id: patchId,
     workflowId: workflow.id,
+    projectId: project.id,
     summary: `Create image-to-video pipelines for ${shots.length} shot${shots.length === 1 ? '' : 's'}.`,
     addNodes,
     updateNodes: [],

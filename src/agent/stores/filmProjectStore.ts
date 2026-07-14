@@ -9,6 +9,7 @@ import {
 import {
   loadFilmProjectSnapshot,
   queueFilmProjectSnapshotSave,
+  saveFilmProjectSnapshot,
 } from '@/agent/persistence/filmProjectPersistence'
 
 interface FilmProjectStoreState {
@@ -17,8 +18,10 @@ interface FilmProjectStoreState {
   hydrated: boolean
   hydrate: () => Promise<void>
   getProjectForWorkflow: (workflowId: string) => FilmProject | null
+  getProjectById: (projectId: string) => FilmProject | null
   ensureProject: (workflowId: string, title?: string) => FilmProject
-  setActiveProject: (workflowId: string, projectId: string) => void
+  setActiveProject: (workflowId: string, projectId: string | null) => void
+  removeProject: (projectId: string) => Promise<void>
   upsertProject: (project: FilmProject) => FilmProject
   updateProject: (projectId: string, updater: (project: FilmProject) => FilmProject) => FilmProject | null
   upsertTask: (projectId: string, task: AgentTask) => void
@@ -59,6 +62,8 @@ export const useFilmProjectStore = create<FilmProjectStoreState>((set, get) => (
       || null
   },
 
+  getProjectById: (projectId) => get().projects.find((project) => project.id === projectId) || null,
+
   ensureProject: (workflowId, title) => {
     const existing = get().getProjectForWorkflow(workflowId)
     if (existing) return existing
@@ -73,12 +78,26 @@ export const useFilmProjectStore = create<FilmProjectStoreState>((set, get) => (
   },
 
   setActiveProject: (workflowId, projectId) => {
-    if (!get().projects.some((project) => project.id === projectId && project.workflowId === workflowId)) return
+    if (projectId && !get().projects.some((project) => project.id === projectId && project.workflowId === workflowId)) return
     set((state) => {
-      const activeProjectByWorkflow = { ...state.activeProjectByWorkflow, [workflowId]: projectId }
+      const activeProjectByWorkflow = { ...state.activeProjectByWorkflow }
+      if (projectId) activeProjectByWorkflow[workflowId] = projectId
+      else delete activeProjectByWorkflow[workflowId]
       persistState(state.projects, activeProjectByWorkflow)
       return { activeProjectByWorkflow }
     })
+  },
+
+  removeProject: async (projectId) => {
+    if (!projectId) return
+    const state = get()
+    const projects = state.projects.filter((project) => project.id !== projectId)
+    if (projects.length === state.projects.length) return
+    const activeProjectByWorkflow = Object.fromEntries(
+      Object.entries(state.activeProjectByWorkflow).filter(([, activeProjectId]) => activeProjectId !== projectId),
+    )
+    set({ projects, activeProjectByWorkflow })
+    await saveFilmProjectSnapshot({ projects, activeProjectByWorkflow })
   },
 
   upsertProject: (project) => {

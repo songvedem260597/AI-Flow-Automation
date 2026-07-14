@@ -75,6 +75,7 @@ export interface AgentToolDefinition {
 export interface WorkflowPatch {
   id: string
   workflowId: string
+  projectId?: string
   summary: string
   addNodes: WorkflowNode[]
   updateNodes: Array<{ nodeId: string; patch: Record<string, unknown> }>
@@ -208,6 +209,7 @@ export const isWorkflowPatch = (value: unknown): value is WorkflowPatch => {
   return Boolean(
     typeof record.id === 'string'
     && typeof record.workflowId === 'string'
+    && (record.projectId === undefined || typeof record.projectId === 'string')
     && typeof record.summary === 'string'
     && Array.isArray(record.addNodes)
     && Array.isArray(record.updateNodes)

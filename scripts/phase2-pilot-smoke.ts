@@ -18,7 +18,7 @@ const chromeMock = {
 Object.assign(globalThis, { chrome: chromeMock, localStorage: { getItem: () => null, setItem: () => undefined, removeItem: () => undefined } })
 
 const main = async () => {
-  const [{ createEmptyFilmProject, createDefaultAgentTasks, normalizeFilmProject }, pilotTools, pilotRuntime, { useFilmProjectStore }, { useAgentStore }, { useWorkflowStore }, { executeAgentToolCalls }] = await Promise.all([
+  const [{ createEmptyFilmProject, createDefaultAgentTasks, normalizeFilmProject }, pilotTools, pilotRuntime, { useFilmProjectStore }, { useAgentStore }, { useWorkflowStore }, { executeAgentToolCalls }, { runFilmAgentTurn }] = await Promise.all([
     import('../src/agent/schemas/filmProjectSchemas'),
     import('../src/agent/tools/pilotTools'),
     import('../src/agent/runtime/pilotRunner'),
@@ -26,6 +26,7 @@ const main = async () => {
     import('../src/agent/stores/agentStore'),
     import('../src/stores/workflowStore'),
     import('../src/agent/runtime/agentToolExecutor'),
+    import('../src/agent/runtime/agentRuntime'),
   ])
 
   const makeWorkflow = (workflowId = 'wf-pilot', projectId = 'project-pilot', shotId = 'SHOT-001') => ({
@@ -288,7 +289,102 @@ const main = async () => {
   await useAgentStore.getState().hydrate()
   assert.equal(useAgentStore.getState().pilotJobs[0].status, 'interrupted', 'reload must not auto-resubmit an active pilot job')
 
-  console.log('Phase 2 pilot smoke tests passed: isolation, persisted reservation, freshness rejection, gates, image/video, failure preservation, reload interruption.')
+  const contextWorkflow = makeWorkflow('wf-conversation-context', 'project-old-context', 'SHOT-CONTEXT')
+  const oldContextProject = makeProject('wf-conversation-context', 'project-old-context', 'SHOT-CONTEXT')
+  useFilmProjectStore.setState({
+    projects: [oldContextProject],
+    activeProjectByWorkflow: { [contextWorkflow.id]: oldContextProject.id },
+    hydrated: true,
+  })
+  useAgentStore.setState({ idempotencyResults: {}, activities: [], hydrated: true })
+  const freshConversationContext = {
+    workflow: contextWorkflow,
+    mode: 'plan-only' as const,
+    projectId: null as string | null,
+    scopeId: 'conversation-fresh-1',
+  }
+  const freshExecution = await executeAgentToolCalls([
+    { id: 'fresh-get', name: 'film.get_project', arguments: {}, idempotencyKey: 'context:get' },
+    { id: 'fresh-create', name: 'film.create_project', arguments: { title: 'Fresh Film' }, idempotencyKey: 'context:create' },
+  ], freshConversationContext)
+  assert.deepEqual(freshExecution.results[0].result, { project: null }, 'a new conversation must not read the workflow active project')
+  assert.ok(freshExecution.project)
+  assert.notEqual(freshExecution.project?.id, oldContextProject.id, 'a new conversation must create a different FilmProject')
+
+  const secondConversationContext = {
+    workflow: contextWorkflow,
+    mode: 'plan-only' as const,
+    projectId: null as string | null,
+    scopeId: 'conversation-fresh-2',
+  }
+  const secondFreshExecution = await executeAgentToolCalls([
+    { id: 'fresh-create-2', name: 'film.create_project', arguments: { title: 'Second Fresh Film' }, idempotencyKey: 'context:create' },
+  ], secondConversationContext)
+  assert.equal(secondFreshExecution.results[0].idempotentReplay, undefined, 'idempotency results must not leak between conversations')
+  assert.notEqual(secondFreshExecution.project?.id, freshExecution.project?.id, 'each new conversation owns its own FilmProject')
+
+  const autonomyWorkflow = makeWorkflow('wf-autonomy-recovery', 'project-unused', 'SHOT-AUTO')
+  let autonomyContinuationCalls = 0
+  const autonomyResult = await runFilmAgentTurn({
+    workflow: autonomyWorkflow,
+    projectId: null,
+    conversationId: 'conversation-autonomy-recovery',
+    userMessage: 'Bạn hãy tự gợi ý phim du hành thời gian cho YouTube 16:9, thời lượng 4 phút.',
+    conversationSummary: 'Người dùng muốn một phim du hành thời gian khám phá các nhánh lịch sử và cho phép Agent tự quyết định chi tiết.',
+    mode: 'plan-only',
+    adapter: {
+      createTurn: async () => ({
+        message: 'Bạn vui lòng cung cấp thêm tiêu đề, thể loại, phong cách và ngôn ngữ để bắt đầu.',
+        conversationSummary: '',
+        toolCalls: [],
+        validationErrors: [],
+        rawText: '',
+      }),
+      continueWithToolResults: async (turn) => {
+        autonomyContinuationCalls += 1
+        assert.deepEqual(turn.toolResults[0].result, { project: null }, 'autonomy recovery must use a verified empty project read')
+        assert.match(turn.userMessage, /INTERNAL AUTONOMY RECOVERY/, 'autonomy retry must explicitly instruct the model to proceed')
+        return {
+          message: 'Tôi đã chủ động dựng dự án phim du hành thời gian 4 phút với các giả định phù hợp cho YouTube.',
+          conversationSummary: 'Phim khoa học viễn tưởng 4 phút, YouTube 16:9.',
+          toolCalls: [
+            {
+              id: 'autonomy-create-project',
+              name: 'film.create_project',
+              arguments: { title: 'Vệt Nứt Thời Gian' },
+              idempotencyKey: 'autonomy-project',
+            },
+            {
+              id: 'autonomy-update-brief',
+              name: 'film.update_brief',
+              arguments: {
+                brief: {
+                  logline: 'Một nhà thám hiểm truy tìm nhánh lịch sử đã xóa mình khỏi hiện tại.',
+                  genre: 'Khoa học viễn tưởng phiêu lưu',
+                  audience: 'Khán giả YouTube yêu thích bí ẩn',
+                  targetDurationSec: 240,
+                  aspectRatio: '16:9',
+                  visualStyle: 'Cinematic',
+                  language: 'Vietnamese',
+                  platform: 'YouTube',
+                  constraints: [],
+                },
+              },
+              idempotencyKey: 'autonomy-brief',
+            },
+          ],
+          validationErrors: [],
+          rawText: '',
+        }
+      },
+    },
+  })
+  assert.equal(autonomyContinuationCalls, 1, 'a passive clarification must get exactly one autonomy retry')
+  assert.ok(autonomyResult.project, 'autonomy recovery must create a FilmProject instead of asking the same checklist again')
+  assert.equal(autonomyResult.project?.brief.targetDurationSec, 240)
+  assert.equal(autonomyResult.project?.brief.aspectRatio, '16:9')
+
+  console.log('Phase 2 pilot smoke tests passed: isolation, persisted reservation, freshness rejection, gates, image/video, failure preservation, reload interruption, fresh conversation context, autonomy recovery.')
 }
 
 void main().catch((error) => {

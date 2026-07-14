@@ -50,7 +50,7 @@ export const PilotApprovalCard: React.FC<{
             <p className="truncate text-[10px] font-semibold text-white/82">{approval.title}</p>
             <span className="rounded-full bg-[#7C5CFF]/13 px-2 py-0.5 text-[7px] font-semibold uppercase tracking-[0.08em] text-[#C8BCFF]">{stage}</span>
           </div>
-          <p className="mt-1 text-[8px] leading-3.5 text-white/36">{approval.description}</p>
+          <p className="mt-1 text-[10px] leading-4 text-white/36">{approval.description}</p>
         </div>
       </div>
 
@@ -76,26 +76,26 @@ export const PilotApprovalCard: React.FC<{
           </div>
         )}
         <label className="block">
-          <span className="mb-1.5 block text-[8px] font-semibold uppercase tracking-[0.08em] text-white/28">Prompt</span>
+          <span className="mb-1.5 block text-[10px] font-semibold uppercase tracking-[0.08em] text-white/28">Prompt</span>
           <textarea
             value={prompt}
             disabled={busy}
             onChange={(event) => setPrompt(event.target.value)}
-            className="min-h-[92px] w-full resize-y rounded-xl border border-white/[0.08] bg-[#0E0E0E] px-3 py-2.5 text-[9px] leading-4 text-white/65 outline-none focus:border-[#7C5CFF]/45 disabled:opacity-45"
+            className="min-h-[92px] w-full resize-y rounded-xl border border-white/[0.08] bg-[#0E0E0E] px-3 py-2.5 text-[10px] leading-4 text-white/65 outline-none focus:border-[#7C5CFF]/45 disabled:opacity-45"
           />
         </label>
         {stage === 'run' ? (
           <div className="flex items-center gap-2">
-            <button type="button" disabled={busy || !prompt.trim()} onClick={() => onRun(prompt.trim())} className="flex h-8 flex-1 items-center justify-center gap-1.5 rounded-xl bg-[#7C5CFF] text-[9px] font-semibold text-white hover:bg-[#8768FF] disabled:opacity-35">
+            <button type="button" disabled={busy || !prompt.trim()} onClick={() => onRun(prompt.trim())} className="flex h-8 flex-1 items-center justify-center gap-1.5 rounded-xl bg-[#7C5CFF] text-[10px] font-semibold text-white hover:bg-[#8768FF] disabled:opacity-35">
               {busy ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />} Run pilot {kind}
             </button>
-            <button type="button" disabled={busy} onClick={onCancel} className="flex h-8 items-center gap-1.5 rounded-xl px-3 text-[9px] text-white/38 hover:bg-white/[0.05] hover:text-white/70 disabled:opacity-35"><X className="h-3.5 w-3.5" /> Cancel</button>
+            <button type="button" disabled={busy} onClick={onCancel} className="flex h-8 items-center gap-1.5 rounded-xl px-3 text-[10px] text-white/38 hover:bg-white/[0.05] hover:text-white/70 disabled:opacity-35"><X className="h-3.5 w-3.5" /> Cancel</button>
           </div>
         ) : (
           <div className="grid grid-cols-2 gap-2">
-            <button type="button" disabled={busy} onClick={onApprove} className="flex h-8 items-center justify-center gap-1.5 rounded-xl bg-[#7C5CFF] text-[9px] font-semibold text-white hover:bg-[#8768FF] disabled:opacity-35"><Check className="h-3.5 w-3.5" /> Approve {kind}</button>
-            <button type="button" disabled={busy || !prompt.trim()} onClick={() => onRegenerate(prompt.trim())} className="flex h-8 items-center justify-center gap-1.5 rounded-xl bg-white/[0.055] text-[9px] font-medium text-white/58 hover:bg-white/[0.09] hover:text-white/82 disabled:opacity-35"><RotateCcw className="h-3.5 w-3.5" /> Regenerate</button>
-            <button type="button" disabled={busy} onClick={onReject} className="col-span-2 flex h-7 items-center justify-center gap-1.5 rounded-lg text-[8px] text-red-200/48 hover:bg-red-500/[0.07] hover:text-red-200/72 disabled:opacity-35"><X className="h-3 w-3" /> Reject and keep asset cached</button>
+            <button type="button" disabled={busy} onClick={onApprove} className="flex h-8 items-center justify-center gap-1.5 rounded-xl bg-[#7C5CFF] text-[10px] font-semibold text-white hover:bg-[#8768FF] disabled:opacity-35"><Check className="h-3.5 w-3.5" /> Approve {kind}</button>
+            <button type="button" disabled={busy || !prompt.trim()} onClick={() => onRegenerate(prompt.trim())} className="flex h-8 items-center justify-center gap-1.5 rounded-xl bg-white/[0.055] text-[10px] font-medium text-white/58 hover:bg-white/[0.09] hover:text-white/82 disabled:opacity-35"><RotateCcw className="h-3.5 w-3.5" /> Regenerate</button>
+            <button type="button" disabled={busy} onClick={onReject} className="col-span-2 flex h-7 items-center justify-center gap-1.5 rounded-lg text-[10px] text-red-200/48 hover:bg-red-500/[0.07] hover:text-red-200/72 disabled:opacity-35"><X className="h-3 w-3" /> Reject and keep asset cached</button>
           </div>
         )}
       </div>

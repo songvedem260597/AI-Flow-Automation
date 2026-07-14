@@ -12,6 +12,12 @@ export interface VideoAgentConversationMessage {
 export interface VideoAgentConversation {
   id: string
   workflowId: string
+  /**
+   * undefined = legacy conversation not migrated yet
+   * null = explicitly fresh conversation with no FilmProject context
+   * string = FilmProject owned by this conversation
+   */
+  filmProjectId?: string | null
   title: string
   messages: VideoAgentConversationMessage[]
   createdAt: number
@@ -28,6 +34,7 @@ const DATABASE_VERSION = 1
 const CONVERSATION_STORE = 'conversations'
 const META_STORE = 'meta'
 let writeQueue: Promise<void> = Promise.resolve()
+const deletedConversationIds = new Set<string>()
 
 function requestResult<T>(request: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -104,7 +111,20 @@ function normalizeConversation(value: unknown): VideoAgentConversation | null {
   const title = typeof candidate.title === 'string' && candidate.title.trim()
     ? candidate.title.trim().slice(0, 90)
     : 'New conversation'
-  return { id, workflowId, title, messages, createdAt, updatedAt }
+  const filmProjectId = candidate.filmProjectId === null
+    ? null
+    : typeof candidate.filmProjectId === 'string' && candidate.filmProjectId.trim()
+      ? candidate.filmProjectId.trim()
+      : undefined
+  return {
+    id,
+    workflowId,
+    ...(filmProjectId !== undefined ? { filmProjectId } : {}),
+    title,
+    messages,
+    createdAt,
+    updatedAt,
+  }
 }
 
 export function createVideoAgentConversation(workflowId: string): VideoAgentConversation {
@@ -112,6 +132,7 @@ export function createVideoAgentConversation(workflowId: string): VideoAgentConv
   return {
     id: `video-agent-conversation-${now}-${Math.random().toString(36).slice(2, 9)}`,
     workflowId,
+    filmProjectId: null,
     title: 'New conversation',
     messages: [],
     createdAt: now,
@@ -151,7 +172,11 @@ export async function loadVideoAgentConversationState(workflowId: string): Promi
 export async function saveVideoAgentConversation(conversation: VideoAgentConversation): Promise<VideoAgentConversation> {
   const normalized = normalizeConversation(conversation)
   if (!normalized) throw new Error('Invalid AI Idea Agent conversation.')
+  // A stale React effect or in-flight autosave must never resurrect a
+  // conversation after the user explicitly deleted it.
+  if (deletedConversationIds.has(normalized.id)) return normalized
   const operation = writeQueue.then(async () => {
+    if (deletedConversationIds.has(normalized.id)) return
     const database = await openDatabase()
     try {
       const transaction = database.transaction([CONVERSATION_STORE, META_STORE], 'readwrite')
@@ -181,6 +206,9 @@ export async function deleteVideoAgentConversation(
   const normalizedConversationId = conversationId.trim()
   const normalizedNextActiveId = nextActiveConversationId?.trim() || null
   if (!normalizedWorkflowId || !normalizedConversationId) throw new Error('Invalid AI Idea Agent conversation deletion request.')
+  // Mark before joining the queue so saves scheduled after this call become
+  // no-ops, while saves already queued still finish before the delete.
+  deletedConversationIds.add(normalizedConversationId)
   const operation = writeQueue.then(async () => {
     const database = await openDatabase()
     try {
@@ -202,7 +230,12 @@ export async function deleteVideoAgentConversation(
     }
   })
   writeQueue = operation.catch(() => undefined)
-  await operation
+  try {
+    await operation
+  } catch (error) {
+    deletedConversationIds.delete(normalizedConversationId)
+    throw error
+  }
 }
 
 export async function setActiveVideoAgentConversation(workflowId: string, conversationId: string): Promise<void> {

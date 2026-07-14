@@ -13,6 +13,9 @@ export interface RunFilmAgentTurnInput {
   selectedNode?: WorkflowNode | null
   userMessage: string
   conversationSummary?: string
+  /** undefined = legacy workflow context, null = start without a persisted FilmProject. */
+  projectId?: string | null
+  conversationId?: string
   mode: AgentMode
   adapter: AgentModelAdapter
 }
@@ -56,12 +59,37 @@ const toolsForMode = (mode: AgentMode) => listAgentTools().filter((tool) => {
     || tool.name === 'asset.list_for_project'
 })
 
+const shouldRecoverFromPassiveClarification = (
+  message: string,
+  userMessage: string,
+  conversationSummary: string,
+): boolean => {
+  const response = message.toLocaleLowerCase()
+  const context = `${conversationSummary}\n${userMessage}`.toLocaleLowerCase()
+  const isPassiveClarification = /(?:vui lòng cung cấp|ban vui long cung cap|cần thêm|can them|hãy cho biết|hay cho biet|bạn có thể cung cấp|ban co the cung cap|cần một số thông tin|can mot so thong tin|need more (?:details|information)|please provide|could you provide|before (?:i|we) can (?:start|create)|to get started)/iu.test(response)
+  if (!isPassiveClarification) return false
+
+  const delegatedCreativeControl = /(?:gợi ý|goi y|tự chọn|tu chon|bạn quyết|ban quyet|tùy bạn|tuy ban|bạn hãy quyết định|ban hay quyet dinh|suggest|you decide|surprise me|anything is fine)/iu.test(context)
+  const hasProductionSeed = /(?:phim|film|video|story|kịch bản|kich ban|thể loại|the loai|du hành|du hanh|youtube|tiktok|netflix|16:9|9:16|1:1|phút|phut|minutes?|seconds?|cinematic|animation|anime|documentary)/iu.test(context)
+    && context.trim().split(/\s+/).length >= 8
+  return delegatedCreativeControl || hasProductionSeed
+}
+
 export const runFilmAgentTurn = async (input: RunFilmAgentTurnInput): Promise<RunFilmAgentTurnResult> => {
   await Promise.all([
     useFilmProjectStore.getState().hydrate(),
     useAgentStore.getState().hydrate(),
   ])
-  const initialProject = useFilmProjectStore.getState().getProjectForWorkflow(input.workflow.id)
+  const filmStore = useFilmProjectStore.getState()
+  const initialProject = input.projectId === undefined
+    ? filmStore.getProjectForWorkflow(input.workflow.id)
+    : input.projectId ? filmStore.getProjectById(input.projectId) : null
+  const executionContext = {
+    workflow: input.workflow,
+    mode: input.mode,
+    projectId: input.projectId === undefined ? initialProject?.id : input.projectId,
+    scopeId: input.conversationId,
+  }
   const turnInput = {
     userMessage: input.userMessage,
     conversationSummary: initialProject?.conversationSummary || input.conversationSummary || '',
@@ -73,17 +101,16 @@ export const runFilmAgentTurn = async (input: RunFilmAgentTurnInput): Promise<Ru
   }
 
   const firstTurn = await input.adapter.createTurn(turnInput)
-  const firstExecution = await executeAgentToolCalls(firstTurn.toolCalls, {
-    workflow: input.workflow,
-    mode: input.mode,
-  })
+  const firstExecution = await executeAgentToolCalls(firstTurn.toolCalls, executionContext)
   let message = firstTurn.message
   let conversationSummary = firstTurn.conversationSummary
   let toolResults = firstExecution.results
   const validationErrors = [...firstTurn.validationErrors, ...firstExecution.validationErrors]
 
   if (firstTurn.toolCalls.length > 0 && firstTurn.toolCalls.length < 20) {
-    const currentProject = useFilmProjectStore.getState().getProjectForWorkflow(input.workflow.id)
+    const currentProject = executionContext.projectId
+      ? useFilmProjectStore.getState().getProjectById(executionContext.projectId)
+      : null
     const continuation = await input.adapter.continueWithToolResults({
       ...turnInput,
       conversationSummary: firstTurn.conversationSummary || currentProject?.conversationSummary || '',
@@ -91,17 +118,45 @@ export const runFilmAgentTurn = async (input: RunFilmAgentTurnInput): Promise<Ru
       toolResults: firstExecution.results,
     })
     const remainingCalls = continuation.toolCalls.slice(0, 20 - firstTurn.toolCalls.length)
-    const secondExecution = await executeAgentToolCalls(remainingCalls, {
-      workflow: input.workflow,
-      mode: input.mode,
-    })
+    const secondExecution = await executeAgentToolCalls(remainingCalls, executionContext)
     message = continuation.message || message
     conversationSummary = continuation.conversationSummary || conversationSummary
     toolResults = [...toolResults, ...secondExecution.results]
     validationErrors.push(...continuation.validationErrors, ...secondExecution.validationErrors)
+  } else if (firstTurn.toolCalls.length === 0 && shouldRecoverFromPassiveClarification(
+    firstTurn.message,
+    input.userMessage,
+    turnInput.conversationSummary,
+  )) {
+    // Some API models ignore the autonomy rules and repeatedly ask for an
+    // intake checklist. Give the model one bounded retry with a verified
+    // local project read and an explicit instruction to proceed. This never
+    // loops and does not create provider/generation side effects by itself.
+    const recoveryRead = await executeAgentToolCalls([{
+      id: 'autonomy-recovery-project-read',
+      name: 'film.get_project' as const,
+      arguments: {},
+      idempotencyKey: 'autonomy-recovery-project-read',
+    }], executionContext)
+    const currentProject = executionContext.projectId
+      ? useFilmProjectStore.getState().getProjectById(executionContext.projectId)
+      : null
+    const continuation = await input.adapter.continueWithToolResults({
+      ...turnInput,
+      userMessage: `${input.userMessage}\n\nINTERNAL AUTONOMY RECOVERY: Your previous reply stalled by asking for an intake checklist. Do not ask for those details again. Use sensible explicit assumptions, invent missing creative details, and create or update the structured FilmProject now with the available tools. Return concrete useful work in the user's language.`,
+      projectContext: currentProject,
+      toolResults: recoveryRead.results,
+    })
+    const secondExecution = await executeAgentToolCalls(continuation.toolCalls.slice(0, 19), executionContext)
+    message = continuation.message || message
+    conversationSummary = continuation.conversationSummary || conversationSummary
+    toolResults = [...toolResults, ...recoveryRead.results, ...secondExecution.results]
+    validationErrors.push(...recoveryRead.validationErrors, ...continuation.validationErrors, ...secondExecution.validationErrors)
   }
 
-  const project = useFilmProjectStore.getState().getProjectForWorkflow(input.workflow.id)
+  const project = executionContext.projectId
+    ? useFilmProjectStore.getState().getProjectById(executionContext.projectId)
+    : null
   if (project && conversationSummary) {
     useFilmProjectStore.getState().updateProject(project.id, (current) => ({
       ...current,
@@ -115,7 +170,7 @@ export const runFilmAgentTurn = async (input: RunFilmAgentTurnInput): Promise<Ru
       ? 'Film project structure updated. Review Tasks, Context, Scenes, and the workflow proposal before applying changes.'
       : 'No structured project changes were applied.'),
     conversationSummary,
-    project: useFilmProjectStore.getState().getProjectForWorkflow(input.workflow.id),
+    project,
     pendingPatch,
     toolResults,
     validationErrors,

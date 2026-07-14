@@ -3298,6 +3298,15 @@ function getWorkflowDataSignature(workflow: Workflow) {
     .join('|')
 }
 
+function getWorkflowNodeContentSignature(node: WorkflowNode): string {
+  const data = { ...(node.data as Record<string, unknown>) }
+  // Enabled state only changes the shell/toggle classes. Keeping it out of
+  // the content signature prevents generated media and its hover controls
+  // from being destroyed and recreated for a simple enable/disable click.
+  delete data.enabled
+  return `${node.type}:${JSON.stringify(data)}`
+}
+
 function buildWorkflowSliceForTarget(workflow: Workflow, targetNodeId: string): Workflow | null {
   const targetNode = workflow.nodes.find((node) => node.id === targetNodeId)
   if (!targetNode) return null
@@ -3890,9 +3899,9 @@ function agentPromptSectionPriority(line: string): number {
   if (!normalized.includes('prompt')) return 0
   if (/prompt\s+(goc|nguon|original|source)\b/.test(normalized)) return 10
   if (
-    /final\s+(?:ai\s+|video\s+|generation\s+)*prompt\b/.test(normalized)
-    || /(?:ai\s+video|generation)\s+prompt\b/.test(normalized)
-    || /prompt\s+(?:swap|hoan\s+chinh|cuoi(?:\s+cung)?|final)\b/.test(normalized)
+    /final\s+(?:ai\s+|image\s+|video\s+|generation\s+)*prompt\b/.test(normalized)
+    || /(?:ai\s+video|image|video|motion|generation)\s+prompt\b/.test(normalized)
+    || /prompt\s+(?:anh|video|swap|hoan\s+chinh|cuoi(?:\s+cung)?|final)\b/.test(normalized)
   ) return 100
   return /^prompt\b/.test(normalized) ? 40 : 0
 }
@@ -3908,6 +3917,35 @@ function cleanAgentPromptCandidate(value: string): string {
     .trim()
   if (/^\*[^*][\s\S]*[^*]\*$/.test(cleaned)) cleaned = cleaned.slice(1, -1).trim()
   return cleaned
+}
+
+const AGENT_PROMPT_VISUAL_SIGNALS: RegExp[] = [
+  /\b(?:portrait|woman|man|girl|boy|person|character|product|car|vehicle|landscape|city|room|scene|subject|creature|animal|co gai|chang trai|nguoi|nhan vat|san pham|phong canh|canh quay)\b/,
+  /\b(?:camera|shot|close-up|closeup|wide shot|medium shot|full body|aerial|macro|lens|framing|composition|depth of field|bokeh|goc may|bo cuc|toan than|can canh)\b/,
+  /\b(?:light|lighting|shadow|golden hour|neon|color palette|backlit|soft light|dramatic light|anh sang|bong do|bang mau)\b/,
+  /\b(?:cinematic|photorealistic|realistic|anime|manga|editorial|illustration|documentary|commercial|stylized|4k|8k|dien anh|sieu thuc|minh hoa)\b/,
+  /\b(?:16:9|9:16|1:1|4:3|3:4|aspect ratio|resolution|fps|seconds|duration|ty le|do phan giai)\b/,
+  /\b(?:walking|running|driving|moving|turning|panning|tracking|dolly|zooming|transitions?|motion|chuyen dong|buoc di|xoay nguoi)\b/,
+  /(?:@image\d+\b|\b(?:preserve|transform|replace|restyle|remove|change|giu nguyen|thay doi|bien doi)\b)/,
+]
+
+function isUsableAgentPromptCandidate(value: string, explicitlyLabeled = false): boolean {
+  const candidate = cleanAgentPromptCandidate(value)
+  if (candidate.length < 12 || candidate.split(/\s+/).length < 3) return false
+  if (/^[\[{]/.test(candidate) || /<\/?[a-z][^>]*>/i.test(candidate)) return false
+
+  const normalized = normalizeAgentSectionLabel(candidate)
+  if (
+    /^(?:selecting|selected|proposing|proposed|preparing|prepared|updating|updated|completed|finished|running|reviewing|reviewed|i am|i'm|i will|i can|we will|here is|sure|of course|dang|da|se|toi se|minh se|tat nhien|duoi day)\b/.test(normalized)
+  ) return false
+  if (/\?$/.test(normalized) && normalized.length < 220) return false
+  if (explicitlyLabeled) return true
+
+  const visualSignalCount = AGENT_PROMPT_VISUAL_SIGNALS.reduce(
+    (count, pattern) => count + (pattern.test(normalized) ? 1 : 0),
+    0,
+  )
+  return visualSignalCount >= 2
 }
 
 function extractAgentPromptForNode(responseText: string): string {
@@ -3942,7 +3980,7 @@ function extractAgentPromptForNode(responseText: string): string {
         cursor += 1
       }
       const candidate = cleanAgentPromptCandidate([inlinePrompt, ...fenced].filter(Boolean).join('\n'))
-      if (candidate) return candidate
+      if (isUsableAgentPromptCandidate(candidate, selectedPriority >= 40)) return candidate
     }
 
     if (cursor < lines.length && /^\s*>/.test(lines[cursor])) {
@@ -3952,7 +3990,7 @@ function extractAgentPromptForNode(responseText: string): string {
         cursor += 1
       }
       const candidate = cleanAgentPromptCandidate([inlinePrompt, ...quoted].filter(Boolean).join('\n'))
-      if (candidate) return candidate
+      if (isUsableAgentPromptCandidate(candidate, selectedPriority >= 40)) return candidate
     }
 
     const section: string[] = inlinePrompt ? [inlinePrompt] : []
@@ -3966,22 +4004,24 @@ function extractAgentPromptForNode(responseText: string): string {
       section.push(line)
     }
     const candidate = cleanAgentPromptCandidate(section.join('\n'))
-    if (candidate) return candidate
+    if (isUsableAgentPromptCandidate(candidate, selectedPriority >= 40)) return candidate
   }
 
   const fencedBlocks = Array.from(normalizedText.matchAll(/```[^\n]*\n([\s\S]*?)```/g), (match) => cleanAgentPromptCandidate(match[1]))
-    .filter(Boolean)
+    .filter((candidate) => isUsableAgentPromptCandidate(candidate))
     .sort((left, right) => right.length - left.length)
   if (fencedBlocks[0]) return fencedBlocks[0]
 
   const quotedBlocks = Array.from(normalizedText.matchAll(/(?:^|\n)((?:\s*>[^\n]*(?:\n|$))+)/g), (match) => cleanAgentPromptCandidate(match[1]))
-    .filter(Boolean)
+    .filter((candidate) => isUsableAgentPromptCandidate(candidate))
     .sort((left, right) => right.length - left.length)
   if (quotedBlocks[0]) return quotedBlocks[0]
 
   const paragraphs = normalizedText.split(/\n\s*\n/).map((paragraph) => paragraph.trim()).filter(Boolean)
   const hasStructuredResponse = paragraphs.length > 1 || /^\s*(?:#{1,6}\s|\*\*|[-*]\s|\d+[.)]\s)/m.test(normalizedText)
-  return hasStructuredResponse ? '' : cleanAgentPromptCandidate(normalizedText)
+  if (hasStructuredResponse) return ''
+  const candidate = cleanAgentPromptCandidate(normalizedText)
+  return isUsableAgentPromptCandidate(candidate) ? candidate : ''
 }
 
 function renderVideoAgentComposerText(value: string): React.ReactNode {
@@ -4120,14 +4160,28 @@ const FilmProductionAgentPanel: React.FC<{
   const [skillDraftInstruction, setSkillDraftInstruction] = useState('')
   const selectedSkill = skillLibrary.skills.find((skill) => skill.id === skillLibrary.selectedSkillId) || null
   const filmProjects = useFilmProjectStore((state) => state.projects)
-  const activeFilmProjectId = useFilmProjectStore((state) => state.activeProjectByWorkflow[workflow.id])
-  const filmProject = filmProjects.find((project) => project.id === activeFilmProjectId)
+  const activeConversation = conversationHistory.find((conversation) => conversation.id === activeConversationId) || null
+  const legacyActiveFilmProjectId = useFilmProjectStore((state) => state.activeProjectByWorkflow[workflow.id])
+  const legacyFilmProject = filmProjects.find((project) => project.id === legacyActiveFilmProjectId)
     || filmProjects.find((project) => project.workflowId === workflow.id)
     || null
+  const filmProject = activeConversation?.filmProjectId === undefined
+    ? legacyFilmProject
+    : activeConversation.filmProjectId
+      ? filmProjects.find((project) => project.id === activeConversation.filmProjectId) || null
+      : null
   const activeAgentTab = useAgentStore((state) => state.activeTab)
   const agentMode = useAgentStore((state) => state.modesByWorkflow[workflow.id] || 'run-with-approval')
-  const pendingWorkflowPatch = useAgentStore((state) => state.pendingPatchesByWorkflow[workflow.id] || null)
+  const workflowPendingPatch = useAgentStore((state) => state.pendingPatchesByWorkflow[workflow.id] || null)
+  const pendingWorkflowPatch = filmProject && workflowPendingPatch
+    && (!workflowPendingPatch.projectId || workflowPendingPatch.projectId === filmProject.id)
+    ? workflowPendingPatch
+    : null
   const agentActivities = useAgentStore((state) => state.activities)
+  const visibleAgentActivities = useMemo(
+    () => filmProject ? agentActivities.filter((activity) => activity.projectId === filmProject.id) : [],
+    [agentActivities, filmProject],
+  )
   const pilotJobs = useAgentStore((state) => state.pilotJobs)
   const selectedWorkflowNodeId = useWorkflowStore((state) => state.selectedNodeId)
   const [applyingWorkflowPatch, setApplyingWorkflowPatch] = useState(false)
@@ -4136,7 +4190,7 @@ const FilmProductionAgentPanel: React.FC<{
     .filter((approval) => approval.status === 'pending' && (approval.type === 'pilot-image' || approval.type === 'pilot-video'))
     .sort((left, right) => left.createdAt - right.createdAt), [filmProject?.approvals])
   const visiblePilotJobs = useMemo(() => pilotJobs
-    .filter((job) => !filmProject || job.projectId === filmProject.id)
+    .filter((job) => Boolean(filmProject) && job.projectId === filmProject?.id)
     .slice(-4)
     .reverse(), [filmProject, pilotJobs])
   const slashCommandMatch = input.trim().match(/^\/([^\s]*)$/)
@@ -4314,6 +4368,8 @@ const FilmProductionAgentPanel: React.FC<{
     void loadVideoAgentConversationState(workflow.id)
       .then(async (state) => {
         if (!active) return
+        await useFilmProjectStore.getState().hydrate()
+        if (!active) return
         let conversations = state.conversations
         let activeId = state.activeConversationId
         if (!activeId) {
@@ -4323,7 +4379,19 @@ const FilmProductionAgentPanel: React.FC<{
           conversations = [conversation]
           activeId = conversation.id
         }
-        const activeConversation = conversations.find((conversation) => conversation.id === activeId) || conversations[0]
+        let activeConversation = conversations.find((conversation) => conversation.id === activeId) || conversations[0]
+        if (activeConversation?.filmProjectId === undefined) {
+          const legacyProjectId = useFilmProjectStore.getState().getProjectForWorkflow(workflow.id)?.id || null
+          activeConversation = { ...activeConversation, filmProjectId: legacyProjectId, updatedAt: Date.now() }
+          conversations = conversations.map((conversation) => conversation.id === activeConversation?.id
+            ? activeConversation as VideoAgentConversation
+            : conversation)
+          await saveVideoAgentConversation(activeConversation)
+          if (!active) return
+        }
+        if (activeConversation?.filmProjectId !== undefined) {
+          useFilmProjectStore.getState().setActiveProject(workflow.id, activeConversation.filmProjectId)
+        }
         conversationHistoryRef.current = conversations
         setConversationHistory(conversations)
         setActiveConversationId(activeConversation?.id || null)
@@ -4479,7 +4547,11 @@ const FilmProductionAgentPanel: React.FC<{
     window.requestAnimationFrame(() => inputRef.current?.focus())
   }
 
-  const persistConversationSnapshot = async (conversationId: string, nextMessages: VideoAgentMessage[]) => {
+  const persistConversationSnapshot = async (
+    conversationId: string,
+    nextMessages: VideoAgentMessage[],
+    filmProjectId?: string | null,
+  ) => {
     const existing = conversationHistoryRef.current.find((conversation) => conversation.id === conversationId)
     if (!existing) throw new Error('The active AI Idea Agent conversation is unavailable.')
     const firstUserMessage = nextMessages.find((message) => message.role === 'user')?.text
@@ -4487,6 +4559,7 @@ const FilmProductionAgentPanel: React.FC<{
       .trim()
     const updatedConversation: VideoAgentConversation = {
       ...existing,
+      ...(filmProjectId !== undefined ? { filmProjectId } : {}),
       title: firstUserMessage ? firstUserMessage.slice(0, 90) : existing.title,
       messages: nextMessages,
       updatedAt: Date.now(),
@@ -4505,6 +4578,11 @@ const FilmProductionAgentPanel: React.FC<{
     if (!brief || isRunning) return
     if (!conversationHistoryReady || !activeConversationId) {
       setError('AI Idea Agent conversation history is still loading. Try again in a moment.')
+      return
+    }
+    const requestConversation = conversationHistoryRef.current.find((conversation) => conversation.id === activeConversationId)
+    if (!requestConversation) {
+      setError('The active AI Idea Agent conversation is unavailable. Start a new conversation and try again.')
       return
     }
     if (activeProvider === 'api' && !apiProviderReady) {
@@ -4575,6 +4653,8 @@ const FilmProductionAgentPanel: React.FC<{
           : null,
         userMessage: agentRequest,
         conversationSummary: durableConversationContext,
+        projectId: requestConversation.filmProjectId,
+        conversationId: activeConversationId,
         mode: agentMode,
         adapter: new PromptAssistantAgentModelAdapter({
           provider: activeProvider,
@@ -4596,7 +4676,8 @@ const FilmProductionAgentPanel: React.FC<{
         createdAt: assistantMessageCreatedAt,
       }
       const completedConversation = [...conversation, assistantMessage]
-      await persistConversationSnapshot(activeConversationId, completedConversation)
+      const resolvedProjectId = runtimeResult.project?.id || requestConversation.filmProjectId || null
+      await persistConversationSnapshot(activeConversationId, completedConversation, resolvedProjectId)
       setMessages(completedConversation)
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : 'AI Idea Agent could not complete this request.')
@@ -4681,6 +4762,7 @@ const FilmProductionAgentPanel: React.FC<{
       conversationHistoryRef.current = nextHistory
       setConversationHistory(nextHistory)
       setActiveConversationId(conversation.id)
+      useFilmProjectStore.getState().setActiveProject(workflow.id, null)
       setMessages(conversation.messages)
       setInput('')
       setInputScrollTop(0)
@@ -4700,9 +4782,20 @@ const FilmProductionAgentPanel: React.FC<{
       return
     }
     try {
-      await setActiveVideoAgentConversation(workflow.id, conversation.id)
-      setActiveConversationId(conversation.id)
-      setMessages(conversation.messages)
+      const resolvedConversation = conversation.filmProjectId === undefined
+        ? { ...conversation, filmProjectId: null, updatedAt: Date.now() }
+        : conversation
+      if (resolvedConversation !== conversation) {
+        await saveVideoAgentConversation(resolvedConversation)
+        const nextHistory = conversationHistoryRef.current.map((item) => item.id === resolvedConversation.id ? resolvedConversation : item)
+        conversationHistoryRef.current = nextHistory
+        setConversationHistory(nextHistory)
+      } else {
+        await setActiveVideoAgentConversation(workflow.id, resolvedConversation.id)
+      }
+      setActiveConversationId(resolvedConversation.id)
+      useFilmProjectStore.getState().setActiveProject(workflow.id, resolvedConversation.filmProjectId)
+      setMessages(resolvedConversation.messages)
       setInput('')
       setInputScrollTop(0)
       setActiveSlashCommand(null)
@@ -4734,10 +4827,25 @@ const FilmProductionAgentPanel: React.FC<{
         ? remaining[0]
         : remaining.find((conversation) => conversation.id === activeConversationId) || remaining[0]
       await deleteVideoAgentConversation(workflow.id, conversationId, nextActiveConversation?.id || null)
+      const deletedProjectId = typeof existing.filmProjectId === 'string' ? existing.filmProjectId : null
+      const projectStillReferenced = deletedProjectId
+        ? remaining.some((conversation) => conversation.filmProjectId === deletedProjectId)
+        : false
+      if (deletedProjectId && !projectStillReferenced) {
+        await useFilmProjectStore.getState().removeProject(deletedProjectId)
+        useAgentStore.getState().clearProjectActivities(deletedProjectId)
+        const pendingPatch = useAgentStore.getState().pendingPatchesByWorkflow[workflow.id]
+        if (pendingPatch?.projectId === deletedProjectId) {
+          useAgentStore.getState().setPendingPatch(workflow.id, null)
+        }
+      }
       conversationHistoryRef.current = remaining
       setConversationHistory(remaining)
       if (deletingActiveConversation && nextActiveConversation) {
         setActiveConversationId(nextActiveConversation.id)
+        if (nextActiveConversation.filmProjectId !== undefined) {
+          useFilmProjectStore.getState().setActiveProject(workflow.id, nextActiveConversation.filmProjectId)
+        }
         setMessages(nextActiveConversation.messages)
         setInput('')
         setInputScrollTop(0)
@@ -4813,7 +4921,7 @@ const FilmProductionAgentPanel: React.FC<{
   }
 
   const currentFilmProject = (): FilmProject | null =>
-    useFilmProjectStore.getState().getProjectForWorkflow(workflow.id)
+    filmProject?.id ? useFilmProjectStore.getState().getProjectById(filmProject.id) : null
 
   const resolvePilotRunApproval = async (approvalId: string, prompt: string) => {
     if (busyPilotApprovalId) return
@@ -5039,8 +5147,8 @@ const FilmProductionAgentPanel: React.FC<{
                         {confirmingDelete && (
                           <div className="absolute inset-0 z-10 flex items-center gap-2 bg-[#1A1A1A] px-3 shadow-[inset_0_0_0_1px_rgba(248,113,113,0.16)]">
                             <span className="min-w-0 flex-1 truncate text-[10px] font-medium text-white/65">Delete this conversation?</span>
-                            <button type="button" onClick={() => setDeleteConversationId(null)} className="h-7 rounded-lg px-2.5 text-[9px] font-medium text-white/38 hover:bg-white/[0.06] hover:text-white/70">Cancel</button>
-                            <button type="button" onClick={() => void deleteSavedConversation(conversation.id)} className="h-7 rounded-lg bg-[#dc3545] px-2.5 text-[9px] font-semibold text-white shadow-[0_7px_20px_rgba(220,53,69,0.22)] transition-colors hover:bg-[#e04454]">Delete</button>
+                            <button type="button" onClick={() => setDeleteConversationId(null)} className="h-7 rounded-lg px-2.5 text-[10px] font-medium text-white/38 hover:bg-white/[0.06] hover:text-white/70">Cancel</button>
+                            <button type="button" onClick={() => void deleteSavedConversation(conversation.id)} className="h-7 rounded-lg bg-[#dc3545] px-2.5 text-[10px] font-semibold text-white shadow-[0_7px_20px_rgba(220,53,69,0.22)] transition-colors hover:bg-[#e04454]">Delete</button>
                           </div>
                         )}
                       </div>
@@ -5077,7 +5185,7 @@ const FilmProductionAgentPanel: React.FC<{
                 activeAgentTab === tab ? 'bg-[#7C5CFF]/13 text-[#D1C8FF]' : 'text-white/28 hover:bg-white/[0.04] hover:text-white/58'
               )}
             >
-              {tab}{tab === 'tasks' && filmProject ? ` ${filmProject.tasks.filter((task) => task.status !== 'completed').length}` : ''}
+              {tab}
             </button>
           ))}
         </div>
@@ -5099,7 +5207,7 @@ const FilmProductionAgentPanel: React.FC<{
       </div>
 
       {activeAgentTab === 'chat' ? <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4">
-        {agentMode === 'auto' && <div className="rounded-xl border border-amber-300/10 bg-amber-300/[0.035] px-3 py-2 text-[8px] leading-3.5 text-amber-100/45">Auto is limited to one pilot shot in Phase 2. Image and video submissions still require approval.</div>}
+        {agentMode === 'auto' && <div className="rounded-xl border border-amber-300/10 bg-amber-300/[0.035] px-3 py-2 text-[10px] leading-4 text-amber-100/45">Auto is limited to one pilot shot in Phase 2. Image and video submissions still require approval.</div>}
         {messages.length === 0 && !isRunning && (
           <div className="flex min-h-full flex-col items-center justify-center py-8 text-center">
             <span className="flex h-12 w-12 items-center justify-center rounded-2xl border border-[#7C5CFF]/20 bg-[#7C5CFF]/10 text-[#B8A8FF] shadow-[0_12px_34px_rgba(124,92,255,0.12)]">
@@ -5117,7 +5225,11 @@ const FilmProductionAgentPanel: React.FC<{
           </div>
         )}
 
-        {messages.map((message, messageIndex) => (
+        {messages.map((message, messageIndex) => {
+          const promptForNode = message.role === 'assistant'
+            ? extractAgentPromptForNode(message.text)
+            : ''
+          return (
           <div key={message.id} className={cn('flex', message.role === 'user' ? 'justify-end' : 'justify-start')}>
             <div className={cn('max-w-[94%] rounded-2xl px-3.5 py-3 text-[11px] leading-[1.65]', message.role === 'user' ? 'rounded-br-md bg-[#7C5CFF] text-white' : 'rounded-bl-md border border-white/[0.08] bg-[#1B1B1B] text-white/72')}>
               <div className="whitespace-pre-wrap break-words">
@@ -5125,40 +5237,35 @@ const FilmProductionAgentPanel: React.FC<{
               </div>
               {message.role === 'assistant' && (
                 <div className="mt-3 flex items-center gap-1.5 border-t border-white/[0.07] pt-2.5">
-                   <button type="button" onClick={() => void copyMessage(message.text)} className="flex h-7 items-center gap-1.5 rounded-lg px-2 text-[9px] font-medium text-white/34 hover:bg-white/[0.06] hover:text-white/70">
+                   <button type="button" onClick={() => void copyMessage(message.text)} className="flex h-7 items-center gap-1.5 rounded-lg px-2 text-[10px] font-medium text-white/34 hover:bg-white/[0.06] hover:text-white/70">
                      <Copy className="h-3 w-3" /> Copy
                    </button>
                    {isSkillCreatorAgentResponse(messages, messageIndex) && (
-                     <button type="button" onClick={() => openSkillEditor(undefined, message.text)} className="flex h-7 items-center gap-1.5 rounded-lg px-2 text-[9px] font-medium text-white/34 hover:bg-white/[0.06] hover:text-white/70">
+                     <button type="button" onClick={() => openSkillEditor(undefined, message.text)} className="flex h-7 items-center gap-1.5 rounded-lg px-2 text-[10px] font-medium text-white/34 hover:bg-white/[0.06] hover:text-white/70">
                        <BookOpen className="h-3 w-3" /> Save skill
                      </button>
                    )}
-                   <button
+                   {promptForNode && <button
                     type="button"
                     onClick={() => {
-                      const promptText = extractAgentPromptForNode(message.text)
-                        || filmProject?.shots.find((shot) => shot.imagePrompt.trim())?.imagePrompt.trim()
-                      if (!promptText) {
-                        setError('Could not identify a final generation prompt in this response. Ask the Agent to return a FINAL GENERATION PROMPT, then try again.')
-                        return
-                      }
-                      onInsertPrompt(promptText, message.provider || activeProvider)
+                      onInsertPrompt(promptForNode, message.provider || activeProvider)
                       setError('')
                       setInsertedMessageId(message.id)
                       window.setTimeout(() => setInsertedMessageId((current) => current === message.id ? null : current), 1600)
                     }}
-                    className="flex h-7 items-center gap-1.5 rounded-lg bg-[#7C5CFF]/14 px-2.5 text-[9px] font-semibold text-[#C8BCFF] hover:bg-[#7C5CFF]/22 hover:text-white"
+                    className="flex h-7 items-center gap-1.5 rounded-lg bg-[#7C5CFF]/14 px-2.5 text-[10px] font-semibold text-[#C8BCFF] hover:bg-[#7C5CFF]/22 hover:text-white"
                   >
                     <Plus className="h-3 w-3" /> {insertedMessageId === message.id ? 'Added to canvas' : 'Add Prompt Node'}
-                  </button>
+                  </button>}
                 </div>
               )}
             </div>
           </div>
-        ))}
+          )
+        })}
 
-        {agentActivities.filter((activity) => !filmProject || activity.projectId === filmProject.id).slice(-4).map((activity) => (
-          <div key={activity.id} className="flex items-center gap-2 rounded-xl border border-white/[0.06] bg-white/[0.018] px-3 py-2 text-[8px] text-white/34">
+        {visibleAgentActivities.slice(-4).map((activity) => (
+          <div key={activity.id} className="flex items-center gap-2 rounded-xl border border-white/[0.06] bg-white/[0.018] px-3 py-2 text-[10px] text-white/34">
             <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', activity.status === 'completed' ? 'bg-emerald-300/70' : activity.status === 'failed' ? 'bg-red-300/70' : activity.status === 'waiting-approval' ? 'bg-amber-300/70' : 'bg-[#A895FF]')} />
             <span className="truncate">{activity.summary}</span>
           </div>
@@ -5204,18 +5311,18 @@ const FilmProductionAgentPanel: React.FC<{
         )}
         <div ref={messageEndRef} />
       </div> : <div className="min-h-0 flex-1 overflow-y-auto">
-        {activeAgentTab === 'tasks' && <AgentTasks project={filmProject} activities={agentActivities.filter((activity) => !filmProject || activity.projectId === filmProject.id)} />}
+        {activeAgentTab === 'tasks' && <AgentTasks project={filmProject} activities={visibleAgentActivities} />}
         {activeAgentTab === 'context' && <AgentContext project={filmProject} />}
         {activeAgentTab === 'scenes' && <AgentScenes project={filmProject} busyApprovalId={busyPilotApprovalId} onViewNode={(nodeId) => useWorkflowStore.getState().setSelectedNode(nodeId)} onApprove={approvePilotReview} onRegenerate={regeneratePilotReview} onReject={rejectPilotReview} onPrepareRetry={preparePilotRetry} />}
       </div>}
 
       <div className="shrink-0 border-t border-white/[0.07] bg-[#131313] p-3.5">
-        {error && <div className="mb-2 rounded-lg border border-red-400/15 bg-red-500/[0.07] px-2.5 py-2 text-[9px] leading-4 text-red-200/75">{error}</div>}
+        {error && <div className="mb-2 rounded-lg border border-red-400/15 bg-red-500/[0.07] px-2.5 py-2 text-[10px] leading-4 text-red-200/75">{error}</div>}
         <div ref={slashCommandMenuRef} className="relative rounded-2xl border border-white/[0.09] bg-[#0F0F0F] p-2.5 transition-colors focus-within:border-[#7C5CFF]/55 focus-within:ring-2 focus-within:ring-[#7C5CFF]/10">
           {showImageMentionMenu && (
             <div className="absolute bottom-[calc(100%+8px)] left-0 right-0 z-[205] max-h-[260px] overflow-y-auto rounded-xl border border-white/[0.1] bg-[#202020] p-1 shadow-[0_20px_58px_rgba(0,0,0,0.72)]">
               <div className="flex items-center justify-between px-2.5 py-2">
-                <span className="text-[9px] font-semibold text-white/48">Workflow images</span>
+                <span className="text-[10px] font-semibold text-white/48">Workflow images</span>
                 <span className="text-[8px] text-white/22">{workflowImageReferences.length}</span>
               </div>
               {filteredImageMentionOptions.map((image, index) => (
@@ -5379,7 +5486,7 @@ const FilmProductionAgentPanel: React.FC<{
                 onClick={() => setSkillMenuOpen((current) => !current)}
                 title={selectedSkill ? `Active skill: ${selectedSkill.name}` : 'Choose a reusable AI Idea Agent skill'}
                 className={cn(
-                  'flex h-8 max-w-[190px] items-center gap-1.5 rounded-lg px-2 text-[9px] font-medium outline-none transition-colors disabled:cursor-not-allowed disabled:opacity-35',
+                  'flex h-8 max-w-[190px] items-center gap-1.5 rounded-lg px-2 text-[10px] font-medium outline-none transition-colors disabled:cursor-not-allowed disabled:opacity-35',
                   selectedSkill
                     ? 'bg-[#7C5CFF]/12 text-[#C8BCFF] hover:bg-[#7C5CFF]/18'
                     : 'text-white/30 hover:bg-white/[0.05] hover:text-white/65'
@@ -5397,7 +5504,7 @@ const FilmProductionAgentPanel: React.FC<{
                       <p className="text-[10px] font-semibold text-white/78">Agent skills</p>
                       <p className="mt-0.5 text-[8px] text-white/28">Reusable creative instructions</p>
                     </div>
-                    <button type="button" onClick={() => openSkillEditor()} className="flex h-7 items-center gap-1 rounded-lg bg-[#7C5CFF]/14 px-2 text-[9px] font-semibold text-[#C8BCFF] hover:bg-[#7C5CFF]/22">
+                    <button type="button" onClick={() => openSkillEditor()} className="flex h-7 items-center gap-1 rounded-lg bg-[#7C5CFF]/14 px-2 text-[10px] font-semibold text-[#C8BCFF] hover:bg-[#7C5CFF]/22">
                       <Plus className="h-3 w-3" /> New
                     </button>
                   </div>
@@ -5421,7 +5528,7 @@ const FilmProductionAgentPanel: React.FC<{
                     {skillLibrary.skills.length === 0 ? (
                       <div className="px-3 py-6 text-center">
                         <BookOpen className="mx-auto h-5 w-5 text-white/18" />
-                        <p className="mt-2 text-[9px] text-white/30">No saved skills yet</p>
+                        <p className="mt-2 text-[10px] text-white/30">No saved skills yet</p>
                       </div>
                     ) : skillLibrary.skills.map((skill) => {
                       const active = skill.id === selectedSkill?.id
@@ -5472,12 +5579,12 @@ const FilmProductionAgentPanel: React.FC<{
                       </div>
                       <Select.Viewport className="max-h-[330px] py-1">
                         {apiModelsLoading && visibleApiModels.length === 0 && (
-                          <div className="flex h-14 items-center justify-center gap-2 text-[9px] text-white/32">
+                          <div className="flex h-14 items-center justify-center gap-2 text-[10px] text-white/32">
                             <LoaderCircle className="h-3.5 w-3.5 animate-spin text-[#A895FF]" /> Loading available models…
                           </div>
                         )}
                         {!apiModelsLoading && apiModelsError && (
-                          <div className="px-3 py-4 text-[9px] leading-4 text-red-200/65">{apiModelsError}</div>
+                          <div className="px-3 py-4 text-[10px] leading-4 text-red-200/65">{apiModelsError}</div>
                         )}
                         {apiModelGroups.map(([plan, models]) => (
                           <Select.Group key={plan}>
@@ -5564,7 +5671,7 @@ const FilmProductionAgentPanel: React.FC<{
 
             <div className="space-y-3 px-4 py-4">
               <label className="block">
-                <span className="mb-1.5 block text-[9px] font-medium text-white/42">Skill name</span>
+                <span className="mb-1.5 block text-[10px] font-medium text-white/42">Skill name</span>
                 <input
                   autoFocus
                   value={skillDraftName}
@@ -5575,7 +5682,7 @@ const FilmProductionAgentPanel: React.FC<{
                 />
               </label>
               <label className="block">
-                <span className="mb-1.5 block text-[9px] font-medium text-white/42">Reusable instructions</span>
+                <span className="mb-1.5 block text-[10px] font-medium text-white/42">Reusable instructions</span>
                 <textarea
                   value={skillDraftInstruction}
                   maxLength={12000}
@@ -5652,6 +5759,7 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
   const canvasRef = useRef<HTMLDivElement>(null)
   const editorRef = useRef<DrawflowInstance | null>(null)
   const workflowRef = useRef(workflow)
+  const renderedNodeStateRef = useRef<Map<string, { contentSignature: string; enabled: boolean }>>(new Map())
   const autoFitWorkflowIdRef = useRef<string | null>(null)
   const suppressEdgeEventRef = useRef(false)
   const connectionSyncFrameRef = useRef<number | null>(null)
@@ -6188,6 +6296,10 @@ const WorkflowCanvas: React.FC<WorkflowCanvasProps> = ({ workflow, isSidebarOpen
               const content = domNode.closest('.drawflow_content_node') || domNode.parentElement
               if (content) {
                 content.innerHTML = renderDrawflowNode(updatedNode)
+                renderedNodeStateRef.current.set(nodeId, {
+                  contentSignature: getWorkflowNodeContentSignature(updatedNode),
+                  enabled: (updatedNode.data as Record<string, unknown>).enabled !== false,
+                })
                 applyPortAttributesForNode(updatedNode)
                 applyNodeVisualRunState(nodeId, 'completed')
                 attachNodeResizeObserver(nodeId)
@@ -7673,7 +7785,13 @@ const groupDragMirrorLog = (
     })
 
     const content = canvasRef.current?.querySelector(`#node-${CSS.escape(node.id)} .drawflow_content_node`)
-    if (content) content.innerHTML = renderDrawflowNode(node)
+    if (content) {
+      content.innerHTML = renderDrawflowNode(node)
+      renderedNodeStateRef.current.set(node.id, {
+        contentSignature: getWorkflowNodeContentSignature(node),
+        enabled: (node.data as Record<string, unknown>).enabled !== false,
+      })
+    }
     applyPortAttributesForNode(node)
     syncNodeRunStates()
     attachNodeResizeObserver(node.id)
@@ -8324,6 +8442,14 @@ const groupDragMirrorLog = (
     suppressEdgeEventRef.current = true
     editor.import(buildDrawflowData(workflowRef.current), false)
     suppressEdgeEventRef.current = false
+
+    renderedNodeStateRef.current.clear()
+    for (const node of workflowRef.current.nodes) {
+      renderedNodeStateRef.current.set(node.id, {
+        contentSignature: getWorkflowNodeContentSignature(node),
+        enabled: (node.data as Record<string, unknown>).enabled !== false,
+      })
+    }
 
     // [CanvasFix] round-2: re-seed the position mirror after a
     // full import so the positionSignature effect does not treat
@@ -9835,7 +9961,6 @@ const groupDragMirrorLog = (
       })
 
       requestAnimationFrame(() => {
-        rerenderDrawflowNode(nodeId)
         syncSelectedNodeDom()
       })
     }
@@ -10065,6 +10190,10 @@ const groupDragMirrorLog = (
         const content = domNode.closest('.drawflow_content_node') || domNode.parentElement
         if (content) {
           content.innerHTML = renderDrawflowNode(updatedNode)
+          renderedNodeStateRef.current.set(nodeId, {
+            contentSignature: getWorkflowNodeContentSignature(updatedNode),
+            enabled: (updatedNode.data as Record<string, unknown>).enabled !== false,
+          })
           applyPortAttributesForNode(updatedNode)
         }
       })
@@ -10338,10 +10467,34 @@ const groupDragMirrorLog = (
       try {
         editor.updateNodeDataFromId(node.id, cloneDeep(node.data))
         const content = canvasRef.current?.querySelector(`#node-${CSS.escape(node.id)} .drawflow_content_node`)
-        if (content) content.innerHTML = renderDrawflowNode(node)
-        applyPortAttributesForNode(node)
-        attachNodeResizeObserver(node.id)
-        scheduleDrawflowConnectionRefresh(node.id)
+        if (!content) continue
+
+        const enabled = (node.data as Record<string, unknown>).enabled !== false
+        const contentSignature = getWorkflowNodeContentSignature(node)
+        const previous = renderedNodeStateRef.current.get(node.id)
+        const nodeRoot = content.querySelector<HTMLElement>('.df-node[data-workflow-node-id]')
+        const contentChanged = !previous
+          || previous.contentSignature !== contentSignature
+          || !nodeRoot
+
+        if (contentChanged) {
+          content.innerHTML = renderDrawflowNode(node)
+          applyPortAttributesForNode(node)
+          attachNodeResizeObserver(node.id)
+          scheduleDrawflowConnectionRefresh(node.id)
+        } else if (nodeRoot && previous.enabled !== enabled) {
+          const nextLabel = enabled ? 'Disable node' : 'Enable node'
+          nodeRoot.classList.toggle('df-node-disabled', !enabled)
+          nodeRoot.dataset.enabled = String(enabled)
+          nodeRoot.querySelectorAll<HTMLButtonElement>('.df-node-toggle').forEach((toggle) => {
+            toggle.classList.toggle('on', enabled)
+            toggle.classList.toggle('off', !enabled)
+            toggle.title = nextLabel
+            toggle.setAttribute('aria-label', nextLabel)
+          })
+        }
+
+        renderedNodeStateRef.current.set(node.id, { contentSignature, enabled })
       } catch {
         // Node may not be mounted yet; the structural hydrate will catch it.
       }

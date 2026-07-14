@@ -27,7 +27,7 @@ export const AgentTasks: React.FC<{ project: FilmProject | null; activities: Age
                   <div className="flex items-center justify-between gap-3"><p className="truncate text-[10px] font-medium text-white/68">{task.title}</p><span className="shrink-0 text-[8px] capitalize text-white/26">{statusOnly ? task.status.replace('-', ' ') : `${task.progress}%`}</span></div>
                   {!statusOnly && <div className="mt-2 h-1 overflow-hidden rounded-full bg-white/[0.05]"><div className="h-full rounded-full bg-[#8E73FF] transition-[width]" style={{ width: `${task.progress}%` }} /></div>}
                   {task.dependsOn.length > 0 && <p className="mt-1.5 truncate text-[7px] text-white/20">Depends on {task.dependsOn.join(', ')}</p>}
-                  {task.error && <p className="mt-1.5 text-[8px] leading-3 text-red-200/60">{task.error}</p>}
+                  {task.error && <p className="mt-1.5 text-[10px] leading-4 text-red-200/60">{task.error}</p>}
                 </div>
               </div>
             </div>
@@ -35,7 +35,7 @@ export const AgentTasks: React.FC<{ project: FilmProject | null; activities: Age
         })}
       </div>
       {activities.length > 0 && (
-        <div className="pt-1"><p className="mb-2 text-[9px] font-semibold uppercase tracking-[0.12em] text-white/25">Tool activity</p><div className="space-y-1">{activities.slice(-8).reverse().map((activity) => <div key={activity.id} className="flex items-center gap-2 rounded-lg px-1 py-1.5 text-[8px] text-white/36"><span className={cn('h-1.5 w-1.5 rounded-full', activity.status === 'completed' ? 'bg-emerald-300/70' : activity.status === 'failed' ? 'bg-red-300/70' : activity.status === 'waiting-approval' ? 'bg-amber-300/70' : 'bg-[#A895FF]')} /><span className="truncate">{activity.summary}</span></div>)}</div></div>
+        <div className="pt-1"><p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-white/25">Tool activity</p><div className="space-y-1">{activities.slice(-8).reverse().map((activity) => <div key={activity.id} className="flex items-center gap-2 rounded-lg px-1 py-1.5 text-[10px] text-white/36"><span className={cn('h-1.5 w-1.5 rounded-full', activity.status === 'completed' ? 'bg-emerald-300/70' : activity.status === 'failed' ? 'bg-red-300/70' : activity.status === 'waiting-approval' ? 'bg-amber-300/70' : 'bg-[#A895FF]')} /><span className="truncate">{activity.summary}</span></div>)}</div></div>
       )}
     </div>
   )
