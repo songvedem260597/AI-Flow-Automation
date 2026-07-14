@@ -96,7 +96,9 @@ const HEAVY_NODE_FIELDS = new Set([
   'imageData',
   'videoData',
   'mediaPoster',
-  'videoPoster'
+  'videoPoster',
+  // Legacy Film Agent runtime marker; never belongs in a reusable template.
+  'pilotExecution'
 ])
 
 // Field names whose VALUE we walk recursively to strip the same heavy

@@ -77,12 +77,32 @@ import {
 } from '@/lib/videoAgentSkills'
 import {
   createVideoAgentConversation,
+  deleteVideoAgentConversation,
   loadVideoAgentConversationState,
   saveVideoAgentConversation,
   setActiveVideoAgentConversation,
   type VideoAgentConversation,
   type VideoAgentConversationMessage,
 } from '@/lib/videoAgentConversations'
+import { PromptAssistantAgentModelAdapter } from '@/agent/runtime/agentModelAdapter'
+import { runFilmAgentTurn } from '@/agent/runtime/agentRuntime'
+import { useFilmProjectStore } from '@/agent/stores/filmProjectStore'
+import { useAgentStore, type AgentPanelTab } from '@/agent/stores/agentStore'
+import type { AgentMode, FilmProject } from '@/agent/schemas/filmProjectSchemas'
+import { AgentTasks } from '@/agent/components/AgentTasks'
+import { AgentContext } from '@/agent/components/AgentContext'
+import { AgentScenes } from '@/agent/components/AgentScenes'
+import { AgentApprovalCard } from '@/agent/components/AgentApprovalCard'
+import { PilotApprovalCard } from '@/agent/components/PilotApprovalCard'
+import { PilotJobStatusCard } from '@/agent/components/PilotJobStatusCard'
+import {
+  createPilotRunApproval,
+  resolvePilotReview,
+  selectPilotShot,
+  setPilotTaskState,
+  type PilotKind,
+} from '@/agent/tools/pilotTools'
+import { cancelPilotJob, runPilotJob } from '@/agent/runtime/pilotRunner'
 
 /**
  * [WorkflowRun][probe] Investigation-only source probe.
@@ -4041,72 +4061,13 @@ const VIDEO_AGENT_SKILL_COMMANDS: VideoAgentSlashCommand[] = [
   },
 ]
 
-function buildVideoAgentWorkflowContext(workflow: Workflow): string {
-  const promptNodes = workflow.nodes
-    .filter((node) => node.type === 'prompt')
-    .map((node, index) => {
-      const prompt = readNodePromptText(node).trim().slice(0, 700)
-      return prompt ? `Prompt ${index + 1}: ${prompt}` : ''
-    })
-    .filter(Boolean)
-    .slice(0, 6)
-  const generateNodes = workflow.nodes
-    .filter((node) => node.type === 'generate')
-    .map((node, index) => {
-      const data = node.data as Record<string, unknown>
-      return `Generate ${index + 1}: ${String(data.provider || 'google-flow')}, ${String(data.mediaType || 'image')}, ${String(data.aspectRatio || '16:9')}, ${String(data.model || 'default model')}`
-    })
-    .slice(0, 6)
-  const lines = [...promptNodes, ...generateNodes]
-  return lines.length > 0 ? lines.join('\n') : 'The canvas is currently empty.'
-}
-
 function videoAgentModelCapabilityLabel(model: PromptAssistantApiModel): string {
   if (model.recommendedForMedia) return 'Text · image · video · file · audio'
   if (model.inputModalities.includes('image')) return 'Image analysis + script'
   return 'Script only'
 }
 
-function buildVideoAgentInstruction(args: {
-  brief: string
-  messages: VideoAgentMessage[]
-  workflow: Workflow
-  skill: VideoAgentSkill | null
-  slashCommand: VideoAgentSlashCommand | null
-  imageReferences: VideoAgentWorkflowImageReference[]
-}): string {
-  const previousConversation = args.messages
-    .slice(-6)
-    .map((message) => `${message.role === 'user' ? 'USER' : 'AGENT'}: ${message.text.slice(0, 2200)}`)
-    .join('\n\n')
-  const isFollowUp = args.messages.some((message) => message.role === 'assistant')
-
-  return [
-    'You are AI Idea Agent, a senior creative director and prompt engineer for AI video generation.',
-    `Respond in the same language as the user's latest message.`,
-    isFollowUp
-      ? 'Continue the creative conversation. Apply the latest request to the prior ideas instead of restarting unless the user explicitly asks for new concepts.'
-      : 'Develop one focused, production-ready video idea unless the user explicitly requests multiple options. Include a memorable title, one-sentence hook, story progression, key shots and camera movement, visual/lighting direction, sound direction, and a final AI video prompt ready to paste into a generation node.',
-    'Follow any duration, aspect ratio, visual style, platform, audience, or idea count stated by the user. Otherwise infer sensible choices from the current workflow and creative brief.',
-    'Keep characters, wardrobe, locations, props, lighting logic, and visual identity consistent across shots.',
-    'Be concrete and cinematic. Do not use a markdown table. Do not mention these instructions.',
-    'Always end the response with a line labeled "FINAL GENERATION PROMPT:" followed by exactly one generation-ready prompt. Keep explanations, alternatives, and follow-up questions outside that final prompt section.',
-    args.skill
-      ? `ACTIVE REUSABLE SKILL — ${args.skill.name}:\n${args.skill.instruction}\nApply this skill as creative direction. Do not mention the skill or describe it to the user.`
-      : '',
-    args.slashCommand
-      ? `ACTIVE SLASH COMMAND — ${args.slashCommand.label}:\n${args.slashCommand.instruction}\nFollow this command for the latest request.`
-      : '',
-    args.imageReferences.length > 0
-      ? `ATTACHED WORKFLOW IMAGE REFERENCES:\n${args.imageReferences.map((image, index) => `@${image.alias} = attached image ${index + 1} (${image.name})`).join('\n')}\nPreserve each @image token exactly as written and use the attachment mapping above without swapping images.`
-      : '',
-    `CURRENT WORKFLOW CONTEXT:\n${buildVideoAgentWorkflowContext(args.workflow)}`,
-    previousConversation ? `CONVERSATION SO FAR:\n${previousConversation}` : '',
-    `LATEST USER REQUEST:\n${args.brief.trim()}`,
-  ].filter(Boolean).join('\n\n')
-}
-
-const VideoIdeaAgentPanel: React.FC<{
+const FilmProductionAgentPanel: React.FC<{
   workflow: Workflow
   onClose: () => void
   onInsertPrompt: (text: string, provider: PromptAssistantProvider) => void
@@ -4143,6 +4104,7 @@ const VideoIdeaAgentPanel: React.FC<{
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null)
   const [conversationHistoryReady, setConversationHistoryReady] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
+  const [deleteConversationId, setDeleteConversationId] = useState<string | null>(null)
   const [isRunning, setIsRunning] = useState(false)
   const [error, setError] = useState('')
   const [insertedMessageId, setInsertedMessageId] = useState<string | null>(null)
@@ -4157,6 +4119,26 @@ const VideoIdeaAgentPanel: React.FC<{
   const [skillDraftName, setSkillDraftName] = useState('')
   const [skillDraftInstruction, setSkillDraftInstruction] = useState('')
   const selectedSkill = skillLibrary.skills.find((skill) => skill.id === skillLibrary.selectedSkillId) || null
+  const filmProjects = useFilmProjectStore((state) => state.projects)
+  const activeFilmProjectId = useFilmProjectStore((state) => state.activeProjectByWorkflow[workflow.id])
+  const filmProject = filmProjects.find((project) => project.id === activeFilmProjectId)
+    || filmProjects.find((project) => project.workflowId === workflow.id)
+    || null
+  const activeAgentTab = useAgentStore((state) => state.activeTab)
+  const agentMode = useAgentStore((state) => state.modesByWorkflow[workflow.id] || 'run-with-approval')
+  const pendingWorkflowPatch = useAgentStore((state) => state.pendingPatchesByWorkflow[workflow.id] || null)
+  const agentActivities = useAgentStore((state) => state.activities)
+  const pilotJobs = useAgentStore((state) => state.pilotJobs)
+  const selectedWorkflowNodeId = useWorkflowStore((state) => state.selectedNodeId)
+  const [applyingWorkflowPatch, setApplyingWorkflowPatch] = useState(false)
+  const [busyPilotApprovalId, setBusyPilotApprovalId] = useState<string | null>(null)
+  const pendingPilotApprovals = useMemo(() => (filmProject?.approvals || [])
+    .filter((approval) => approval.status === 'pending' && (approval.type === 'pilot-image' || approval.type === 'pilot-video'))
+    .sort((left, right) => left.createdAt - right.createdAt), [filmProject?.approvals])
+  const visiblePilotJobs = useMemo(() => pilotJobs
+    .filter((job) => !filmProject || job.projectId === filmProject.id)
+    .slice(-4)
+    .reverse(), [filmProject, pilotJobs])
   const slashCommandMatch = input.trim().match(/^\/([^\s]*)$/)
   const slashCommandQuery = slashCommandMatch ? slashCommandMatch[1].toLowerCase() : null
   const filteredSkillCommands = useMemo(() => {
@@ -4217,6 +4199,13 @@ const VideoIdeaAgentPanel: React.FC<{
         model: normalizedModelId,
       },
     })
+  }, [])
+
+  useEffect(() => {
+    void Promise.all([
+      useFilmProjectStore.getState().hydrate(),
+      useAgentStore.getState().hydrate(),
+    ]).catch(() => setError('Could not restore the AI Film Production Agent project state.'))
   }, [])
 
   const refreshApiModels = useCallback(async (): Promise<PromptAssistantApiModel[]> => {
@@ -4375,9 +4364,15 @@ const VideoIdeaAgentPanel: React.FC<{
   }, [activeConversationId, conversationHistoryReady, messages])
 
   useEffect(() => {
-    if (!historyOpen) return
+    if (!historyOpen) {
+      setDeleteConversationId(null)
+      return
+    }
     const closeOnOutsidePointer = (event: PointerEvent) => {
-      if (!historyMenuRef.current?.contains(event.target as Node)) setHistoryOpen(false)
+      if (!historyMenuRef.current?.contains(event.target as Node)) {
+        setHistoryOpen(false)
+        setDeleteConversationId(null)
+      }
     }
     document.addEventListener('pointerdown', closeOnOutsidePointer)
     return () => document.removeEventListener('pointerdown', closeOnOutsidePointer)
@@ -4561,18 +4556,36 @@ const VideoIdeaAgentPanel: React.FC<{
           persistApiModelSelection(requestModel)
         }
       }
-      const instruction = buildVideoAgentInstruction({
+      const durableConversationContext = messages
+        .slice(-6)
+        .map((message) => `${message.role === 'user' ? 'USER' : 'AGENT'}: ${message.text.slice(0, 1600)}`)
+        .join('\n\n')
+      const agentRequest = [
+        selectedSkill ? `ACTIVE REUSABLE SKILL — ${selectedSkill.name}:\n${selectedSkill.instruction}` : '',
+        slashCommand ? `ACTIVE SLASH COMMAND — ${slashCommand.label}:\n${slashCommand.instruction}` : '',
+        imageReferences.length > 0
+          ? `ATTACHED REFERENCES:\n${imageReferences.map((image, index) => `@${image.alias} = attached image ${index + 1} (${image.name})`).join('\n')}\nKeep every @image token mapped to the same attachment.`
+          : '',
         brief,
-        messages,
+      ].filter(Boolean).join('\n\n')
+      const runtimeResult = await runFilmAgentTurn({
         workflow,
-        skill: selectedSkill,
-        slashCommand,
-        imageReferences,
+        selectedNode: selectedWorkflowNodeId
+          ? workflow.nodes.find((node) => node.id === selectedWorkflowNodeId) || null
+          : null,
+        userMessage: agentRequest,
+        conversationSummary: durableConversationContext,
+        mode: agentMode,
+        adapter: new PromptAssistantAgentModelAdapter({
+          provider: activeProvider,
+          apiModel: activeProvider === 'api' ? requestModel : undefined,
+          mediaUploads,
+        }),
       })
-      const text = await runPromptAssistant(activeProvider, instruction, 120000, mediaUploads, {
-        focus: false,
-        apiModel: activeProvider === 'api' ? requestModel : undefined,
-      })
+      const text = runtimeResult.message
+      if (runtimeResult.validationErrors.length > 0) {
+        setError(runtimeResult.validationErrors.slice(0, 4).join(' '))
+      }
       const assistantMessageCreatedAt = Date.now()
       const assistantMessage: VideoAgentMessage = {
         id: `video-agent-assistant-${assistantMessageCreatedAt}`,
@@ -4702,6 +4715,244 @@ const VideoIdeaAgentPanel: React.FC<{
     }
   }
 
+  const deleteSavedConversation = async (conversationId: string) => {
+    if (isRunning || !conversationHistoryReady) return
+    const existing = conversationHistoryRef.current.find((conversation) => conversation.id === conversationId)
+    if (!existing) {
+      setDeleteConversationId(null)
+      return
+    }
+    try {
+      let remaining = conversationHistoryRef.current.filter((conversation) => conversation.id !== conversationId)
+      if (remaining.length === 0) {
+        const replacement = createVideoAgentConversation(workflow.id)
+        await saveVideoAgentConversation(replacement)
+        remaining = [replacement]
+      }
+      const deletingActiveConversation = conversationId === activeConversationId
+      const nextActiveConversation = deletingActiveConversation
+        ? remaining[0]
+        : remaining.find((conversation) => conversation.id === activeConversationId) || remaining[0]
+      await deleteVideoAgentConversation(workflow.id, conversationId, nextActiveConversation?.id || null)
+      conversationHistoryRef.current = remaining
+      setConversationHistory(remaining)
+      if (deletingActiveConversation && nextActiveConversation) {
+        setActiveConversationId(nextActiveConversation.id)
+        setMessages(nextActiveConversation.messages)
+        setInput('')
+        setInputScrollTop(0)
+        setActiveSlashCommand(null)
+        setSlashMenuDismissed(false)
+        setInsertedMessageId(null)
+      }
+      setDeleteConversationId(null)
+      setError('')
+    } catch {
+      setError('Could not delete the selected AI Idea Agent conversation from IndexedDB.')
+    }
+  }
+
+  const applyAgentWorkflowPatch = () => {
+    if (!pendingWorkflowPatch || applyingWorkflowPatch) return
+    setApplyingWorkflowPatch(true)
+    try {
+      const result = useWorkflowStore.getState().applyWorkflowPatch(pendingWorkflowPatch)
+      if (!result.success) {
+        setError(result.error || 'The workflow proposal could not be applied.')
+        return
+      }
+      useAgentStore.getState().setPendingPatch(workflow.id, null)
+      if (filmProject) {
+        const updatedProject = useFilmProjectStore.getState().updateProject(filmProject.id, (project) => ({
+          ...project,
+          shots: project.shots.map((shot) => {
+            const workflowNodeIds = pendingWorkflowPatch.addNodes
+              .filter((node) => String((node.data as Record<string, unknown>).shotId || '') === shot.id)
+              .map((node) => node.id)
+            return workflowNodeIds.length > 0
+              ? { ...shot, workflowNodeIds, status: 'workflow-ready' as const }
+              : shot
+          }),
+          tasks: project.tasks.map((task) => task.type === 'workflow'
+            ? { ...task, status: 'completed' as const, progress: 100, error: undefined }
+            : task),
+          approvals: project.approvals.map((approval) => approval.id === `approval-${pendingWorkflowPatch.id}`
+            ? { ...approval, status: 'approved' as const, resolvedAt: Date.now() }
+            : approval),
+        }))
+        if (updatedProject && (agentMode === 'run-with-approval' || agentMode === 'auto')) {
+          const appliedWorkflow = useWorkflowStore.getState().workflows.find((item) => item.id === workflow.id)
+          if (appliedWorkflow) {
+            const selected = selectPilotShot(updatedProject, updatedProject.pilotShotId)
+            const withImageApproval = createPilotRunApproval(selected.project, appliedWorkflow, selected.selection.shotId, 'image')
+            useFilmProjectStore.getState().upsertProject(withImageApproval)
+          }
+        }
+      }
+      setError('')
+    } finally {
+      setApplyingWorkflowPatch(false)
+    }
+  }
+
+  const rejectAgentWorkflowPatch = () => {
+    if (!pendingWorkflowPatch) return
+    useAgentStore.getState().setPendingPatch(workflow.id, null)
+    if (filmProject) {
+      useFilmProjectStore.getState().updateProject(filmProject.id, (project) => ({
+        ...project,
+        tasks: project.tasks.map((task) => task.type === 'workflow'
+          ? { ...task, status: 'pending' as const, progress: 0 }
+          : task),
+        approvals: project.approvals.map((approval) => approval.id === `approval-${pendingWorkflowPatch.id}`
+          ? { ...approval, status: 'rejected' as const, resolvedAt: Date.now() }
+          : approval),
+      }))
+    }
+    setError('')
+  }
+
+  const currentFilmProject = (): FilmProject | null =>
+    useFilmProjectStore.getState().getProjectForWorkflow(workflow.id)
+
+  const resolvePilotRunApproval = async (approvalId: string, prompt: string) => {
+    if (busyPilotApprovalId) return
+    const project = currentFilmProject()
+    const approval = project?.approvals.find((item) => item.id === approvalId)
+    if (!project || !approval || approval.payload.stage !== 'run') {
+      setError('Pilot run approval is no longer available.')
+      return
+    }
+    const kind: PilotKind = approval.payload.kind === 'video' ? 'video' : 'image'
+    setBusyPilotApprovalId(approvalId)
+    try {
+      const approvedProject = useFilmProjectStore.getState().updateProject(project.id, (current) => {
+        const currentApproval = current.approvals.find((item) => item.id === approvalId)
+        if (!currentApproval) throw new Error('Pilot approval could not be resolved.')
+        if (currentApproval.status === 'approved') return current
+        if (currentApproval.status !== 'pending') throw new Error(`Pilot approval is already ${currentApproval.status}.`)
+        return {
+          ...current,
+          approvals: current.approvals.map((item) => item.id === approvalId
+            ? { ...item, status: 'approved' as const, resolvedAt: Date.now(), payload: { ...item.payload, prompt } }
+            : item),
+          shots: current.shots.map((shot) => shot.id === approval.payload.shotId
+            ? { ...shot, ...(kind === 'image' ? { imagePrompt: prompt } : { videoPrompt: prompt }) }
+            : shot),
+        }
+      })
+      const resolved = approvedProject?.approvals.find((item) => item.id === approvalId)
+      if (!resolved) throw new Error('Pilot approval could not be persisted.')
+      const activeWorkflow = useWorkflowStore.getState().workflows.find((item) => item.id === workflow.id) || workflow
+      const result = await runPilotJob({
+        projectId: String(resolved.payload.projectId || ''),
+        shotId: String(resolved.payload.shotId || ''),
+        workflowId: String(resolved.payload.workflowId || ''),
+        generateNodeId: String(resolved.payload.generateNodeId || ''),
+        approvalId: resolved.id,
+        idempotencyKey: String(resolved.payload.idempotencyKey || ''),
+        kind,
+      }, activeWorkflow)
+      if (result.status === 'failed') throw new Error(result.error || `Pilot ${kind} failed.`)
+      setError('')
+    } catch (pilotError) {
+      setError(pilotError instanceof Error ? pilotError.message : `Pilot ${kind} failed.`)
+    } finally {
+      setBusyPilotApprovalId(null)
+    }
+  }
+
+  const cancelPilotApproval = (approvalId: string) => {
+    const project = currentFilmProject()
+    const approval = project?.approvals.find((item) => item.id === approvalId)
+    if (!project || !approval) return
+    const kind: PilotKind = approval.payload.kind === 'video' ? 'video' : 'image'
+    let next = {
+      ...project,
+      approvals: project.approvals.map((item) => item.id === approvalId
+        ? { ...item, status: 'cancelled' as const, resolvedAt: Date.now() }
+        : item),
+    }
+    next = setPilotTaskState(next, kind, 'pending')
+    useFilmProjectStore.getState().upsertProject(next)
+  }
+
+  const approvePilotReview = (approvalId: string) => {
+    if (busyPilotApprovalId) return
+    const project = currentFilmProject()
+    const approval = project?.approvals.find((item) => item.id === approvalId)
+    if (!project || !approval || approval.status !== 'pending' || approval.payload.stage !== 'review') return
+    const kind: PilotKind = approval.payload.kind === 'video' ? 'video' : 'image'
+    setBusyPilotApprovalId(approvalId)
+    try {
+      const activeWorkflow = useWorkflowStore.getState().workflows.find((item) => item.id === workflow.id) || workflow
+      const next = resolvePilotReview(project, activeWorkflow, approvalId, 'approve')
+      useFilmProjectStore.getState().upsertProject(next)
+      setError('')
+    } catch (reviewError) {
+      setError(reviewError instanceof Error ? reviewError.message : `Could not approve pilot ${kind}.`)
+    } finally {
+      setBusyPilotApprovalId(null)
+    }
+  }
+
+  const rejectPilotReview = (approvalId: string) => {
+    if (busyPilotApprovalId) return
+    const project = currentFilmProject()
+    const approval = project?.approvals.find((item) => item.id === approvalId)
+    if (!project || !approval || approval.payload.stage !== 'review') return
+    const kind: PilotKind = approval.payload.kind === 'video' ? 'video' : 'image'
+    try {
+      const activeWorkflow = useWorkflowStore.getState().workflows.find((item) => item.id === workflow.id) || workflow
+      const next = resolvePilotReview(project, activeWorkflow, approvalId, 'reject')
+      useFilmProjectStore.getState().upsertProject(next)
+      setError('')
+    } catch (reviewError) {
+      setError(reviewError instanceof Error ? reviewError.message : `Could not reject pilot ${kind}.`)
+    }
+  }
+
+  const regeneratePilotReview = (approvalId: string, prompt: string) => {
+    if (busyPilotApprovalId) return
+    const project = currentFilmProject()
+    const approval = project?.approvals.find((item) => item.id === approvalId)
+    if (!project || !approval || approval.payload.stage !== 'review') return
+    const kind: PilotKind = approval.payload.kind === 'video' ? 'video' : 'image'
+    try {
+      const activeWorkflow = useWorkflowStore.getState().workflows.find((item) => item.id === workflow.id) || workflow
+      const next = resolvePilotReview(project, activeWorkflow, approvalId, 'regenerate', prompt)
+      useFilmProjectStore.getState().upsertProject(next)
+      setError('')
+    } catch (reviewError) {
+      setError(reviewError instanceof Error ? reviewError.message : `Could not prepare pilot ${kind} regeneration.`)
+    }
+  }
+
+  const cancelActivePilotJob = (jobId: string) => {
+    try {
+      cancelPilotJob(jobId)
+      setError('Local runner cancellation requested. The provider may already have accepted the request.')
+    } catch (cancelError) {
+      setError(cancelError instanceof Error ? cancelError.message : 'Could not cancel the pilot job.')
+    }
+  }
+
+  const preparePilotRetry = (shotId: string, kind: PilotKind) => {
+    const project = currentFilmProject()
+    if (!project) return
+    try {
+      const activeWorkflow = useWorkflowStore.getState().workflows.find((item) => item.id === workflow.id) || workflow
+      const next = createPilotRunApproval(project, activeWorkflow, shotId, kind)
+      useFilmProjectStore.getState().upsertProject(next)
+      setError('')
+    } catch (retryError) {
+      setError(retryError instanceof Error ? retryError.message : `Could not prepare pilot ${kind} retry.`)
+    }
+  }
+
+  const selectAgentTab = (tab: AgentPanelTab) => useAgentStore.getState().setActiveTab(tab)
+  const setFilmAgentMode = (mode: AgentMode) => useAgentStore.getState().setMode(workflow.id, mode)
+
   const suggestionPrompts = [
     'Create a cinematic product launch concept',
     'Turn my current workflow into a 60-second story',
@@ -4716,8 +4967,8 @@ const VideoIdeaAgentPanel: React.FC<{
             <Bot className="h-4 w-4" />
           </span>
           <div className="min-w-0">
-            <h2 className="truncate text-[12px] font-semibold text-white/88">AI Idea Agent</h2>
-            <p className="truncate text-[9px] text-white/30">Develop concepts, storyboards and generation prompts</p>
+            <h2 className="truncate text-[12px] font-semibold text-white/88">AI Film Production Agent</h2>
+            <p className="truncate text-[9px] text-white/30">Plan films, scenes, shots and workflow proposals</p>
           </div>
         </div>
         <div className="flex items-center gap-1">
@@ -4750,17 +5001,21 @@ const VideoIdeaAgentPanel: React.FC<{
                   {conversationHistory.map((conversation) => {
                     const active = conversation.id === activeConversationId
                     const preview = conversation.messages[conversation.messages.length - 1]?.text || 'Empty conversation'
+                    const confirmingDelete = deleteConversationId === conversation.id
                     return (
-                      <button
+                      <div
                         key={conversation.id}
-                        type="button"
-                        disabled={isRunning}
-                        onClick={() => void openSavedConversation(conversation)}
                         className={cn(
-                          'flex w-full items-start gap-2.5 rounded-xl px-2.5 py-2.5 text-left transition-colors hover:bg-white/[0.05] disabled:cursor-not-allowed disabled:opacity-45',
+                          'group relative flex w-full items-stretch overflow-hidden rounded-xl transition-colors hover:bg-white/[0.05]',
                           active && 'bg-[#7C5CFF]/10'
                         )}
                       >
+                        <button
+                          type="button"
+                          disabled={isRunning}
+                          onClick={() => void openSavedConversation(conversation)}
+                          className="flex min-w-0 flex-1 items-start gap-2.5 px-2.5 py-2.5 text-left disabled:cursor-not-allowed disabled:opacity-45"
+                        >
                         <span className={cn('mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border', active ? 'border-[#7C5CFF]/24 bg-[#7C5CFF]/12 text-[#B8A8FF]' : 'border-white/[0.07] bg-white/[0.025] text-white/28')}>
                           <Film className="h-3.5 w-3.5" />
                         </span>
@@ -4771,6 +5026,24 @@ const VideoIdeaAgentPanel: React.FC<{
                         </span>
                         {active && <Check className="mt-1 h-3.5 w-3.5 shrink-0 text-[#A895FF]" />}
                       </button>
+                        <button
+                          type="button"
+                          title={`Delete ${conversation.title}`}
+                          aria-label={`Delete conversation ${conversation.title}`}
+                          disabled={isRunning}
+                          onClick={() => setDeleteConversationId(conversation.id)}
+                          className="flex w-9 shrink-0 items-center justify-center text-white/25 transition-colors hover:bg-[#dc3545] hover:text-white hover:shadow-[0_6px_18px_rgba(220,53,69,0.24)] disabled:cursor-not-allowed disabled:opacity-30"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                        {confirmingDelete && (
+                          <div className="absolute inset-0 z-10 flex items-center gap-2 bg-[#1A1A1A] px-3 shadow-[inset_0_0_0_1px_rgba(248,113,113,0.16)]">
+                            <span className="min-w-0 flex-1 truncate text-[10px] font-medium text-white/65">Delete this conversation?</span>
+                            <button type="button" onClick={() => setDeleteConversationId(null)} className="h-7 rounded-lg px-2.5 text-[9px] font-medium text-white/38 hover:bg-white/[0.06] hover:text-white/70">Cancel</button>
+                            <button type="button" onClick={() => void deleteSavedConversation(conversation.id)} className="h-7 rounded-lg bg-[#dc3545] px-2.5 text-[9px] font-semibold text-white shadow-[0_7px_20px_rgba(220,53,69,0.22)] transition-colors hover:bg-[#e04454]">Delete</button>
+                          </div>
+                        )}
+                      </div>
                     )
                   })}
                 </div>
@@ -4792,7 +5065,41 @@ const VideoIdeaAgentPanel: React.FC<{
         </div>
       </header>
 
-      <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4">
+      <div className="flex h-11 shrink-0 items-center justify-between border-b border-white/[0.06] px-3.5">
+        <div className="flex min-w-0 items-center gap-0.5">
+          {(['chat', 'tasks', 'context', 'scenes'] as AgentPanelTab[]).map((tab) => (
+            <button
+              key={tab}
+              type="button"
+              onClick={() => selectAgentTab(tab)}
+              className={cn(
+                'h-8 rounded-lg px-2.5 text-[11px] font-semibold capitalize transition-colors',
+                activeAgentTab === tab ? 'bg-[#7C5CFF]/13 text-[#D1C8FF]' : 'text-white/28 hover:bg-white/[0.04] hover:text-white/58'
+              )}
+            >
+              {tab}{tab === 'tasks' && filmProject ? ` ${filmProject.tasks.filter((task) => task.status !== 'completed').length}` : ''}
+            </button>
+          ))}
+        </div>
+        <Select.Root value={agentMode} onValueChange={(value) => setFilmAgentMode(value as AgentMode)} disabled={isRunning}>
+          <Select.Trigger aria-label="Agent mode" className="flex h-8 max-w-[168px] items-center gap-1.5 rounded-lg px-2.5 text-[11px] font-semibold text-white/48 outline-none hover:bg-white/[0.05] data-[state=open]:bg-[#7C5CFF]/12 data-[state=open]:text-[#C8BCFF]">
+            <Select.Value /> <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+          </Select.Trigger>
+          <Select.Portal>
+            <Select.Content position="popper" side="bottom" align="end" sideOffset={6} className="z-[220] min-w-[190px] overflow-hidden rounded-xl border border-white/[0.1] bg-[#1B1B1B] p-1 shadow-[0_18px_48px_rgba(0,0,0,0.68)]">
+              <Select.Viewport>{([
+                ['plan-only', 'Plan only'],
+                ['edit-workflow', 'Edit workflow'],
+                ['run-with-approval', 'Run with approval'],
+                ['auto', 'Auto (pilot approval only)'],
+              ] as Array<[AgentMode, string]>).map(([value, label]) => <Select.Item key={value} value={value} className="relative flex h-9 cursor-pointer select-none items-center rounded-lg pl-8 pr-3 text-[11px] font-medium text-white/58 outline-none data-[highlighted]:bg-[#7C5CFF]/12 data-[state=checked]:text-[#C8BCFF]"><Select.ItemIndicator className="absolute left-2.5"><Check className="h-3.5 w-3.5" /></Select.ItemIndicator><Select.ItemText>{label}</Select.ItemText></Select.Item>)}</Select.Viewport>
+            </Select.Content>
+          </Select.Portal>
+        </Select.Root>
+      </div>
+
+      {activeAgentTab === 'chat' ? <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4">
+        {agentMode === 'auto' && <div className="rounded-xl border border-amber-300/10 bg-amber-300/[0.035] px-3 py-2 text-[8px] leading-3.5 text-amber-100/45">Auto is limited to one pilot shot in Phase 2. Image and video submissions still require approval.</div>}
         {messages.length === 0 && !isRunning && (
           <div className="flex min-h-full flex-col items-center justify-center py-8 text-center">
             <span className="flex h-12 w-12 items-center justify-center rounded-2xl border border-[#7C5CFF]/20 bg-[#7C5CFF]/10 text-[#B8A8FF] shadow-[0_12px_34px_rgba(124,92,255,0.12)]">
@@ -4830,6 +5137,7 @@ const VideoIdeaAgentPanel: React.FC<{
                     type="button"
                     onClick={() => {
                       const promptText = extractAgentPromptForNode(message.text)
+                        || filmProject?.shots.find((shot) => shot.imagePrompt.trim())?.imagePrompt.trim()
                       if (!promptText) {
                         setError('Could not identify a final generation prompt in this response. Ask the Agent to return a FINAL GENERATION PROMPT, then try again.')
                         return
@@ -4849,16 +5157,57 @@ const VideoIdeaAgentPanel: React.FC<{
           </div>
         ))}
 
+        {agentActivities.filter((activity) => !filmProject || activity.projectId === filmProject.id).slice(-4).map((activity) => (
+          <div key={activity.id} className="flex items-center gap-2 rounded-xl border border-white/[0.06] bg-white/[0.018] px-3 py-2 text-[8px] text-white/34">
+            <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', activity.status === 'completed' ? 'bg-emerald-300/70' : activity.status === 'failed' ? 'bg-red-300/70' : activity.status === 'waiting-approval' ? 'bg-amber-300/70' : 'bg-[#A895FF]')} />
+            <span className="truncate">{activity.summary}</span>
+          </div>
+        ))}
+
+        {pendingWorkflowPatch && (
+          <AgentApprovalCard
+            patch={pendingWorkflowPatch}
+            applying={applyingWorkflowPatch}
+            onApply={applyAgentWorkflowPatch}
+            onReject={rejectAgentWorkflowPatch}
+          />
+        )}
+
+        {pendingPilotApprovals.map((approval) => (
+          <PilotApprovalCard
+            key={approval.id}
+            approval={approval}
+            busy={busyPilotApprovalId === approval.id}
+            onRun={(prompt) => void resolvePilotRunApproval(approval.id, prompt)}
+            onApprove={() => approvePilotReview(approval.id)}
+            onRegenerate={(prompt) => regeneratePilotReview(approval.id, prompt)}
+            onReject={() => rejectPilotReview(approval.id)}
+            onCancel={() => cancelPilotApproval(approval.id)}
+          />
+        ))}
+
+        {visiblePilotJobs.map((job) => (
+          <PilotJobStatusCard
+            key={job.id}
+            job={job}
+            onCancel={['queued', 'running', 'waiting-output'].includes(job.status) ? () => cancelActivePilotJob(job.id) : undefined}
+          />
+        ))}
+
         {isRunning && (
           <div className="flex justify-start">
             <div className="flex items-center gap-2 rounded-2xl rounded-bl-md border border-white/[0.08] bg-[#1B1B1B] px-3.5 py-3 text-[10px] text-white/42">
               <LoaderCircle className="h-3.5 w-3.5 animate-spin text-[#A895FF]" />
-              Developing video ideas with {promptAssistantProviderLabel(activeProvider)}…
+              Structuring the film project with {promptAssistantProviderLabel(activeProvider)}…
             </div>
           </div>
         )}
         <div ref={messageEndRef} />
-      </div>
+      </div> : <div className="min-h-0 flex-1 overflow-y-auto">
+        {activeAgentTab === 'tasks' && <AgentTasks project={filmProject} activities={agentActivities.filter((activity) => !filmProject || activity.projectId === filmProject.id)} />}
+        {activeAgentTab === 'context' && <AgentContext project={filmProject} />}
+        {activeAgentTab === 'scenes' && <AgentScenes project={filmProject} busyApprovalId={busyPilotApprovalId} onViewNode={(nodeId) => useWorkflowStore.getState().setSelectedNode(nodeId)} onApprove={approvePilotReview} onRegenerate={regeneratePilotReview} onReject={rejectPilotReview} onPrepareRetry={preparePilotRetry} />}
+      </div>}
 
       <div className="shrink-0 border-t border-white/[0.07] bg-[#131313] p-3.5">
         {error && <div className="mb-2 rounded-lg border border-red-400/15 bg-red-500/[0.07] px-2.5 py-2 text-[9px] leading-4 text-red-200/75">{error}</div>}
@@ -10902,7 +11251,7 @@ const groupDragMirrorLog = (
           {windowMode && (
             <button
               type="button"
-              title="AI Idea Agent"
+              title="AI Film Production Agent"
               onClick={() => {
                 setInspectorNodeId(null)
                 setVideoAgentOpen((current) => !current)
@@ -11498,7 +11847,7 @@ const groupDragMirrorLog = (
           )}
         </div>
         {windowMode && videoAgentOpen && (
-          <VideoIdeaAgentPanel
+          <FilmProductionAgentPanel
             workflow={workflow}
             onClose={() => setVideoAgentOpen(false)}
             onInsertPrompt={(text, provider) => {

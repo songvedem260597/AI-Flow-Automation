@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { persist, createJSONStorage, type StateStorage } from 'zustand/middleware'
 import type { Workflow, WorkflowNode, WorkflowEdge, FlowNodeType } from '@/types'
+import type { WorkflowPatch, WorkflowPatchApplyResult } from '@/agent/schemas/agentToolSchemas'
 import { v4 as uuid } from 'uuid'
 import { canvasLog } from '@/lib/canvasInvestigate'
 
@@ -204,7 +205,7 @@ const chromeStorage: StateStorage = {
   }
 }
 
-interface WorkflowState {
+export interface WorkflowState {
   workflows: Workflow[]
   activeWorkflowId: string | null
   selectedNodeId: string | null
@@ -234,6 +235,8 @@ interface WorkflowState {
    * user never asked for.
    */
   replaceWorkflowNodes: (workflowId: string, nextNodes: WorkflowNode[]) => void
+  /** Apply one validated Agent workflow proposal in one store write/history entry. */
+  applyWorkflowPatch: (patch: WorkflowPatch) => WorkflowPatchApplyResult
   deleteNode: (nodeId: string) => void
   deleteNodes: (workflowId: string, nodeIds: string[]) => void
   setSelectedNode: (nodeId: string | null) => void
@@ -302,6 +305,113 @@ const createDefaultNodeData = (type: FlowNodeType): Record<string, unknown> => {
   }
 }
 
+const PATCH_NODE_TYPES = new Set<FlowNodeType>([
+  'prompt', 'image', 'generate', 'delay', 'download', 'wait', 'condition', 'loop', 'merge', 'split'
+])
+
+const PATCH_SOURCE_HANDLE = /^(?:output_\d+|all-images|batch)$/
+const PATCH_TARGET_HANDLE = /^input_\d+$/
+
+type PreparedWorkflowPatch = {
+  workflow: Workflow
+  replay: boolean
+  error?: string
+}
+
+const prepareWorkflowPatch = (workflow: Workflow, patch: WorkflowPatch): PreparedWorkflowPatch => {
+  if (!patch.id.trim()) return { workflow, replay: false, error: 'WorkflowPatch id is required.' }
+  if (patch.workflowId !== workflow.id) return { workflow, replay: false, error: 'WorkflowPatch targets a different workflow.' }
+  if (patch.addNodes.length > 100) return { workflow, replay: false, error: 'WorkflowPatch exceeds the 100-node limit.' }
+
+  const addNodeIds = patch.addNodes.map((node) => node.id)
+  const addEdgeIds = patch.addEdges.map((edge) => edge.id)
+  if (new Set(addNodeIds).size !== addNodeIds.length) return { workflow, replay: false, error: 'WorkflowPatch contains duplicate node IDs.' }
+  if (new Set(addEdgeIds).size !== addEdgeIds.length) return { workflow, replay: false, error: 'WorkflowPatch contains duplicate edge IDs.' }
+
+  const existingNodeById = new Map(workflow.nodes.map((node) => [node.id, node]))
+  const existingEdgeById = new Map(workflow.edges.map((edge) => [edge.id, edge]))
+  const replayNodes = patch.addNodes.length > 0 && patch.addNodes.every((node) => {
+    const existing = existingNodeById.get(node.id)
+    return Boolean(existing && String((existing.data as Record<string, unknown>).agentPatchId || '') === patch.id)
+  })
+  const replayEdges = patch.addEdges.every((edge) => existingEdgeById.has(edge.id))
+  if (replayNodes && replayEdges) return { workflow, replay: true }
+
+  for (const node of patch.addNodes) {
+    if (!node.id.trim() || existingNodeById.has(node.id)) return { workflow, replay: false, error: `Node ID already exists: ${node.id || '(missing)'}.` }
+    if (!PATCH_NODE_TYPES.has(node.type)) return { workflow, replay: false, error: `Unsupported node type: ${node.type}.` }
+    if (!Number.isFinite(node.position?.x) || !Number.isFinite(node.position?.y)) {
+      return { workflow, replay: false, error: `Node ${node.id} has an invalid position.` }
+    }
+    if (!node.data || typeof node.data !== 'object') return { workflow, replay: false, error: `Node ${node.id} has invalid data.` }
+  }
+
+  const deleteNodeIds = new Set(patch.deleteNodeIds)
+  const deleteEdgeIds = new Set(patch.deleteEdgeIds)
+  const finalNodes = workflow.nodes
+    .filter((node) => !deleteNodeIds.has(node.id))
+    .map((node) => {
+      const update = patch.updateNodes.find((candidate) => candidate.nodeId === node.id)
+      return update ? { ...node, data: { ...node.data, ...update.patch } } : node
+    })
+    .concat(patch.addNodes.map((node) => ({
+      ...node,
+      data: { ...node.data, agentPatchId: patch.id },
+    })))
+  const finalNodeIds = new Set(finalNodes.map((node) => node.id))
+
+  for (const update of patch.updateNodes) {
+    if (!finalNodeIds.has(update.nodeId)) return { workflow, replay: false, error: `Cannot update missing node: ${update.nodeId}.` }
+    if (!update.patch || typeof update.patch !== 'object' || Array.isArray(update.patch)) {
+      return { workflow, replay: false, error: `Node update ${update.nodeId} has an invalid patch.` }
+    }
+  }
+
+  const retainedEdges = workflow.edges.filter((edge) => (
+    !deleteEdgeIds.has(edge.id)
+    && finalNodeIds.has(edge.source)
+    && finalNodeIds.has(edge.target)
+  ))
+  const retainedEdgeIds = new Set(retainedEdges.map((edge) => edge.id))
+  const edgeConnectionKeys = new Set(retainedEdges.map((edge) => [
+    edge.source,
+    edge.target,
+    edge.sourceHandle || 'output_1',
+    edge.targetHandle || 'input_1',
+  ].join('|')))
+
+  for (const edge of patch.addEdges) {
+    if (!edge.id.trim() || retainedEdgeIds.has(edge.id)) return { workflow, replay: false, error: `Edge ID already exists: ${edge.id || '(missing)'}.` }
+    if (!finalNodeIds.has(edge.source) || !finalNodeIds.has(edge.target)) {
+      return { workflow, replay: false, error: `Edge ${edge.id} references a missing node.` }
+    }
+    if (edge.sourceHandle && !PATCH_SOURCE_HANDLE.test(edge.sourceHandle)) {
+      return { workflow, replay: false, error: `Edge ${edge.id} has an invalid source handle.` }
+    }
+    if (edge.targetHandle && !PATCH_TARGET_HANDLE.test(edge.targetHandle)) {
+      return { workflow, replay: false, error: `Edge ${edge.id} has an invalid target handle.` }
+    }
+    const connectionKey = [
+      edge.source,
+      edge.target,
+      edge.sourceHandle || 'output_1',
+      edge.targetHandle || 'input_1',
+    ].join('|')
+    if (edgeConnectionKeys.has(connectionKey)) return { workflow, replay: false, error: `Edge ${edge.id} duplicates an existing connection.` }
+    edgeConnectionKeys.add(connectionKey)
+  }
+
+  return {
+    replay: false,
+    workflow: {
+      ...workflow,
+      nodes: finalNodes,
+      edges: [...retainedEdges, ...patch.addEdges],
+      updatedAt: Date.now(),
+    },
+  }
+}
+
 const HEAVY_PERSIST_KEYS = new Set([
   'mediaData',
   'imageData',
@@ -316,7 +426,9 @@ const HEAVY_PERSIST_KEYS = new Set([
   'runResult',
   'logs',
   'mediaPoster',
-  'videoPoster'
+  'videoPoster',
+  // Legacy Film Agent runtime marker. Idempotency now lives in Agent Run Store.
+  'pilotExecution'
 ])
 
 // [AssetStore] Legacy base64-style fields that are explicitly safe to
@@ -994,6 +1106,38 @@ export const useWorkflowStore = create<WorkflowState>()(
             isDirty: true
           }
         })
+      },
+
+      applyWorkflowPatch: (patch) => {
+        let result: WorkflowPatchApplyResult = { success: false, applied: false, error: 'WorkflowPatch was not applied.' }
+        set((state) => {
+          const workflow = state.workflows.find((item) => item.id === patch.workflowId)
+          if (!workflow) {
+            result = { success: false, applied: false, error: 'WorkflowPatch workflow was not found.' }
+            return state
+          }
+          const prepared = prepareWorkflowPatch(workflow, patch)
+          if (prepared.error) {
+            result = { success: false, applied: false, error: prepared.error }
+            return state
+          }
+          if (prepared.replay) {
+            result = { success: true, applied: false }
+            return state
+          }
+
+          const nextNodeIds = new Set(prepared.workflow.nodes.map((node) => node.id))
+          const nextEdgeIds = new Set(prepared.workflow.edges.map((edge) => edge.id))
+          result = { success: true, applied: true }
+          return {
+            history: pushWorkflowHistory(state, patch.workflowId),
+            workflows: state.workflows.map((item) => item.id === patch.workflowId ? prepared.workflow : item),
+            selectedNodeId: state.selectedNodeId && !nextNodeIds.has(state.selectedNodeId) ? null : state.selectedNodeId,
+            selectedEdgeId: state.selectedEdgeId && !nextEdgeIds.has(state.selectedEdgeId) ? null : state.selectedEdgeId,
+            isDirty: true,
+          }
+        })
+        return result
       },
 
       deleteNode: (nodeId) => {

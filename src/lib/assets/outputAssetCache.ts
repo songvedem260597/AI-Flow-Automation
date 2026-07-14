@@ -30,6 +30,13 @@
 import { saveAssetFromBlob, type AssetMeta } from './assetStore'
 
 interface OutputItemLike {
+  assetId?: unknown
+  posterAssetId?: unknown
+  thumbnailAssetId?: unknown
+  data?: unknown
+  mediaData?: unknown
+  imageData?: unknown
+  videoData?: unknown
   url?: unknown
   videoUrl?: unknown
   imageUrl?: unknown
@@ -47,6 +54,11 @@ interface OutputItemLike {
 }
 
 interface OutputLike {
+  assetId?: unknown
+  imageAssetId?: unknown
+  videoAssetId?: unknown
+  posterAssetId?: unknown
+  thumbnailAssetId?: unknown
   outputs?: unknown
   images?: unknown
   imageUrls?: unknown
@@ -62,6 +74,10 @@ const resolveItemSourceUrl = (item: OutputItemLike): string =>
   || asString(item.url)
   || asString(item.mediaUrl)
   || asString(item.imageUrl)
+  || asString(item.data)
+  || asString(item.mediaData)
+  || asString(item.imageData)
+  || asString(item.videoData)
   || asString(item.thumbnailUrl)
   || asString(item.poster)
   || ''
@@ -95,9 +111,12 @@ const fetchBlobFromUrl = async (url: string, timeoutMs = 8000): Promise<Blob | n
   // certainly a b64 image; we'd still cache it, but warn so an
   // operator can see why. Persisted `_output` will strip the URL
   // either way (sanitizer rejects data:/blob: strings > 100 KB).
-  if (url.startsWith('data:') && url.length > 2_000_000) {
+  if (url.startsWith('data:') && url.length > 35_000_000) {
+    // Keep transient base64 out of the persisted workflow when it is
+    // beyond the existing output-cache safety ceiling. Normal ChatGPT
+    // images are cached below this limit and replaced by assetId.
     // eslint-disable-next-line no-console
-    console.warn('[AssetStore] data URL over 2 MB, skipping cache', { bytes: url.length })
+    console.warn('[AssetStore] data URL over 35 MB, skipping cache', { bytes: url.length })
     return null
   }
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null

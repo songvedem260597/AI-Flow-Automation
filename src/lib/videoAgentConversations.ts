@@ -172,6 +172,39 @@ export async function saveVideoAgentConversation(conversation: VideoAgentConvers
   return normalized
 }
 
+export async function deleteVideoAgentConversation(
+  workflowId: string,
+  conversationId: string,
+  nextActiveConversationId: string | null,
+): Promise<void> {
+  const normalizedWorkflowId = workflowId.trim()
+  const normalizedConversationId = conversationId.trim()
+  const normalizedNextActiveId = nextActiveConversationId?.trim() || null
+  if (!normalizedWorkflowId || !normalizedConversationId) throw new Error('Invalid AI Idea Agent conversation deletion request.')
+  const operation = writeQueue.then(async () => {
+    const database = await openDatabase()
+    try {
+      const transaction = database.transaction([CONVERSATION_STORE, META_STORE], 'readwrite')
+      const completed = transactionDone(transaction)
+      transaction.objectStore(CONVERSATION_STORE).delete(normalizedConversationId)
+      if (normalizedNextActiveId) {
+        transaction.objectStore(META_STORE).put({
+          key: activeMetaKey(normalizedWorkflowId),
+          conversationId: normalizedNextActiveId,
+          updatedAt: Date.now(),
+        })
+      } else {
+        transaction.objectStore(META_STORE).delete(activeMetaKey(normalizedWorkflowId))
+      }
+      await completed
+    } finally {
+      database.close()
+    }
+  })
+  writeQueue = operation.catch(() => undefined)
+  await operation
+}
+
 export async function setActiveVideoAgentConversation(workflowId: string, conversationId: string): Promise<void> {
   const operation = writeQueue.then(async () => {
     const database = await openDatabase()
