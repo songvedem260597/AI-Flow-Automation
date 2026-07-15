@@ -118,6 +118,68 @@ For each task, the coding agent must:
 6. For documentation-only edits, report that build was not run because no runtime source changed.
 7. Provide the required completion report already defined in this CLAUDE.md.
 
+### 6a. Shell Command Syntax (Windows / PowerShell)
+
+The default shell in this workspace is **PowerShell** (`Shell: powershell`).
+PowerShell has different syntax from bash/zsh — chains and operators must
+match the shell that's actually running.
+
+Bad (bash syntax — fails in PowerShell with `ParserError`):
+
+```bash
+git status && echo "---" && git log --oneline -10
+cmd1 ; cmd2 && cmd3 | grep foo
+```
+
+Good (PowerShell syntax):
+
+```powershell
+git status; if ($LASTEXITCODE -eq 0) { git log --oneline -10 }
+# chain with `;` (no short-circuit) or use `if ($LASTEXITCODE) { ... }` for short-circuit
+# pipe still works: cmd | Select-String foo
+```
+
+Required rules:
+
+- **Chain separator**: use `;` between commands, NOT `&&` / `||`. PowerShell
+ uses `;` for unconditional sequencing. For short-circuit-on-failure use
+ `if ($LASTEXITCODE -ne 0) { throw }` or `cmd1; if ($LASTEXITCODE -eq 0) { cmd2 }`.
+- **Redirect output**: `>` still works. To capture command output without
+ echoing it back through the agent context, redirect to a file under
+ `scripts/_artifacts/` (already gitignored) or `build/` (already gitignored),
+ then read it via the Read tool. Example:
+  ```powershell
+  git --no-pager diff --no-color -U2 path/to/file.ts > scripts/_artifacts/diff.txt
+  ```
+- **Avoid `cat` / `head` / `tail` / `sed` / `awk`**: use the dedicated
+ `Read`, `Grep`, `Glob`, and `StrReplace` tools instead. If a shell command
+ is genuinely needed, prefer PowerShell built-ins (`Get-Content`, `Select-Object`,
+ `ForEach-Object`, `[System.IO.File]::ReadAllBytes`).
+- **No interactive commands**: PowerShell scripts run non-interactively;
+ avoid `git rebase -i`, `git add -i`, prompts, `less`-style pagers, etc.
+ Use `git --no-pager` to force non-paged output.
+- **Bash-only flags break**: e.g. `grep --color`, `find ... -printf`,
+ `xargs -I {}` may not exist. Prefer `rg` (ripgrep) via the `Grep` tool.
+- **Multi-line scripts**: when several commands must run as one block
+ (e.g. byte-level file inspection), wrap them in a single `Shell` call
+ inside a script-block — splitting them across many small calls adds
+ startup overhead and can race on intermediate files.
+- **Encoding gotcha**: PowerShell's `Get-Content` + `Set-Content` defaults
+ to UTF-16 LE with BOM for text files. When dumping raw git blobs via
+ `git cat-file -p` or `git --no-pager show`, write the output to a file
+ and read with `Read` (binary-safe), or pipe through `Out-File -Encoding utf8`
+ to avoid the UTF-16 BOM issue that corrupts byte-equal comparisons.
+- **Measure-Object output**: PowerShell pipelines through `Measure-Object`
+ can drop empty results and confuse the `block_until_ms` reader. If a
+ command seems to "return nothing", dump to a file and `Read` it instead
+ of relying on stdout streaming.
+- **Exit codes**: PowerShell does not exit non-zero on most pipeline
+ errors. After any command that should fail-fast (build, lint), explicitly
+ check `$LASTEXITCODE` and surface it to the agent context.
+
+When unsure which shell is active, check `<user_info>` at the start of
+the conversation — `Shell:` field is authoritative.
+
 ### 7. Do Not Regress
 
 Do not regress any existing stable behavior, especially:

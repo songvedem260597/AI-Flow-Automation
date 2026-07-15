@@ -61,6 +61,7 @@ reference/
 .pw-chatgpt-profile/
 .pw-templates-profile/
 artifacts/
+scripts/_artifacts/
 build_log.txt
 diagnostic-upload.js
 
