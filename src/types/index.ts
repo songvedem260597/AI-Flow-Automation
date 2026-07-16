@@ -351,6 +351,7 @@ export type MessageAction =
   | 'FLOW_CONTENT_PING'
   | 'FLOW_GET_ADMISSION_HEALTH'
   | 'FLOW_GET_ADMISSION_SNAPSHOT'
+  | 'FLOW_REQUEST_SUBMISSION_PACING'
   // owner: google-flow — Phase 3 Recovery Controller actions.
   | 'FLOW_GET_RECOVERY_SNAPSHOT'
   | 'FLOW_RUN_RECOVERY_HEALTH_PROBE'

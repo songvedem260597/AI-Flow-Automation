@@ -7,6 +7,15 @@ import type {
   FlowErrorCode,
   FlowRecoveryAdmissionDecision,
 } from '../../types/flow.ts'
+import {
+  resolveFlowSubmissionPacingConfig,
+  sampleFlowSubmissionPacingDelay,
+  waitForFlowSubmissionPacingDelay,
+  type FlowPacingTimerAdapter,
+  type FlowSubmissionPacingConfig,
+  type FlowSubmissionPacingOptions,
+  type FlowSubmissionPacingPhase,
+} from './submissionPacing.ts'
 
 export type FlowAdmissionLogEvent =
   | 'FLOW_ADMISSION_REQUESTED'
@@ -23,6 +32,9 @@ export type FlowAdmissionLogEvent =
   | 'FLOW_ADMISSION_TRANSITION_REJECTED'
   | 'FLOW_ADMISSION_MANUAL_RESET'
   | 'FLOW_ADMISSION_PERSISTENCE_FAILED'
+  | 'FLOW_PACING_BEFORE_INSERT'
+  | 'FLOW_PACING_BEFORE_SUBMIT'
+  | 'FLOW_PACING_BETWEEN_JOBS'
 
 export interface FlowAdmissionRequest {
   source: string
@@ -48,6 +60,14 @@ export interface FlowCancellationDecision {
   snapshot: FlowAdmissionSnapshot
 }
 
+export interface FlowSubmissionPacingDecision {
+  granted: boolean
+  jobId: string
+  phase: FlowSubmissionPacingPhase
+  durationMs: number
+  statusReason: string
+}
+
 export interface FlowAdmissionStorage {
   load(): Promise<FlowAdmissionSnapshot | null>
   save(snapshot: FlowAdmissionSnapshot): Promise<void>
@@ -63,6 +83,9 @@ export interface FlowAdmissionControllerOptions {
   minimumCooldownMs?: number
   recoveryGate?: () => Promise<FlowRecoveryAdmissionDecision>
   recoveryOwnsBlockingFailures?: boolean
+  submissionPacing?: FlowSubmissionPacingOptions
+  random?: () => number
+  pacingTimer?: FlowPacingTimerAdapter
 }
 
 const GLOBAL_SCOPE = 'google-flow-global' as const
@@ -95,6 +118,11 @@ export class FlowAdmissionController {
   private readonly minimumCooldownMs: number
   private readonly recoveryGate?: FlowAdmissionControllerOptions['recoveryGate']
   private readonly recoveryOwnsBlockingFailures: boolean
+  private readonly submissionPacing: FlowSubmissionPacingConfig
+  private readonly random: () => number
+  private readonly pacingTimer?: FlowPacingTimerAdapter
+  private readonly pacingPhasePromises = new Map<string, Promise<FlowSubmissionPacingDecision>>()
+  private readonly completedPacingPhases = new Set<string>()
 
   constructor(options: FlowAdmissionControllerOptions = {}) {
     this.now = options.now || (() => Date.now())
@@ -106,6 +134,9 @@ export class FlowAdmissionController {
     this.minimumCooldownMs = options.minimumCooldownMs ?? 1_000
     this.recoveryGate = options.recoveryGate
     this.recoveryOwnsBlockingFailures = options.recoveryOwnsBlockingFailures === true
+    this.submissionPacing = resolveFlowSubmissionPacingConfig(options.submissionPacing)
+    this.random = options.random || Math.random
+    this.pacingTimer = options.pacingTimer
   }
 
   async requestAdmission(
@@ -157,7 +188,15 @@ export class FlowAdmissionController {
       }
     }
 
-    if (this.now() < this.cooldownUntil) {
+    const shouldWaitForInterJobPacing = this.shouldPaceAutomaticSource(requestedJob.source)
+    const interJobPacingMs = shouldWaitForInterJobPacing
+      ? Math.max(0, this.cooldownUntil - this.now())
+      : 0
+    // Legacy callers keep the original fail-fast minimum cooldown. The
+    // production pacing policy instead reserves the next automatic job and
+    // waits below with that job's AbortSignal, so a queue item is delayed
+    // rather than incorrectly failed as FLOW_BUSY.
+    if (this.now() < this.cooldownUntil && !shouldWaitForInterJobPacing && !this.submissionPacing.enabled) {
       this.pendingAdmissionJob = null
       this.emit('FLOW_ADMISSION_DENIED_BUSY', requestedJob, `minimum_cooldown_until_${this.cooldownUntil}`)
       return {
@@ -214,6 +253,25 @@ export class FlowAdmissionController {
         return this.cancelBeforeSubmit(requestedJob, 'cancelled_before_health_probe')
       }
 
+      if (interJobPacingMs > 0) {
+        try {
+          await waitForFlowSubmissionPacingDelay(
+            interJobPacingMs,
+            jobAbortController.signal,
+            this.pacingTimer,
+          )
+        } catch {
+          return this.cancelBeforeSubmit(requestedJob, 'cancelled_during_inter_job_pacing')
+        }
+        if (
+          jobAbortController.signal.aborted
+          || this.activeJob?.jobId !== requestedJob.jobId
+          || this.activeJob.state !== 'checking'
+        ) {
+          return this.cancelBeforeSubmit(requestedJob, 'stale_inter_job_pacing_timer_ignored')
+        }
+      }
+
       let health: FlowAdmissionHealth
       try {
         health = await probe(jobAbortController.signal)
@@ -251,6 +309,7 @@ export class FlowAdmissionController {
         requestedJob.statusReason = health.statusReason || 'pre_submit_health_probe_failed'
         requestedJob.completedAt = this.now()
         this.lastJob = { ...requestedJob }
+        const releasedAbortController = blocking ? null : this.activeAbortController
         if (blocking) {
           this.activeJob = requestedJob
         } else {
@@ -264,6 +323,8 @@ export class FlowAdmissionController {
           this.emit('FLOW_JOB_TERMINAL', requestedJob, requestedJob.statusReason)
         }
         await this.persist()
+        releasedAbortController?.abort('pre_submit_health_probe_failed')
+        if (!blocking) this.cleanupPacingForJob(requestedJob.jobId)
         return {
           granted: false,
           errorCode,
@@ -288,6 +349,31 @@ export class FlowAdmissionController {
       }
     } finally {
       request.signal?.removeEventListener('abort', relayAbort)
+    }
+  }
+
+  /**
+   * Grant a phase-specific pacing permit to the active Flow content job.
+   * The controller owns both duration selection and cancellation. For the
+   * final `before_submit` phase it also moves the job to `in_flight` before
+   * returning, so content cannot click Generate without controller approval.
+   */
+  async waitForSubmissionPacing(
+    jobId: string,
+    phase: FlowSubmissionPacingPhase,
+  ): Promise<FlowSubmissionPacingDecision> {
+    const key = `${jobId}:${phase}`
+    const existing = this.pacingPhasePromises.get(key)
+    if (existing) return existing
+
+    const pending = this.runSubmissionPacingPhase(jobId, phase)
+    this.pacingPhasePromises.set(key, pending)
+    try {
+      return await pending
+    } finally {
+      if (this.pacingPhasePromises.get(key) === pending) {
+        this.pacingPhasePromises.delete(key)
+      }
     }
   }
 
@@ -333,6 +419,7 @@ export class FlowAdmissionController {
     this.activeJob.statusReason = statusReason
     this.emit('FLOW_SUBMIT_UNCERTAIN', this.activeJob, statusReason)
     await this.persist()
+    this.activeAbortController?.abort('flow_submit_uncertain')
     return { ...this.activeJob }
   }
 
@@ -349,14 +436,22 @@ export class FlowAdmissionController {
     this.activeJob.completedAt = this.now()
     this.activeJob.statusReason = statusReason
     if (errorCode) this.activeJob.errorCode = errorCode
-    if (this.activeJob.submittedAt && this.minimumCooldownMs > 0) {
-      this.cooldownUntil = Math.max(this.cooldownUntil, this.now() + this.minimumCooldownMs)
+    const cooldownMs = this.resolvePostJobCooldownMs(this.activeJob, errorCode)
+    if (cooldownMs > 0) {
+      this.cooldownUntil = Math.max(this.cooldownUntil, this.now() + cooldownMs)
     }
+    const completedJobId = this.activeJob.jobId
     this.lastJob = { ...this.activeJob }
     this.emit('FLOW_JOB_TERMINAL', this.activeJob, statusReason)
+    const releasedAbortController = this.activeAbortController
     this.activeJob = null
     this.activeAbortController = null
     await this.persistReleaseOrRollback(previous, this.lastJob)
+    if (cooldownMs > 0 && this.submissionPacing.enabled) {
+      this.emitPacing('FLOW_PACING_BETWEEN_JOBS', completedJobId, cooldownMs)
+    }
+    releasedAbortController?.abort('flow_job_completed')
+    this.cleanupPacingForJob(jobId)
     this.emit('FLOW_MUTEX_RELEASED', this.lastJob, statusReason)
     return this.getSnapshotUnsafe()
   }
@@ -444,14 +539,17 @@ export class FlowAdmissionController {
     job.errorCode = 'cancelled'
     job.statusReason = reason
     job.completedAt = this.now()
-    if (job.submittedAt && this.minimumCooldownMs > 0) {
+    if (!this.submissionPacing.enabled && job.submittedAt && this.minimumCooldownMs > 0) {
       this.cooldownUntil = Math.max(this.cooldownUntil, this.now() + this.minimumCooldownMs)
     }
     this.lastJob = { ...job }
     this.emit('FLOW_ADMISSION_MANUAL_RESET', job, reason)
+    const releasedAbortController = this.activeAbortController
     this.activeJob = null
     this.activeAbortController = null
     await this.persistReleaseOrRollback(previous, this.lastJob)
+    releasedAbortController?.abort('flow_admission_manual_reset')
+    this.cleanupPacingForJob(job.jobId)
     this.emit('FLOW_MUTEX_RELEASED', this.lastJob, reason)
     return this.getSnapshotUnsafe()
   }
@@ -468,10 +566,13 @@ export class FlowAdmissionController {
     job.statusReason = reason
     job.completedAt = this.now()
     this.lastJob = { ...job }
+    const releasedAbortController = this.activeAbortController
     this.activeJob = null
     this.activeAbortController = null
     this.emit('FLOW_JOB_TERMINAL', job, reason)
     await this.persistReleaseOrRollback(previous, job)
+    releasedAbortController?.abort(reason)
+    this.cleanupPacingForJob(job.jobId)
     this.emit('FLOW_MUTEX_RELEASED', job, reason)
     return {
       granted: false,
@@ -479,6 +580,106 @@ export class FlowAdmissionController {
       errorCode: 'cancelled',
       statusReason: reason,
       snapshot: this.getSnapshotUnsafe(),
+    }
+  }
+
+  private async runSubmissionPacingPhase(
+    jobId: string,
+    phase: FlowSubmissionPacingPhase,
+  ): Promise<FlowSubmissionPacingDecision> {
+    await this.ensureHydrated()
+    const key = `${jobId}:${phase}`
+    const job = this.activeJob
+    if (!job || job.jobId !== jobId) {
+      return { granted: false, jobId, phase, durationMs: 0, statusReason: 'no_matching_active_flow_job' }
+    }
+
+    if (this.completedPacingPhases.has(key)) {
+      const validState = phase === 'before_submit'
+        ? job.state === 'in_flight'
+        : job.state === 'admitted' || job.state === 'in_flight'
+      return {
+        granted: validState,
+        jobId,
+        phase,
+        durationMs: 0,
+        statusReason: validState ? 'submission_pacing_already_granted' : `invalid_active_state_${job.state}`,
+      }
+    }
+
+    if (job.state !== 'admitted') {
+      return { granted: false, jobId, phase, durationMs: 0, statusReason: `invalid_active_state_${job.state}` }
+    }
+    const signal = this.activeAbortController?.signal
+    if (!signal || signal.aborted) {
+      return { granted: false, jobId, phase, durationMs: 0, statusReason: 'submission_pacing_signal_unavailable' }
+    }
+
+    const range = phase === 'before_insert'
+      ? this.submissionPacing.beforeInsert
+      : this.submissionPacing.beforeSubmit
+    const durationMs = this.submissionPacing.enabled
+      ? sampleFlowSubmissionPacingDelay(range, this.random)
+      : 0
+    if (durationMs > 0) {
+      this.emitPacing(
+        phase === 'before_insert' ? 'FLOW_PACING_BEFORE_INSERT' : 'FLOW_PACING_BEFORE_SUBMIT',
+        jobId,
+        durationMs,
+      )
+      try {
+        await waitForFlowSubmissionPacingDelay(durationMs, signal, this.pacingTimer)
+      } catch {
+        return { granted: false, jobId, phase, durationMs, statusReason: 'submission_pacing_aborted' }
+      }
+    }
+
+    if (
+      signal.aborted
+      || this.activeJob?.jobId !== jobId
+      || this.activeJob.state !== 'admitted'
+    ) {
+      return { granted: false, jobId, phase, durationMs, statusReason: 'stale_submission_pacing_timer_ignored' }
+    }
+
+    if (phase === 'before_submit') {
+      let started: FlowAdmissionJob | null = null
+      try {
+        started = await this.markSubmitStarted(jobId, 'submission_pacing_permit_granted')
+      } catch {
+        return { granted: false, jobId, phase, durationMs, statusReason: 'submit_permit_persistence_failed' }
+      }
+      if (!started || started.state !== 'in_flight') {
+        return { granted: false, jobId, phase, durationMs, statusReason: 'submit_permit_transition_rejected' }
+      }
+    }
+
+    this.completedPacingPhases.add(key)
+    return { granted: true, jobId, phase, durationMs, statusReason: 'submission_pacing_granted' }
+  }
+
+  private shouldPaceAutomaticSource(source: string): boolean {
+    return this.submissionPacing.enabled && this.submissionPacing.automaticSources.includes(source)
+  }
+
+  private resolvePostJobCooldownMs(job: FlowAdmissionJob, errorCode?: FlowErrorCode): number {
+    if (!job.submittedAt) return 0
+    if (!this.submissionPacing.enabled) return this.minimumCooldownMs
+    // Recovery and rate-limit policy own failed-job cooldowns. Submission
+    // pacing is only added after a successful automatic Flow job.
+    if (errorCode || !this.shouldPaceAutomaticSource(job.source)) return 0
+    return sampleFlowSubmissionPacingDelay(this.submissionPacing.betweenAutomaticJobs, this.random)
+  }
+
+  private emitPacing(event: FlowAdmissionLogEvent, jobId: string, durationMs: number): void {
+    // Privacy contract: pacing logs contain exactly the owner and duration.
+    // Prompt text and payload metadata never enter this event.
+    this.logger?.(event, { jobId, durationMs })
+  }
+
+  private cleanupPacingForJob(jobId: string): void {
+    for (const key of this.completedPacingPhases) {
+      if (key.startsWith(`${jobId}:`)) this.completedPacingPhases.delete(key)
     }
   }
 
@@ -491,6 +692,9 @@ export class FlowAdmissionController {
           this.activeJob = cloneJob(persisted.activeJob)
           this.lastJob = cloneJob(persisted.lastJob)
           this.cooldownUntil = Number(persisted.cooldownUntil || 0)
+          if (this.activeJob?.state === 'checking' || this.activeJob?.state === 'admitted') {
+            this.activeAbortController = new AbortController()
+          }
         }
         this.hydrated = true
       })()

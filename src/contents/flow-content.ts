@@ -96,6 +96,8 @@ interface FlowJobControl {
   submitStarted: boolean
 }
 
+type FlowSubmissionPacingPhase = 'before_insert' | 'before_submit'
+
 const activeFlowJobControls = new Map<string, FlowJobControl>()
 
 function flowCancelledResult(jobId?: string, statusReason = 'cancelled_before_submit'): Record<string, unknown> {
@@ -108,6 +110,50 @@ function flowCancelledResult(jobId?: string, statusReason = 'cancelled_before_su
     jobId,
     generation: { expected: 0, generated: 0, failed: 0, pending: 0, partial: false },
   }, 'orchestrator')
+}
+
+function flowPacingFailureResult(
+  jobId: string | undefined,
+  statusReason: string,
+  cancelled: boolean,
+): Record<string, unknown> {
+  return ensureFlowResultContract({
+    success: false,
+    status: cancelled ? 'FLOW_CANCELLED' : 'FLOW_SUBMISSION_PACING_DENIED',
+    error: statusReason,
+    errorCode: cancelled ? 'cancelled' : 'flow_busy',
+    statusReason,
+    jobId,
+    generation: { expected: 0, generated: 0, failed: 0, pending: 0, partial: false },
+  }, 'orchestrator')
+}
+
+async function requestFlowSubmissionPacing(
+  jobId: string | undefined,
+  phase: FlowSubmissionPacingPhase,
+  signal?: AbortSignal,
+): Promise<{ success: boolean; statusReason: string; durationMs: number }> {
+  if (!jobId) return { success: false, statusReason: 'flow_pacing_job_id_required', durationMs: 0 }
+  if (signal?.aborted) return { success: false, statusReason: 'submission_pacing_aborted', durationMs: 0 }
+
+  const sent = await safeSendAwait({
+    action: 'FLOW_REQUEST_SUBMISSION_PACING',
+    payload: { jobId, phase },
+  })
+  if (signal?.aborted) return { success: false, statusReason: 'submission_pacing_aborted', durationMs: 0 }
+  if (!sent.ok || !sent.response || typeof sent.response !== 'object') {
+    return {
+      success: false,
+      statusReason: sent.error || 'submission_pacing_response_unavailable',
+      durationMs: 0,
+    }
+  }
+  const response = sent.response as Record<string, unknown>
+  return {
+    success: response.success === true,
+    statusReason: String(response.statusReason || 'submission_pacing_not_granted'),
+    durationMs: Number(response.durationMs || 0),
+  }
 }
 
 // ── Safe sendMessage helpers (extension context invalidated resilience) ──────
@@ -956,6 +1002,22 @@ async function runFlowPrompt(payload: {
     await snapshotEditorText('after_addRef')
   }
 
+  // Admission-owned pacing permit. Content does not sample a duration and
+  // cannot proceed to Slate insertion unless the active job still owns the
+  // global Flow mutex. This is operational pacing, not input simulation.
+  const insertPacing = await requestFlowSubmissionPacing(
+    payload.jobId,
+    'before_insert',
+    control?.controller.signal,
+  )
+  if (!insertPacing.success) {
+    return flowPacingFailureResult(
+      payload.jobId,
+      insertPacing.statusReason,
+      control?.controller.signal.aborted === true,
+    )
+  }
+
   // Step 5: Insert text
   console.log('[FlowContent] Step 5: insertText, len=', payload.prompt.length)
   flowTrace('Content', 'STEP_5_INSERT_START', { promptLen: payload.prompt.length })
@@ -1167,6 +1229,22 @@ async function runFlowPrompt(payload: {
       rawResult: { message: (e as Error)?.message },
       payloadSummary: payloadSummary,
     })
+  }
+
+  // The strict prompt verification above is complete. Admission now owns
+  // the final 500–1500 ms pacing window and transitions this exact job to
+  // in_flight before returning the only permit that allows a Generate click.
+  const submitPacing = await requestFlowSubmissionPacing(
+    payload.jobId,
+    'before_submit',
+    control?.controller.signal,
+  )
+  if (!submitPacing.success) {
+    return flowPacingFailureResult(
+      payload.jobId,
+      submitPacing.statusReason,
+      control?.controller.signal.aborted === true,
+    )
   }
 
   console.log('[FlowContent] Step 7: submit')

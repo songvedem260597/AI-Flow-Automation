@@ -20,6 +20,10 @@ import type { ChromeMessage } from '@/types'
 import { PROVIDER_TABS } from '@/constants'
 import { DEBUG_FLAGS, debugLog } from '@/lib/debug'
 import { FlowAdmissionController } from './flow/FlowAdmissionController'
+import {
+  DEFAULT_FLOW_SUBMISSION_PACING,
+  type FlowSubmissionPacingPhase,
+} from './flow/submissionPacing'
 import { FlowRecoveryController } from './flow/FlowRecoveryController'
 import { FlowSessionRefresher } from './flow/FlowSessionRefresher'
 import { createFlowHealthProbeResult } from './flow/recoveryHealth'
@@ -78,9 +82,10 @@ const FLOW_BACKGROUND_INSTANCE_ID = `flow-background-${Date.now()}-${Math.random
 const flowDispatchedJobIds = new Set<string>()
 let flowRecoveryController!: FlowRecoveryController
 const flowAdmissionController = new FlowAdmissionController({
-  // Conservative extension-side safety debounce, not a claimed Google Flow
-  // rate limit. The controller option remains configurable for runtime tuning.
-  minimumCooldownMs: 1_000,
+  // Operational pacing only — not anti-bot simulation. Admission owns every
+  // duration and submit permit; content never samples timing independently.
+  minimumCooldownMs: 0,
+  submissionPacing: DEFAULT_FLOW_SUBMISSION_PACING,
   recoveryOwnsBlockingFailures: true,
   recoveryGate: async () => flowRecoveryController.getAdmissionDecision(),
   storage: {
@@ -783,6 +788,12 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
     // owner: google-flow — P0 admission lifecycle and Wait-node probes.
     case 'FLOW_GET_ADMISSION_SNAPSHOT':
       return { success: true, snapshot: await flowAdmissionController.getSnapshot() }
+
+    // owner: google-flow — phase permit only. This action never receives a
+    // prompt and never clicks Flow; the Admission Controller owns timing and
+    // transitions the final permit to in_flight before content may submit.
+    case 'FLOW_REQUEST_SUBMISSION_PACING':
+      return handleFlowSubmissionPacing((message.payload || {}) as { jobId?: string; phase?: string })
 
     // owner: google-flow — Phase 3 Recovery Controller. These exact actions
     // never dispatch generation and are intentionally separate from ChatGPT.
@@ -3924,6 +3935,19 @@ async function handleFlowStatus(payload: FlowStatusPayload) {
     }
   }
   return { received: true, status: payload.status, jobId: payload.jobId }
+}
+
+async function handleFlowSubmissionPacing(payload: { jobId?: string; phase?: string }) {
+  const jobId = String(payload.jobId || '')
+  const phase = String(payload.phase || '') as FlowSubmissionPacingPhase
+  if (!jobId) {
+    return { success: false, jobId, durationMs: 0, statusReason: 'flow_pacing_job_id_required' }
+  }
+  if (phase !== 'before_insert' && phase !== 'before_submit') {
+    return { success: false, jobId, durationMs: 0, statusReason: 'invalid_flow_pacing_phase' }
+  }
+  const decision = await flowAdmissionController.waitForSubmissionPacing(jobId, phase)
+  return { success: decision.granted, ...decision }
 }
 
 // ── Tile Monitor ─────────────────────────────────────────────────────────────
