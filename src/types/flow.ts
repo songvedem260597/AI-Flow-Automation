@@ -76,6 +76,8 @@ export type FlowAdmissionState =
   | 'submit_uncertain'
   | 'terminal'
   | 'blocked'
+  | 'cancelled'
+  | 'manual_reset'
 
 export interface FlowAdmissionJob {
   jobId: string

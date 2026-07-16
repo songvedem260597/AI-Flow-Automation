@@ -2,6 +2,7 @@ import type {
   FlowAdmissionHealth,
   FlowAdmissionJob,
   FlowAdmissionSnapshot,
+  FlowAdmissionState,
   FlowErrorCode,
 } from '../../types/flow.ts'
 
@@ -16,6 +17,10 @@ export type FlowAdmissionLogEvent =
   | 'FLOW_JOB_TERMINAL'
   | 'FLOW_MUTEX_RELEASED'
   | 'FLOW_CANCELLATION_REQUESTED'
+  | 'FLOW_ADMISSION_STATE_TRANSITION'
+  | 'FLOW_ADMISSION_TRANSITION_REJECTED'
+  | 'FLOW_ADMISSION_MANUAL_RESET'
+  | 'FLOW_ADMISSION_PERSISTENCE_FAILED'
 
 export interface FlowAdmissionRequest {
   source: string
@@ -60,6 +65,13 @@ const GLOBAL_SCOPE = 'google-flow-global' as const
 
 const cloneJob = (job: FlowAdmissionJob | null): FlowAdmissionJob | null =>
   job ? { ...job } : null
+
+interface FlowAdmissionMemoryState {
+  activeJob: FlowAdmissionJob | null
+  lastJob: FlowAdmissionJob | null
+  cooldownUntil: number
+  activeAbortController: AbortController | null
+}
 
 export class FlowAdmissionController {
   private activeJob: FlowAdmissionJob | null = null
@@ -117,8 +129,13 @@ export class FlowAdmissionController {
     }
     this.pendingAdmissionJob = requestedJob
 
-    await this.ensureHydrated()
-    await this.expireStaleLeaseIfSafe()
+    try {
+      await this.ensureHydrated()
+      await this.expireStaleLeaseIfSafe()
+    } catch (error) {
+      if (this.pendingAdmissionJob?.jobId === requestedJob.jobId) this.pendingAdmissionJob = null
+      throw error
+    }
 
     if (this.activeJob && !this.isTerminal(this.activeJob.state)) {
       this.pendingAdmissionJob = null
@@ -144,6 +161,7 @@ export class FlowAdmissionController {
 
     this.activeJob = requestedJob
     this.pendingAdmissionJob = null
+    this.emitTransition(requestedJob, 'idle', 'checking', 'pre_submit_reservation_acquired')
     const jobAbortController = new AbortController()
     this.activeAbortController = jobAbortController
     const relayAbort = () => jobAbortController.abort(request.signal?.reason)
@@ -151,9 +169,8 @@ export class FlowAdmissionController {
     else request.signal?.addEventListener('abort', relayAbort, { once: true })
 
     this.emit('FLOW_ADMISSION_CHECKING', requestedJob, 'pre_submit_health_probe')
-    await this.persist()
-
     try {
+      await this.persist()
       if (jobAbortController.signal.aborted) {
         return this.cancelBeforeSubmit(requestedJob, 'cancelled_before_health_probe')
       }
@@ -184,7 +201,12 @@ export class FlowAdmissionController {
       if (!health.healthy) {
         const errorCode = health.errorCode || 'unknown'
         const blocking = errorCode === 'unusual_activity' || errorCode === 'rate_limited' || errorCode === 'session_expired'
-        requestedJob.state = blocking ? 'blocked' : 'terminal'
+        this.transition(
+          requestedJob,
+          blocking ? 'blocked' : 'terminal',
+          health.statusReason || 'pre_submit_health_probe_failed',
+          ['checking'],
+        )
         requestedJob.errorCode = errorCode
         requestedJob.statusReason = health.statusReason || 'pre_submit_health_probe_failed'
         requestedJob.completedAt = this.now()
@@ -211,7 +233,7 @@ export class FlowAdmissionController {
         }
       }
 
-      requestedJob.state = 'admitted'
+      this.transition(requestedJob, 'admitted', 'pre_submit_health_probe_passed', ['checking'])
       requestedJob.admittedAt = this.now()
       requestedJob.statusReason = 'pre_submit_health_probe_passed'
       this.activeJob = requestedJob
@@ -232,8 +254,8 @@ export class FlowAdmissionController {
   async markSubmitStarted(jobId: string, statusReason = 'submit_attempt_started'): Promise<FlowAdmissionJob | null> {
     await this.ensureHydrated()
     if (!this.activeJob || this.activeJob.jobId !== jobId) return null
-    if (this.activeJob.state !== 'admitted' && this.activeJob.state !== 'checking') return { ...this.activeJob }
-    this.activeJob.state = 'in_flight'
+    if (this.activeJob.state === 'in_flight') return { ...this.activeJob }
+    if (!this.transition(this.activeJob, 'in_flight', statusReason, ['admitted'])) return { ...this.activeJob }
     this.activeJob.submittedAt = this.now()
     this.activeJob.statusReason = statusReason
     this.emit('FLOW_SUBMIT_STARTED', this.activeJob, statusReason)
@@ -244,9 +266,14 @@ export class FlowAdmissionController {
   async markSubmitConfirmed(jobId: string, statusReason = 'submit_click_confirmed'): Promise<FlowAdmissionJob | null> {
     await this.ensureHydrated()
     if (!this.activeJob || this.activeJob.jobId !== jobId) return null
+    if (this.activeJob.state === 'admitted') {
+      if (!this.transition(this.activeJob, 'in_flight', statusReason, ['admitted'])) return { ...this.activeJob }
+    } else if (this.activeJob.state !== 'in_flight') {
+      this.emitTransitionRejected(this.activeJob, this.activeJob.state, 'in_flight', statusReason)
+      return { ...this.activeJob }
+    }
     if (!this.activeJob.submittedAt) this.activeJob.submittedAt = this.now()
-    this.activeJob.state = 'in_flight'
-    this.activeJob.submitConfirmedAt = this.now()
+    if (!this.activeJob.submitConfirmedAt) this.activeJob.submitConfirmedAt = this.now()
     this.activeJob.statusReason = statusReason
     this.emit('FLOW_SUBMIT_CONFIRMED', this.activeJob, statusReason)
     await this.persist()
@@ -256,7 +283,12 @@ export class FlowAdmissionController {
   async markSubmitUncertain(jobId: string, statusReason: string): Promise<FlowAdmissionJob | null> {
     await this.ensureHydrated()
     if (!this.activeJob || this.activeJob.jobId !== jobId) return null
-    this.activeJob.state = 'submit_uncertain'
+    if (this.activeJob.state !== 'submit_uncertain' && !this.transition(
+      this.activeJob,
+      'submit_uncertain',
+      statusReason,
+      ['admitted', 'in_flight'],
+    )) return { ...this.activeJob }
     this.activeJob.errorCode = 'submit_uncertain'
     this.activeJob.statusReason = statusReason
     this.emit('FLOW_SUBMIT_UNCERTAIN', this.activeJob, statusReason)
@@ -267,7 +299,13 @@ export class FlowAdmissionController {
   async completeJob(jobId: string, errorCode?: FlowErrorCode, statusReason = 'job_completed'): Promise<FlowAdmissionSnapshot> {
     await this.ensureHydrated()
     if (!this.activeJob || this.activeJob.jobId !== jobId) return this.getSnapshotUnsafe()
-    this.activeJob.state = 'terminal'
+    const previous = this.captureMemoryState()
+    if (!this.transition(
+      this.activeJob,
+      'terminal',
+      statusReason,
+      ['admitted', 'in_flight', 'submit_uncertain'],
+    )) return this.getSnapshotUnsafe()
     this.activeJob.completedAt = this.now()
     this.activeJob.statusReason = statusReason
     if (errorCode) this.activeJob.errorCode = errorCode
@@ -278,8 +316,8 @@ export class FlowAdmissionController {
     this.emit('FLOW_JOB_TERMINAL', this.activeJob, statusReason)
     this.activeJob = null
     this.activeAbortController = null
+    await this.persistReleaseOrRollback(previous, this.lastJob)
     this.emit('FLOW_MUTEX_RELEASED', this.lastJob, statusReason)
-    await this.persist()
     return this.getSnapshotUnsafe()
   }
 
@@ -324,14 +362,33 @@ export class FlowAdmissionController {
     if (!userAcknowledged || !this.activeJob || (this.activeJob.state !== 'blocked' && this.activeJob.state !== 'submit_uncertain')) {
       return this.getSnapshotUnsafe()
     }
-    return this.completeJob(this.activeJob.jobId, 'cancelled', 'user_acknowledged_flow_admission_reset')
+    const previous = this.captureMemoryState()
+    const job = this.activeJob
+    const reason = 'user_acknowledged_flow_admission_reset'
+    if (!this.transition(job, 'manual_reset', reason, ['blocked', 'submit_uncertain'])) return this.getSnapshotUnsafe()
+    job.errorCode = 'cancelled'
+    job.statusReason = reason
+    job.completedAt = this.now()
+    if (job.submittedAt && this.minimumCooldownMs > 0) {
+      this.cooldownUntil = Math.max(this.cooldownUntil, this.now() + this.minimumCooldownMs)
+    }
+    this.lastJob = { ...job }
+    this.emit('FLOW_ADMISSION_MANUAL_RESET', job, reason)
+    this.activeJob = null
+    this.activeAbortController = null
+    await this.persistReleaseOrRollback(previous, this.lastJob)
+    this.emit('FLOW_MUTEX_RELEASED', this.lastJob, reason)
+    return this.getSnapshotUnsafe()
   }
 
   private async cancelBeforeSubmit(job: FlowAdmissionJob, reason: string): Promise<FlowAdmissionDecision> {
     if (this.activeJob?.jobId !== job.jobId) {
       return { granted: false, errorCode: 'cancelled', statusReason: reason, snapshot: this.getSnapshotUnsafe() }
     }
-    job.state = 'terminal'
+    const previous = this.captureMemoryState()
+    if (!this.transition(job, 'cancelled', reason, ['checking', 'admitted'])) {
+      return { granted: false, job: { ...job }, errorCode: 'cancelled', statusReason: reason, snapshot: this.getSnapshotUnsafe() }
+    }
     job.errorCode = 'cancelled'
     job.statusReason = reason
     job.completedAt = this.now()
@@ -339,8 +396,8 @@ export class FlowAdmissionController {
     this.activeJob = null
     this.activeAbortController = null
     this.emit('FLOW_JOB_TERMINAL', job, reason)
+    await this.persistReleaseOrRollback(previous, job)
     this.emit('FLOW_MUTEX_RELEASED', job, reason)
-    await this.persist()
     return {
       granted: false,
       job: { ...job },
@@ -354,7 +411,7 @@ export class FlowAdmissionController {
     if (this.hydrated) return
     if (!this.hydratePromise) {
       this.hydratePromise = (async () => {
-        const persisted = await this.storage?.load().catch(() => null)
+        const persisted = await this.storage?.load()
         if (persisted) {
           this.activeJob = cloneJob(persisted.activeJob)
           this.lastJob = cloneJob(persisted.lastJob)
@@ -369,18 +426,23 @@ export class FlowAdmissionController {
   private async expireStaleLeaseIfSafe(): Promise<void> {
     const job = this.activeJob
     if (!job) return
-    const age = this.now() - (job.admittedAt || job.requestedAt)
-    if ((job.state === 'checking' || job.state === 'admitted') && age > this.preSubmitLeaseMs) {
-      await this.completeJob(job.jobId, 'cancelled', 'pre_submit_lease_expired_without_submit')
+    const preSubmitAge = this.now() - (job.admittedAt || job.requestedAt)
+    if ((job.state === 'checking' || job.state === 'admitted') && preSubmitAge >= this.preSubmitLeaseMs) {
+      await this.cancelBeforeSubmit(job, 'pre_submit_lease_expired_without_submit')
       return
     }
-    if (job.state === 'in_flight' && age > this.inFlightSafetyMs) {
+    if (job.state === 'in_flight' && !job.submittedAt) {
+      await this.markSubmitUncertain(job.jobId, 'in_flight_missing_submitted_timestamp')
+      return
+    }
+    const inFlightAge = job.submittedAt ? this.now() - job.submittedAt : 0
+    if (job.state === 'in_flight' && inFlightAge >= this.inFlightSafetyMs) {
       await this.markSubmitUncertain(job.jobId, 'in_flight_safety_timeout_requires_probe_or_user_reset')
     }
   }
 
   private isTerminal(state: FlowAdmissionJob['state']): boolean {
-    return state === 'idle' || state === 'terminal'
+    return state === 'idle' || state === 'terminal' || state === 'cancelled' || state === 'manual_reset'
   }
 
   private getSnapshotUnsafe(): FlowAdmissionSnapshot {
@@ -406,7 +468,104 @@ export class FlowAdmissionController {
     })
   }
 
+  private transition(
+    job: FlowAdmissionJob,
+    nextState: FlowAdmissionState,
+    reason: string,
+    allowedPreviousStates: FlowAdmissionState[],
+  ): boolean {
+    const previousState = job.state
+    if (previousState === nextState) return true
+    if (!allowedPreviousStates.includes(previousState)) {
+      this.emitTransitionRejected(job, previousState, nextState, reason)
+      return false
+    }
+    job.state = nextState
+    this.emitTransition(job, previousState, nextState, reason)
+    return true
+  }
+
+  private emitTransition(
+    job: FlowAdmissionJob,
+    previousState: FlowAdmissionState,
+    nextState: FlowAdmissionState,
+    reason: string,
+  ): void {
+    this.logger?.('FLOW_ADMISSION_STATE_TRANSITION', {
+      jobId: job.jobId,
+      previousState,
+      nextState,
+      source: job.source,
+      tabId: job.tabId,
+      mediaType: job.mediaType,
+      timestamp: this.now(),
+      reason,
+    })
+  }
+
+  private emitTransitionRejected(
+    job: FlowAdmissionJob,
+    previousState: FlowAdmissionState,
+    nextState: FlowAdmissionState,
+    reason: string,
+  ): void {
+    this.logger?.('FLOW_ADMISSION_TRANSITION_REJECTED', {
+      jobId: job.jobId,
+      previousState,
+      nextState,
+      source: job.source,
+      tabId: job.tabId,
+      mediaType: job.mediaType,
+      timestamp: this.now(),
+      reason,
+    })
+  }
+
+  private captureMemoryState(): FlowAdmissionMemoryState {
+    return {
+      activeJob: cloneJob(this.activeJob),
+      lastJob: cloneJob(this.lastJob),
+      cooldownUntil: this.cooldownUntil,
+      activeAbortController: this.activeAbortController,
+    }
+  }
+
+  private restoreMemoryState(state: FlowAdmissionMemoryState): void {
+    this.activeJob = cloneJob(state.activeJob)
+    this.lastJob = cloneJob(state.lastJob)
+    this.cooldownUntil = state.cooldownUntil
+    this.activeAbortController = state.activeAbortController
+  }
+
+  private async persistReleaseOrRollback(
+    previous: FlowAdmissionMemoryState,
+    attemptedJob: FlowAdmissionJob | null,
+  ): Promise<void> {
+    try {
+      await this.persist()
+    } catch (error) {
+      const attemptedState = attemptedJob?.state
+      this.restoreMemoryState(previous)
+      if (attemptedJob && attemptedState && previous.activeJob && attemptedState !== previous.activeJob.state) {
+        this.emitTransition(
+          previous.activeJob,
+          attemptedState,
+          previous.activeJob.state,
+          'admission_persistence_rollback',
+        )
+      }
+      throw error
+    }
+  }
+
   private async persist(): Promise<void> {
-    await this.storage?.save(this.getSnapshotUnsafe()).catch(() => {})
+    if (!this.storage) return
+    try {
+      await this.storage.save(this.getSnapshotUnsafe())
+    } catch (error) {
+      const job = this.activeJob || this.lastJob
+      if (job) this.emit('FLOW_ADMISSION_PERSISTENCE_FAILED', job, error instanceof Error ? error.message : String(error))
+      throw error
+    }
   }
 }

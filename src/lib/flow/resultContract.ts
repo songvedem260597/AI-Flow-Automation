@@ -39,7 +39,7 @@ const TEXT_RULES: Array<{
     code: 'rate_limited',
     reason: 'rate_limit_warning',
     confidence: 'high',
-    patterns: ['too many requests', 'rate limit', 'rate-limit', 'quota exceeded'],
+    patterns: ['too many requests', 'rate limit', 'rate-limit', 'quota exceeded', 'quá nhiều yêu cầu', 'đã vượt quá hạn mức'],
   },
   {
     code: 'session_expired',

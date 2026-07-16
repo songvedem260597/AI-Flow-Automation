@@ -21,6 +21,7 @@ import { PROVIDER_TABS } from '@/constants'
 import { DEBUG_FLAGS, debugLog } from '@/lib/debug'
 import { FlowAdmissionController } from './flow/FlowAdmissionController'
 import { createFlowEvidence, ensureFlowResultContract } from '@/lib/flow/resultContract'
+import { isGoogleFlowUrl } from '@/lib/flow/url'
 import type {
   FlowAdmissionHealth,
   FlowAdmissionSnapshot,
@@ -53,7 +54,7 @@ const flowAdmissionController = new FlowAdmissionController({
   minimumCooldownMs: 1_000,
   storage: {
     async load(): Promise<FlowAdmissionSnapshot | null> {
-      const stored = await chrome.storage.session?.get?.(FLOW_ADMISSION_STORAGE_KEY).catch(() => null)
+      const stored = await chrome.storage.session?.get?.(FLOW_ADMISSION_STORAGE_KEY)
       const value = stored?.[FLOW_ADMISSION_STORAGE_KEY]
       return value && typeof value === 'object' ? value as FlowAdmissionSnapshot : null
     },
@@ -2578,7 +2579,7 @@ async function probeFlowAdmissionHealth(tabId: number, signal: AbortSignal): Pro
   }
 
   const url = String(tab.url || tab.pendingUrl || '')
-  if (!url.includes('labs.google/fx/')) {
+  if (!isGoogleFlowUrl(url)) {
     return {
       healthy: false,
       tabExists: true,

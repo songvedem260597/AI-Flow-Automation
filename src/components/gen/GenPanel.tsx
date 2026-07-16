@@ -1880,6 +1880,7 @@ export const GenPanel: React.FC<{
   const [genStatus, setGenStatus] = useState<'idle' | 'generating' | 'done'>('idle')
   const [flowStep, setFlowStep] = useState('')
   const [flowAdmissionResetReason, setFlowAdmissionResetReason] = useState('')
+  const [flowAdmissionResetting, setFlowAdmissionResetting] = useState(false)
   const [tileCounts, setTileCounts] = useState({ generating: 0, done: 0, failed: 0, total: 0 })
   const [tileMonitorActive, setTileMonitorActive] = useState(false)
   const [genCount, setGenCount] = useState(0)
@@ -2650,23 +2651,31 @@ const handleCancel = useCallback(() => {
 }, [runAbortController])
 
 const handleFlowAdmissionReset = useCallback(async () => {
+  if (flowAdmissionResetting) return
   const acknowledged = window.confirm(
     'Google Flow may still be processing a previous submit. Resetting only unlocks this extension; it does not cancel Flow. Check the Flow tab before generating again. Continue?'
   )
   if (!acknowledged) return
 
-  const response = await chrome.runtime.sendMessage({
-    action: 'FLOW_RESET_ADMISSION',
-    payload: { userAcknowledged: true },
-  }) as { snapshot?: { state?: string } }
-  const state = String(response?.snapshot?.state || '')
-  if (state === 'idle' || state === 'terminal') {
-    setFlowAdmissionResetReason('')
-    setFlowStep('Flow admission reset. Review the Flow tab before generating again.')
-    return
+  setFlowAdmissionResetting(true)
+  try {
+    const response = await chrome.runtime.sendMessage({
+      action: 'FLOW_RESET_ADMISSION',
+      payload: { userAcknowledged: true },
+    }) as { success?: boolean; snapshot?: { state?: string } }
+    const state = String(response?.snapshot?.state || '')
+    if (response?.success === true && state === 'idle') {
+      setFlowAdmissionResetReason('')
+      setFlowStep('Flow admission reset. Review the Flow tab before generating again.')
+      return
+    }
+    setFlowStep(`Flow admission remains ${state || 'blocked'}`)
+  } catch (error) {
+    setFlowStep(`Flow admission reset failed: ${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    setFlowAdmissionResetting(false)
   }
-  setFlowStep(`Flow admission remains ${state || 'blocked'}`)
-}, [])
+}, [flowAdmissionResetting])
 
 interface TileCounts {
   generating: number
@@ -3531,9 +3540,10 @@ const handleGenerate = useCallback(async () => {
             <button
               type="button"
               onClick={handleFlowAdmissionReset}
-              className="mt-1 text-[10px] font-medium text-amber-300 hover:text-amber-200"
+              disabled={flowAdmissionResetting}
+              className="mt-1 text-[10px] font-medium text-amber-300 hover:text-amber-200 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              Review Flow and reset admission…
+              {flowAdmissionResetting ? 'Resetting admission…' : 'Review Flow and reset admission…'}
             </button>
           </div>
         )}

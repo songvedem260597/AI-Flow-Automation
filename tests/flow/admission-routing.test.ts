@@ -33,3 +33,26 @@ test('pipeline stop keeps ownership only while a Google Flow request is pending'
   assert.match(runner, /if \(this\.flowRequestPending\) \{[\s\S]*action: 'FLOW_CANCEL_ADMISSION'/)
   assert.match(runner, /if \(!runner\?\.hasPendingFlowRequest\(\)\) \{[\s\S]*currentRunner = null/)
 })
+
+test('health probe never classifies warning text from the whole document body', () => {
+  const bridge = readSource('src/contents/flow-slate-bridge.ts')
+  assert.doesNotMatch(bridge, /document\.body\?\.(?:innerText|textContent)[\s\S]{0,300}classifyFlowErrorText/)
+})
+
+test('manual reset UI has an in-progress guard against double-clicks', () => {
+  const genPanel = readSource('src/components/gen/GenPanel.tsx')
+  assert.match(genPanel, /flowAdmissionResetting/)
+  assert.match(genPanel, /disabled=\{flowAdmissionResetting\}/)
+})
+
+test('workflow blocked results include safe manual-reset guidance', () => {
+  const runner = readSource('src/pipeline/runner.ts')
+  assert.match(runner, /reset admission only after confirming no generation is active/)
+})
+
+test('ChatGPT provider-idle wait uses ChatGPT job status, not Flow admission state', () => {
+  const runner = readSource('src/pipeline/runner.ts')
+  assert.match(runner, /waitContext\.provider === 'chatgpt'/)
+  assert.match(runner, /action: 'GET_CHATGPT_JOB_STATUS'/)
+  assert.match(runner, /action: 'FLOW_GET_ADMISSION_SNAPSHOT'/)
+})

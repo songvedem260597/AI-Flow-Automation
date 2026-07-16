@@ -7,6 +7,12 @@ import { hasExtensionContext, isContextInvalidated } from '@/lib/extensionContex
 import { debugLog, debugWarn, DEBUG_FLAGS } from '@/lib/debug'
 import { getAsset } from '@/lib/assets/assetStore'
 import { waitForFlowCondition } from '@/lib/flow/waitForFlowCondition'
+import {
+  collectChatGPTWaitJobIds,
+  isChatGPTJobIdle,
+  resolveProviderWaitTarget,
+  type ProviderWaitTarget,
+} from '@/lib/flow/waitProvider'
 import type { FlowWaitCondition, FlowWaitResult } from '@/types/flow'
 
 // Same helpers, plain JS names (avoid TS-only `unknown` typing here)
@@ -952,8 +958,10 @@ export class PipelineRunner {
         return this.executeDownloadNode(data as Record<string, unknown>, inputs)
 
       case 'wait': {
-        const waitData = data as { condition?: FlowWaitCondition; selector?: string; timeout?: number }
-        const waitResult = await this.waitForCondition(waitData)
+        const waitData = data as { condition?: FlowWaitCondition; selector?: string; timeout?: number; provider?: string }
+        const provider = resolveProviderWaitTarget(waitData.provider, inputs.all)
+        const chatgptJobIds = collectChatGPTWaitJobIds(inputs.all)
+        const waitResult = await this.waitForCondition(waitData, { provider, chatgptJobIds })
         return { type: 'wait', waited: true, ...waitResult }
       }
 
@@ -1831,7 +1839,19 @@ private isNonRetryableGenerateNode(node: WorkflowNode): boolean {
         evidenceCount: Array.isArray(response.evidence) ? response.evidence.length : 0,
         outputsCount: Array.isArray(response.outputs) ? (response.outputs as unknown[]).length : 0,
       }))
-      throw new Error(response.error || response.status || 'Google Flow automation failed')
+      const baseMessage = response.error || response.status || 'Google Flow automation failed'
+      const admission = isRecord(response.admission) ? response.admission : {}
+      const admissionState = String(admission.state || '')
+      const errorCode = String(response.errorCode || '')
+      const resetRequired = admissionState === 'blocked'
+        || admissionState === 'submit_uncertain'
+        || errorCode === 'submit_uncertain'
+        || errorCode === 'unusual_activity'
+        || errorCode === 'rate_limited'
+        || errorCode === 'session_expired'
+      throw new Error(resetRequired
+        ? `${baseMessage}. Open GenPanel, review the Flow tab, and reset admission only after confirming no generation is active.`
+        : baseMessage)
     }
     console.log(`[WorkflowRun][nodeResult] ` + JSON.stringify({
       workflowRunId: this.taskId,
@@ -2614,7 +2634,10 @@ private isNonRetryableGenerateNode(node: WorkflowNode): boolean {
       || JSON.stringify(value)
   }
 
-  private async waitForCondition(config: { condition?: FlowWaitCondition; selector?: string; timeout?: number }): Promise<FlowWaitResult> {
+  private async waitForCondition(
+    config: { condition?: FlowWaitCondition; selector?: string; timeout?: number },
+    waitContext: { provider: ProviderWaitTarget; chatgptJobIds: string[] },
+  ): Promise<FlowWaitResult> {
     const condition = config.condition || 'provider-idle'
     const timeoutMs = Math.max(1, Number(config.timeout || 30000))
     const selector = String(config.selector || '')
@@ -2637,8 +2660,37 @@ private isNonRetryableGenerateNode(node: WorkflowNode): boolean {
           return { satisfied: !this.isPaused, statusReason: this.isPaused ? 'waiting_for_manual_resume' : 'manual_resume_received' }
         }
 
+        if (condition === 'provider-idle' && waitContext.provider === 'chatgpt') {
+          if (waitContext.chatgptJobIds.length === 0) {
+            return { satisfied: true, statusReason: 'chatgpt_upstream_completed_without_active_job' }
+          }
+          for (const jobId of waitContext.chatgptJobIds) {
+            const response = await this.sendRuntimeMessage({
+              action: 'GET_CHATGPT_JOB_STATUS',
+              payload: { jobId },
+            })
+            if (!response.success || !isRecord(response.job)) {
+              return {
+                satisfied: false,
+                statusReason: `chatgpt_job_status_unavailable:${String(response.error || jobId)}`,
+              }
+            }
+            const status = String(response.job.status || '')
+            if (!isChatGPTJobIdle(status)) {
+              return { satisfied: false, statusReason: `chatgpt_job_state:${status || 'unknown'}` }
+            }
+          }
+          return { satisfied: true, statusReason: 'chatgpt_jobs_idle' }
+        }
+
         if (condition === 'provider-idle' || condition === 'flow-cooldown-ended') {
           const response = await this.sendRuntimeMessage({ action: 'FLOW_GET_ADMISSION_SNAPSHOT' })
+          if (!response.success) {
+            return {
+              satisfied: false,
+              statusReason: `flow_admission_snapshot_unavailable:${String(response.error || 'unknown')}`,
+            }
+          }
           const snapshot = response.snapshot && typeof response.snapshot === 'object'
             ? response.snapshot as Record<string, unknown>
             : {}

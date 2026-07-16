@@ -1,4 +1,9 @@
 import { classifyFlowErrorText } from '../lib/flow/resultContract'
+import {
+  classifyFlowAdmissionWarningContexts,
+  countFlowTileActivity,
+  type FlowWarningContext,
+} from '../lib/flow/healthClassifier'
 import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
 
 /**
@@ -61,7 +66,7 @@ import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
   // Bump this every time you make a runtime change so the Flow page console
   // verification (window.__FLOW_BRIDGE_BUILD_TIME__) matches the running bundle.
   // 2026-07-10 05:55:00 — added Flow Video input mode (Khung hình / Thành phần).
-  var FLOW_BRIDGE_BUILD_TIME = "2026-07-17 21:30:00"
+  var FLOW_BRIDGE_BUILD_TIME = "2026-07-17 02:38:03"
   bridgeLog('[Bridge] BUILD_TIME ' + FLOW_BRIDGE_BUILD_TIME + ' instance=' + BRIDGE_INSTANCE_ID)
   ;(window as Record<string, unknown>).__FLOW_BRIDGE_BUILD_TIME__ = FLOW_BRIDGE_BUILD_TIME
 
@@ -6439,13 +6444,49 @@ import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
   function getFlowAdmissionHealth(): Record<string, unknown> {
     var tiles = scanTiles()
     var counts = getTileCounts(tiles)
+    var activityCounts = countFlowTileActivity(tiles)
     var composer = findEditorElement() || findGoogleFlowEditor()
-    var pageText = ''
-    try { pageText = (document.body?.innerText || document.body?.textContent || '').slice(0, 200000) } catch (_) {}
-    var pageClassification = classifyFlowErrorText(pageText)
-    // Old failed tiles may remain in the gallery. Only provider-wide account,
-    // session, and rate warnings are blockers at admission time.
-    if (pageClassification?.errorCode === 'generation_failed') pageClassification = null
+    var warningContexts: FlowWarningContext[] = []
+    var warningElements = new Set<HTMLElement>()
+
+    // Account/session/rate warnings are classified only from explicit visible
+    // warning surfaces. Never scan document.body, the composer, or old tiles:
+    // all three may contain user prompt text or historical generation errors.
+    var warningSelectors: Array<{ selector: string; kind: FlowWarningContext['kind'] }> = [
+      { selector: '[role="dialog"]', kind: 'dialog' },
+      { selector: '[aria-modal="true"]', kind: 'dialog' },
+      { selector: '[role="alert"]', kind: 'alert' },
+      { selector: '[data-sonner-toast]', kind: 'toast' },
+      { selector: '[data-toast-root]', kind: 'toast' },
+      { selector: '[aria-live="assertive"]', kind: 'status' },
+      { selector: '[aria-live="polite"]', kind: 'status' },
+      { selector: '[role="status"]', kind: 'status' },
+    ]
+    try {
+      for (var wsi = 0; wsi < warningSelectors.length; wsi++) {
+        var warningRule = warningSelectors[wsi]
+        var matches = Array.from(document.querySelectorAll(warningRule.selector)) as HTMLElement[]
+        for (var wei = 0; wei < matches.length; wei++) {
+          var warningElement = matches[wei]
+          if (warningElements.has(warningElement) || !isVisible(warningElement)) continue
+          if (composer && (
+            warningElement === composer ||
+            warningElement.contains(composer) ||
+            composer.contains(warningElement)
+          )) continue
+          warningElements.add(warningElement)
+          var warningKind = warningElement.closest('[data-tile-id], [data-gen-tile]')
+            ? 'tile'
+            : warningRule.kind
+          warningContexts.push({
+            kind: warningKind,
+            selector: warningRule.selector,
+            text: (warningElement.innerText || warningElement.textContent || '').slice(0, 4_000),
+          })
+        }
+      }
+    } catch (_) {}
+    var pageClassification = classifyFlowAdmissionWarningContexts(warningContexts)
 
     var blockingDialog = false
     var blockingSelector = ''
@@ -6473,6 +6514,7 @@ import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
         confidence: pageClassification.confidence,
         statusReason: pageClassification.statusReason,
         matchedText: pageClassification.matchedText,
+        selector: pageClassification.selector,
       })
     } else if (!composer) {
       errorCode = 'composer_missing'
@@ -6482,9 +6524,9 @@ import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
       errorCode = 'flow_busy'
       statusReason = 'blocking_dialog_visible'
       evidence.push({ source: 'dom', detectedAt: Date.now(), confidence: 'high', statusReason: statusReason, selector: blockingSelector })
-    } else if (counts.generating > 0) {
+    } else if (activityCounts.generating > 0 || activityCounts.processing > 0 || activityCounts.pending > 0) {
       errorCode = 'flow_busy'
-      statusReason = 'provider_has_generating_tiles'
+      statusReason = activityCounts.pending > 0 ? 'provider_has_pending_tiles' : 'provider_has_generating_tiles'
       evidence.push({ source: 'dom', detectedAt: Date.now(), confidence: 'high', statusReason: statusReason })
     }
 
@@ -6493,9 +6535,9 @@ import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
       healthy: !errorCode,
       bridgeReady: true,
       composerPresent: !!composer,
-      processing: counts.generating,
-      pending: 0,
-      generating: counts.generating,
+      processing: activityCounts.processing,
+      pending: activityCounts.pending,
+      generating: activityCounts.generating,
       counts: counts,
       blockingDialog: blockingDialog,
       errorCode: errorCode || undefined,
