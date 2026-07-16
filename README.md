@@ -104,6 +104,10 @@ npm run build
 
 ## Usage
 
+### Hướng dẫn xử lý lỗi Google Flow
+
+Nếu bạn không biết kỹ thuật và không biết nên bấm gì khi Flow báo lỗi, hãy đọc [Hướng dẫn xử lý lỗi Google Flow cho người mới](./docs/HUONG_DAN_XU_LY_LOI_FLOW.md).
+
 ### Creating a Workflow
 
 1. Click "New Workflow" in the sidebar
