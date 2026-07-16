@@ -120,6 +120,25 @@ export interface FlowAdmissionSnapshot {
   capturedAt: number
 }
 
+export interface FlowAdmissionDiagnosticSnapshot {
+  scope: 'google-flow-global'
+  state: FlowAdmissionState
+  ownerJobId?: string
+  source?: string
+  tabId?: number
+  requestedAt?: number
+  admittedAt?: number
+  submittedAt?: number
+  completedAt?: number
+  blockedUntil?: number
+  errorCode?: FlowErrorCode
+  persistenceLoaded: boolean
+  persistenceVersion: number
+  safetyTimeoutRemainingMs?: number
+  preSubmitLeaseRemainingMs?: number
+  capturedAt: number
+}
+
 export type FlowWaitCondition =
   | 'manual'
   | 'provider-idle'

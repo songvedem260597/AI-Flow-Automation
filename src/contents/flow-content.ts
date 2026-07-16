@@ -4,6 +4,7 @@ import {
   isFlowTileInBaseline,
   wasFlowTileObservedProcessing,
 } from '../lib/flow/tileIdentity'
+import { FLOW_CONTENT_BUILD_MARKER } from '../lib/flow/runtimeDiagnostics'
 
 /**
  * Flow Content Script — ISOLATED world on https://labs.google/*
@@ -12,6 +13,83 @@ import {
  */
 const SOURCE = 'flow-auto-slate'
 const RESULT_SOURCE = SOURCE + '-result'
+
+type ContentRuntimeInstance = {
+  instanceId: string
+  documentId: string
+  runtimeListenerCount: number
+  bridgeResultListenerCount: number
+  mutationObserverCount: number
+  pollingLoopCount: number
+  submitHandlerCount: number
+}
+
+type ContentRuntimeRegistry = {
+  documentId: string
+  installCount: number
+  instances: ContentRuntimeInstance[]
+}
+
+const contentRuntimeWindow = window as unknown as Record<string, unknown>
+const previousContentCleanup = contentRuntimeWindow.__flowContentRuntimeCleanup
+if (typeof previousContentCleanup === 'function') {
+  try { (previousContentCleanup as () => void)() } catch (_) {}
+}
+
+const CONTENT_DOCUMENT_ID = typeof contentRuntimeWindow.__FLOW_CONTENT_DOCUMENT_ID__ === 'string'
+  ? String(contentRuntimeWindow.__FLOW_CONTENT_DOCUMENT_ID__)
+  : `flow-document-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+contentRuntimeWindow.__FLOW_CONTENT_DOCUMENT_ID__ = CONTENT_DOCUMENT_ID
+
+const existingContentRegistry = contentRuntimeWindow.__FLOW_CONTENT_RUNTIME_REGISTRY__ as ContentRuntimeRegistry | undefined
+const contentRuntimeRegistry: ContentRuntimeRegistry = existingContentRegistry?.documentId === CONTENT_DOCUMENT_ID
+  ? existingContentRegistry
+  : { documentId: CONTENT_DOCUMENT_ID, installCount: 0, instances: [] }
+const CONTENT_INSTANCE_ID = `flow-content-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+const contentRuntimeInstance: ContentRuntimeInstance = {
+  instanceId: CONTENT_INSTANCE_ID,
+  documentId: CONTENT_DOCUMENT_ID,
+  runtimeListenerCount: 0,
+  bridgeResultListenerCount: 0,
+  mutationObserverCount: 0,
+  pollingLoopCount: 0,
+  submitHandlerCount: 0,
+}
+contentRuntimeRegistry.installCount += 1
+contentRuntimeRegistry.instances.push(contentRuntimeInstance)
+contentRuntimeWindow.__FLOW_CONTENT_RUNTIME_REGISTRY__ = contentRuntimeRegistry
+contentRuntimeWindow.__FLOW_CONTENT_INSTANCE_ID__ = CONTENT_INSTANCE_ID
+contentRuntimeWindow.__FLOW_CONTENT_BUILD_MARKER__ = FLOW_CONTENT_BUILD_MARKER
+
+function getContentRuntimeInjectionCounts(): Record<string, unknown> {
+  const currentDocumentInstances = contentRuntimeRegistry.instances.filter((instance) => instance.documentId === CONTENT_DOCUMENT_ID)
+  const runtimeMessageListenerCount = currentDocumentInstances.reduce((sum, instance) => sum + instance.runtimeListenerCount, 0)
+  const bridgeResultListenerCount = currentDocumentInstances.reduce((sum, instance) => sum + instance.bridgeResultListenerCount, 0)
+  const mutationObserverCount = currentDocumentInstances.reduce((sum, instance) => sum + instance.mutationObserverCount, 0)
+  const pollingLoopCount = currentDocumentInstances.reduce((sum, instance) => sum + instance.pollingLoopCount, 0)
+  const submitHandlerCount = currentDocumentInstances.reduce((sum, instance) => sum + instance.submitHandlerCount, 0)
+  const activeInstanceIds = currentDocumentInstances
+    .filter((instance) => instance.runtimeListenerCount + instance.bridgeResultListenerCount + instance.mutationObserverCount + instance.pollingLoopCount > 0)
+    .map((instance) => instance.instanceId)
+  return {
+    documentId: CONTENT_DOCUMENT_ID,
+    installCount: contentRuntimeRegistry.installCount,
+    activeInstanceIds,
+    runtimeMessageListenerCount,
+    bridgeResultListenerCount,
+    mutationObserverCount,
+    pollingLoopCount,
+    submitHandlerCount,
+    duplicateListenerDetected: runtimeMessageListenerCount > 1 || bridgeResultListenerCount > 1,
+    duplicateObserverDetected: mutationObserverCount > 1,
+    duplicatePollingLoopDetected: pollingLoopCount > 1,
+    duplicateSubmitHandlerDetected: submitHandlerCount > 1,
+  }
+}
+
+function flowPageLocation(): { origin: string; pathname: string } {
+  return { origin: window.location.origin, pathname: window.location.pathname }
+}
 
 interface FlowJobControl {
   controller: AbortController
@@ -114,7 +192,7 @@ function bridgeCall(action: string, data: Record<string, unknown> = {}, timeoutM
   })
 }
 
-window.addEventListener('message', (e: MessageEvent) => {
+function flowBridgeResultMessageListener(e: MessageEvent) {
   if (e.source !== window) return
   const d = e.data as Record<string, unknown>
   if (!d || (d.source as string) !== RESULT_SOURCE) return
@@ -128,7 +206,9 @@ window.addEventListener('message', (e: MessageEvent) => {
   clearTimeout(pending.timeout)
   _pendingRequests.delete(rid)
   pending.resolve(d)
-})
+}
+window.addEventListener('message', flowBridgeResultMessageListener)
+contentRuntimeInstance.bridgeResultListenerCount = 1
 
 function isBridgeLoaded(): boolean {
   return !!(window as unknown as Record<string, unknown>).__flowSlateBridgeCleanup
@@ -1323,6 +1403,9 @@ async function runFlowPrompt(payload: {
     var observer = new MutationObserver(function () {
       observerFiredAt = Date.now()
     })
+    var observerTracked = false
+    var pollingLoopTracked = true
+    contentRuntimeInstance.pollingLoopCount += 1
     try {
       observer.observe(galleryRoot, {
         childList: true,
@@ -1330,11 +1413,21 @@ async function runFlowPrompt(payload: {
         attributes: true,
         attributeFilter: ['class', 'data-tile-id', 'src', 'aria-label', 'aria-disabled'],
       })
+      observerTracked = true
+      contentRuntimeInstance.mutationObserverCount += 1
     } catch (_) {}
 
     // Cleanup helper — must be called whenever we leave the polling loop.
     var cleanupObserver = function () {
       try { observer.disconnect() } catch (_) {}
+      if (observerTracked) {
+        observerTracked = false
+        contentRuntimeInstance.mutationObserverCount = Math.max(0, contentRuntimeInstance.mutationObserverCount - 1)
+      }
+      if (pollingLoopTracked) {
+        pollingLoopTracked = false
+        contentRuntimeInstance.pollingLoopCount = Math.max(0, contentRuntimeInstance.pollingLoopCount - 1)
+      }
     }
 
     while (waitedMs < maxWaitMs) {
@@ -3043,7 +3136,7 @@ async function snapshotEditorText(stage: string): Promise<{ stage: string; domTe
 
 // ── Message Handler ──────────────────────────────────────────────────────────
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+const flowContentRuntimeMessageListener: Parameters<typeof chrome.runtime.onMessage.addListener>[0] = (message, sender, sendResponse) => {
   const action = (message as Record<string, unknown>).action as string
 
   // FlowTrace: log every incoming action so listener-race issues are visible.
@@ -3053,10 +3146,87 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   console.log('[FlowTrace][Content] ON_MESSAGE_RECEIVED', JSON.stringify({
     action: action,
     senderTabId: sender?.tab?.id,
-    senderUrl: sender?.tab?.url,
+    senderOrigin: sender?.tab?.url ? (() => { try { return new URL(sender.tab.url).origin } catch (_) { return '' } })() : '',
+    senderPathname: sender?.tab?.url ? (() => { try { return new URL(sender.tab.url).pathname } catch (_) { return '' } })() : '',
     senderFrameId: sender?.frameId,
-    url: window.location.href,
+    location: flowPageLocation(),
   }))
+
+  // owner: google-flow — read-only Phase 2.6 runtime verification.
+  if (action === 'FLOW_RUNTIME_HANDSHAKE') {
+    ;(async () => {
+      const bridge = await bridgeCall('runtimeHandshake', {}, 5000)
+      const counts = getContentRuntimeInjectionCounts()
+      sendResponse({
+        contentReady: true,
+        contentMarker: FLOW_CONTENT_BUILD_MARKER,
+        contentInstanceId: CONTENT_INSTANCE_ID,
+        contentLocation: flowPageLocation(),
+        bridgeReady: bridge.ready === true,
+        bridgeMarker: typeof bridge.bridgeMarker === 'string' ? bridge.bridgeMarker : undefined,
+        bridgeInstanceId: typeof bridge.bridgeInstanceId === 'string' ? bridge.bridgeInstanceId : undefined,
+        composerDetected: bridge.composerDetected === true,
+        duplicateBridgeDetected: bridge.duplicateBridgeDetected === true,
+        duplicateListenerDetected: counts.duplicateListenerDetected === true || bridge.duplicateListenerDetected === true,
+        injectionCounts: {
+          content: counts,
+          bridge: bridge.injectionCounts || null,
+        },
+        ...(bridge.success === false ? { error: String(bridge.error || 'bridge_runtime_handshake_failed') } : {}),
+      })
+    })().catch((error) => {
+      sendResponse({
+        contentReady: true,
+        contentMarker: FLOW_CONTENT_BUILD_MARKER,
+        contentInstanceId: CONTENT_INSTANCE_ID,
+        contentLocation: flowPageLocation(),
+        bridgeReady: false,
+        duplicateBridgeDetected: false,
+        duplicateListenerDetected: getContentRuntimeInjectionCounts().duplicateListenerDetected === true,
+        injectionCounts: { content: getContentRuntimeInjectionCounts(), bridge: null },
+        error: error instanceof Error ? error.message : String(error),
+      })
+    })
+    return true
+  }
+
+  if (action === 'FLOW_RUNTIME_HEALTH_PROBE') {
+    ;(async () => {
+      const health = await bridgeCall('getAdmissionHealth', {}, 5000)
+      sendResponse({
+        contentReady: true,
+        contentMarker: FLOW_CONTENT_BUILD_MARKER,
+        contentInstanceId: CONTENT_INSTANCE_ID,
+        contentLocation: flowPageLocation(),
+        bridgeReady: health.bridgeReady === true,
+        composerPresent: health.composerPresent === true,
+        blockingDialog: health.blockingDialog === true,
+        errorCode: typeof health.errorCode === 'string' ? health.errorCode : '',
+        processing: Number.isFinite(Number(health.processing)) ? Math.max(0, Number(health.processing)) : null,
+        pending: Number.isFinite(Number(health.pending)) ? Math.max(0, Number(health.pending)) : null,
+        generating: Number.isFinite(Number(health.generating)) ? Math.max(0, Number(health.generating)) : null,
+        injectionCounts: getContentRuntimeInjectionCounts(),
+        ...(health.success === false ? { error: String(health.error || 'bridge_health_probe_failed') } : {}),
+      })
+    })().catch((error) => {
+      sendResponse({
+        contentReady: true,
+        contentMarker: FLOW_CONTENT_BUILD_MARKER,
+        contentInstanceId: CONTENT_INSTANCE_ID,
+        contentLocation: flowPageLocation(),
+        bridgeReady: false,
+        composerPresent: null,
+        blockingDialog: null,
+        errorCode: null,
+        processing: null,
+        pending: null,
+        generating: null,
+        injectionCounts: getContentRuntimeInjectionCounts(),
+        error: error instanceof Error ? error.message : String(error),
+      })
+    })
+    return true
+  }
 
   if (action === 'FLOW_DEBUG_PING') {
     const scan = (window as unknown as Record<string, unknown>).__flowDebugScan?.()
@@ -3552,4 +3722,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   return false
-})
+}
+
+chrome.runtime.onMessage.addListener(flowContentRuntimeMessageListener)
+contentRuntimeInstance.runtimeListenerCount = 1
+contentRuntimeInstance.submitHandlerCount = 1
+
+contentRuntimeWindow.__flowContentRuntimeCleanup = function () {
+  try { chrome.runtime.onMessage.removeListener(flowContentRuntimeMessageListener) } catch (_) {}
+  try { window.removeEventListener('message', flowBridgeResultMessageListener) } catch (_) {}
+  contentRuntimeInstance.runtimeListenerCount = 0
+  contentRuntimeInstance.bridgeResultListenerCount = 0
+  contentRuntimeInstance.submitHandlerCount = 0
+  if (contentRuntimeWindow.__FLOW_CONTENT_INSTANCE_ID__ === CONTENT_INSTANCE_ID) {
+    try { delete contentRuntimeWindow.__FLOW_CONTENT_INSTANCE_ID__ } catch (_) {}
+  }
+}

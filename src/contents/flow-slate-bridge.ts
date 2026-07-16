@@ -5,6 +5,22 @@ import {
   type FlowWarningContext,
 } from '../lib/flow/healthClassifier'
 import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
+import { FLOW_BRIDGE_BUILD_MARKER } from '../lib/flow/runtimeDiagnostics'
+
+type BridgeRuntimeInstance = {
+  instanceId: string
+  documentId: string
+  messageListenerCount: number
+  mutationObserverCount: number
+  pollingLoopCount: number
+  submitHandlerCount: number
+}
+
+type BridgeRuntimeRegistry = {
+  documentId: string
+  installCount: number
+  instances: BridgeRuntimeInstance[]
+}
 
 /**
  * Flow Slate Bridge — MAIN world
@@ -34,15 +50,21 @@ import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
   var _resultId = _sourceId + '-result'
   var _pending = {}
   var _reqId = 0
+  var bridgeGlobal = window as unknown as Record<string, unknown>
+  var previousBridgeInstanceId = typeof bridgeGlobal.__FLOW_BRIDGE_INSTANCE_ID__ === 'string'
+    ? String(bridgeGlobal.__FLOW_BRIDGE_INSTANCE_ID__)
+    : ''
+  var previousBridgeCleanupSucceeded = false
 
   // ── Singleton guard ───────────────────────────────────────────────────
   // If a previous instance of this bridge is still installed, tear it
   // down first. This MUST happen before we install our postMessage
   // listener so two instances never co-exist on the same channel.
-  if (typeof window !== 'undefined' && (window as Record<string, unknown>).__flowSlateBridgeCleanup) {
+  if (typeof window !== 'undefined' && bridgeGlobal.__flowSlateBridgeCleanup) {
     try {
-      var existingCleanup = (window as Record<string, unknown>).__flowSlateBridgeCleanup as () => void
+      var existingCleanup = bridgeGlobal.__flowSlateBridgeCleanup as () => void
       existingCleanup()
+      previousBridgeCleanupSucceeded = true
       bridgeLog('[Bridge] previous instance cleaned up')
     } catch (_: unknown) {
       // ignore — previous instance may already be partially torn down
@@ -56,8 +78,42 @@ import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
   // ── Bridge instance registry ──────────────────────────────────────────
   // Expose a registry on window so debug tooling (and the FlowTrace
   // grep pipeline) can confirm only one bridge is installed at a time.
+  var BRIDGE_DOCUMENT_ID = typeof bridgeGlobal.__FLOW_BRIDGE_DOCUMENT_ID__ === 'string'
+    ? String(bridgeGlobal.__FLOW_BRIDGE_DOCUMENT_ID__)
+    : 'flow-main-document_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8)
+  bridgeGlobal.__FLOW_BRIDGE_DOCUMENT_ID__ = BRIDGE_DOCUMENT_ID
+  var existingBridgeRegistry = bridgeGlobal.__FLOW_BRIDGE_RUNTIME_REGISTRY__ as BridgeRuntimeRegistry | undefined
+  var bridgeRuntimeRegistry: BridgeRuntimeRegistry = existingBridgeRegistry?.documentId === BRIDGE_DOCUMENT_ID
+    ? existingBridgeRegistry
+    : { documentId: BRIDGE_DOCUMENT_ID, installCount: 0, instances: [] }
+  if (previousBridgeInstanceId && !previousBridgeCleanupSucceeded && !bridgeRuntimeRegistry.instances.some(function (instance) {
+    return instance.instanceId === previousBridgeInstanceId
+  })) {
+    // A previous same-document marker survived but its cleanup failed. Keep a
+    // conservative ghost record so the handshake reports a duplicate instead
+    // of silently assuming the old listener/submit handler disappeared.
+    bridgeRuntimeRegistry.instances.push({
+      instanceId: previousBridgeInstanceId,
+      documentId: BRIDGE_DOCUMENT_ID,
+      messageListenerCount: 1,
+      mutationObserverCount: 0,
+      pollingLoopCount: 0,
+      submitHandlerCount: 1,
+    })
+  }
   var BRIDGE_INSTANCE_ID = 'flow-slate-bridge_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8)
-  ;(window as Record<string, unknown>).__FLOW_BRIDGE_INSTANCE_ID__ = BRIDGE_INSTANCE_ID
+  var bridgeRuntimeInstance: BridgeRuntimeInstance = {
+    instanceId: BRIDGE_INSTANCE_ID,
+    documentId: BRIDGE_DOCUMENT_ID,
+    messageListenerCount: 0,
+    mutationObserverCount: 0,
+    pollingLoopCount: 0,
+    submitHandlerCount: 0,
+  }
+  bridgeRuntimeRegistry.installCount += 1
+  bridgeRuntimeRegistry.instances.push(bridgeRuntimeInstance)
+  bridgeGlobal.__FLOW_BRIDGE_RUNTIME_REGISTRY__ = bridgeRuntimeRegistry
+  bridgeGlobal.__FLOW_BRIDGE_INSTANCE_ID__ = BRIDGE_INSTANCE_ID
 
   // Feature flag: disable settings automation until popup detection is stable
   var ENABLE_FLOW_SETTINGS_AUTOMATION = false
@@ -66,9 +122,10 @@ import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
   // Bump this every time you make a runtime change so the Flow page console
   // verification (window.__FLOW_BRIDGE_BUILD_TIME__) matches the running bundle.
   // 2026-07-10 05:55:00 — added Flow Video input mode (Khung hình / Thành phần).
-  var FLOW_BRIDGE_BUILD_TIME = "2026-07-17 02:38:03"
+  var FLOW_BRIDGE_BUILD_TIME = "2026-07-17 02:52:02"
   bridgeLog('[Bridge] BUILD_TIME ' + FLOW_BRIDGE_BUILD_TIME + ' instance=' + BRIDGE_INSTANCE_ID)
   ;(window as Record<string, unknown>).__FLOW_BRIDGE_BUILD_TIME__ = FLOW_BRIDGE_BUILD_TIME
+  bridgeGlobal.__FLOW_BRIDGE_BUILD_MARKER__ = FLOW_BRIDGE_BUILD_MARKER
 
   // ── Debug level helpers ──────────────────────────────────────────────────────
   var FLOW_DEBUG_VERBOSE =
@@ -2963,6 +3020,33 @@ import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
     window.postMessage(payload, window.location.origin)
   }
 
+  function getBridgeRuntimeInjectionCounts(): Record<string, unknown> {
+    var currentDocumentInstances = bridgeRuntimeRegistry.instances.filter(function (instance) {
+      return instance.documentId === BRIDGE_DOCUMENT_ID
+    })
+    var messageListenerCount = currentDocumentInstances.reduce(function (sum, instance) { return sum + instance.messageListenerCount }, 0)
+    var mutationObserverCount = currentDocumentInstances.reduce(function (sum, instance) { return sum + instance.mutationObserverCount }, 0)
+    var pollingLoopCount = currentDocumentInstances.reduce(function (sum, instance) { return sum + instance.pollingLoopCount }, 0)
+    var submitHandlerCount = currentDocumentInstances.reduce(function (sum, instance) { return sum + instance.submitHandlerCount }, 0)
+    var activeInstanceIds = currentDocumentInstances.filter(function (instance) {
+      return instance.messageListenerCount + instance.mutationObserverCount + instance.pollingLoopCount > 0
+    }).map(function (instance) { return instance.instanceId })
+    return {
+      documentId: BRIDGE_DOCUMENT_ID,
+      installCount: bridgeRuntimeRegistry.installCount,
+      activeInstanceIds: activeInstanceIds,
+      messageListenerCount: messageListenerCount,
+      mutationObserverCount: mutationObserverCount,
+      pollingLoopCount: pollingLoopCount,
+      submitHandlerCount: submitHandlerCount,
+      duplicateBridgeDetected: activeInstanceIds.length > 1,
+      duplicateListenerDetected: messageListenerCount > 1,
+      duplicateObserverDetected: mutationObserverCount > 1,
+      duplicatePollingLoopDetected: pollingLoopCount > 1,
+      duplicateSubmitHandlerDetected: submitHandlerCount > 1,
+    }
+  }
+
   async function handleMessage(e: MessageEvent) {
     if (e.source !== window) return
     var d = e.data as Record<string, unknown>
@@ -2973,7 +3057,25 @@ import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
 
     if (FLOW_DEBUG_VERBOSE) bridgeDebug('[Bridge] Message:', action, 'rid:', rid)
 
-    if (action === 'insert') {
+    if (action === 'runtimeHandshake') {
+      // Read-only by contract. This only checks the currently authenticated
+      // page DOM and bridge ownership; it does not insert text, click, reload,
+      // alter Flow settings, or start/stop a monitor.
+      var runtimeComposer = findEditorElement() || findGoogleFlowEditor()
+      var runtimeInjectionCounts = getBridgeRuntimeInjectionCounts()
+      postResult(rid, {
+        success: true,
+        ready: true,
+        bridgeMarker: FLOW_BRIDGE_BUILD_MARKER,
+        bridgeInstanceId: BRIDGE_INSTANCE_ID,
+        bridgeLocation: { origin: window.location.origin, pathname: window.location.pathname },
+        composerDetected: !!runtimeComposer,
+        duplicateBridgeDetected: runtimeInjectionCounts.duplicateBridgeDetected === true,
+        duplicateListenerDetected: runtimeInjectionCounts.duplicateListenerDetected === true,
+        injectionCounts: runtimeInjectionCounts,
+      })
+
+    } else if (action === 'insert') {
       var text = (d.text as string) || ''
       if (FLOW_DEBUG_VERBOSE) bridgeDebug('[Bridge] === INSERT START, text len=' + text.length + ' ===')
       var result = insertText(text)
@@ -3029,7 +3131,7 @@ import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
       postResult(rid, state)
 
     } else if (action === 'ping') {
-      postResult(rid, { pong: true, ready: true, url: window.location.href })
+      postResult(rid, { pong: true, ready: true, url: window.location.href, bridgeMarker: FLOW_BRIDGE_BUILD_MARKER })
 
     } else if (action === 'submit') {
       if (!safeText(d.jobId)) {
@@ -3325,6 +3427,8 @@ import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
   }
 
   window.addEventListener('message', handleMessage)
+  bridgeRuntimeInstance.messageListenerCount = 1
+  bridgeRuntimeInstance.submitHandlerCount = 1
 
   // Mark the page so dev console helpers can detect the real bridge
   // and back off. Without this, a stale dev-helper bundle injected as
@@ -3334,10 +3438,13 @@ import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
 
   ;(window as Record<string, unknown>).__flowSlateBridgeCleanup = function () {
     window.removeEventListener('message', handleMessage)
+    bridgeRuntimeInstance.messageListenerCount = 0
+    bridgeRuntimeInstance.submitHandlerCount = 0
     if (_tileMonitorInterval) {
       clearInterval(_tileMonitorInterval)
       _tileMonitorInterval = null
     }
+    bridgeRuntimeInstance.pollingLoopCount = 0
     // Drop instance markers so the next bridge load is a clean slate.
     try { delete (window as Record<string, unknown>).__FLOW_BRIDGE_INSTANCE_ID__ } catch (_) {}
     try { document.documentElement.removeAttribute('data-flow-bridge-real-installed') } catch (_) {}
@@ -6415,6 +6522,7 @@ import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
         _tileMonitorCallback(tiles)
       }
     }, intervalMs)
+    bridgeRuntimeInstance.pollingLoopCount = 1
 
     bridgeLog('[Bridge] TileMonitor started, interval=' + intervalMs + 'ms')
   }
@@ -6424,6 +6532,7 @@ import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
       clearInterval(_tileMonitorInterval)
       _tileMonitorInterval = null
     }
+    bridgeRuntimeInstance.pollingLoopCount = 0
     _tileMonitorCallback = null
     _knownTileIds.clear()
     bridgeLog('[Bridge] TileMonitor stopped')

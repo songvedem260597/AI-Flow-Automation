@@ -263,6 +263,7 @@ export interface AppSettings {
   defaultModel?: string
   defaultAspectRatio?: string
   promptAssistantMode: 'tab' | 'api'
+  flowRuntimeDiagnosticsEnabled: boolean
   apiProvider: {
     enabled: boolean
     endpoint: string
@@ -349,6 +350,14 @@ export type MessageAction =
   | 'FLOW_CONTENT_PING'
   | 'FLOW_GET_ADMISSION_HEALTH'
   | 'FLOW_GET_ADMISSION_SNAPSHOT'
+  // owner: google-flow — read-only Phase 2.6 runtime verification harness.
+  | 'FLOW_RUNTIME_SET_ENABLED'
+  | 'FLOW_RUNTIME_HANDSHAKE'
+  | 'FLOW_RUNTIME_HEALTH_PROBE'
+  | 'FLOW_RUNTIME_ADMISSION_DRY_RUN'
+  | 'GET_FLOW_ADMISSION_DIAGNOSTICS'
+  | 'FLOW_RUNTIME_GET_REPORT'
+  | 'FLOW_RUNTIME_RESET_LOGS'
   | 'FLOW_CANCEL_ADMISSION'
   | 'FLOW_RESET_ADMISSION'
   | 'FLOW_CANCEL_JOB'

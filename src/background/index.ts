@@ -22,6 +22,23 @@ import { DEBUG_FLAGS, debugLog } from '@/lib/debug'
 import { FlowAdmissionController } from './flow/FlowAdmissionController'
 import { createFlowEvidence, ensureFlowResultContract } from '@/lib/flow/resultContract'
 import { isGoogleFlowUrl } from '@/lib/flow/url'
+import {
+  FLOW_BACKGROUND_BUILD_MARKER,
+  FLOW_BRIDGE_BUILD_MARKER,
+  FLOW_CONTENT_BUILD_MARKER,
+  FLOW_RUNTIME_DIAGNOSTICS_VERSION,
+  buildFlowRuntimeHandshake,
+  buildFlowRuntimeHealthReport,
+  createFlowRuntimeDiagnosticState,
+  evaluateRuntimeMarker,
+  resetFlowRuntimeDiagnosticLogs,
+  sanitizeFlowRuntimeReport,
+  startFlowRuntimeDiagnosticSession,
+  type FlowRuntimeContentHandshakeResponse,
+  type FlowRuntimeDiagnosticState,
+  type FlowRuntimeHandshakeResult,
+  type FlowRuntimeHealthReport,
+} from '@/lib/flow/runtimeDiagnostics'
 import type {
   FlowAdmissionHealth,
   FlowAdmissionSnapshot,
@@ -47,6 +64,8 @@ var workflowEditorWindowId: number | null = null
 var workflowEditorTabId: number | null = null
 
 const FLOW_ADMISSION_STORAGE_KEY = 'flowAdmissionP0'
+const FLOW_RUNTIME_DIAGNOSTICS_STORAGE_KEY = 'flowRuntimeDiagnosticsV1'
+const FLOW_BACKGROUND_INSTANCE_ID = `flow-background-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
 const flowDispatchedJobIds = new Set<string>()
 const flowAdmissionController = new FlowAdmissionController({
   // Conservative extension-side safety debounce, not a claimed Google Flow
@@ -66,8 +85,128 @@ const flowAdmissionController = new FlowAdmissionController({
     // Admission logs intentionally exclude prompt text, cookies, tokens, and
     // response bodies. These lifecycle fields are safe for default logging.
     console.log(`[FlowAdmission] ${event} ${JSON.stringify(payload)}`)
+    void appendFlowRuntimeDiagnosticEvent(event, payload)
   },
 })
+
+let flowRuntimeDiagnosticWriteQueue: Promise<void> = Promise.resolve()
+
+function normalizeFlowRuntimeDiagnosticState(value: unknown): FlowRuntimeDiagnosticState {
+  if (!value || typeof value !== 'object') return createFlowRuntimeDiagnosticState()
+  const raw = value as Partial<FlowRuntimeDiagnosticState>
+  if (raw.version !== FLOW_RUNTIME_DIAGNOSTICS_VERSION) return createFlowRuntimeDiagnosticState()
+  return {
+    version: FLOW_RUNTIME_DIAGNOSTICS_VERSION,
+    enabled: raw.enabled === true,
+    runtimeSessionId: typeof raw.runtimeSessionId === 'string' ? raw.runtimeSessionId : null,
+    startedAt: typeof raw.startedAt === 'number' ? raw.startedAt : null,
+    updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : Date.now(),
+    logs: Array.isArray(raw.logs) ? raw.logs.slice(-500) : [],
+    testCaseResults: Array.isArray(raw.testCaseResults) ? raw.testCaseResults.slice(-200) : [],
+    consoleErrors: Array.isArray(raw.consoleErrors) ? raw.consoleErrors.slice(-100) : [],
+    lastHandshake: raw.lastHandshake && typeof raw.lastHandshake === 'object' ? raw.lastHandshake : null,
+    lastHealthProbe: raw.lastHealthProbe && typeof raw.lastHealthProbe === 'object' ? raw.lastHealthProbe : null,
+  }
+}
+
+async function loadFlowRuntimeDiagnosticState(): Promise<FlowRuntimeDiagnosticState> {
+  await flowRuntimeDiagnosticWriteQueue
+  const stored = await chrome.storage.session?.get?.(FLOW_RUNTIME_DIAGNOSTICS_STORAGE_KEY)
+  return normalizeFlowRuntimeDiagnosticState(stored?.[FLOW_RUNTIME_DIAGNOSTICS_STORAGE_KEY])
+}
+
+function updateFlowRuntimeDiagnosticState(
+  updater: (state: FlowRuntimeDiagnosticState) => Promise<FlowRuntimeDiagnosticState> | FlowRuntimeDiagnosticState,
+): Promise<FlowRuntimeDiagnosticState> {
+  let result!: FlowRuntimeDiagnosticState
+  const operation = flowRuntimeDiagnosticWriteQueue.then(async () => {
+    const stored = await chrome.storage.session?.get?.(FLOW_RUNTIME_DIAGNOSTICS_STORAGE_KEY)
+    const current = normalizeFlowRuntimeDiagnosticState(stored?.[FLOW_RUNTIME_DIAGNOSTICS_STORAGE_KEY])
+    result = await updater(current)
+    if (result !== current) {
+      await chrome.storage.session?.set?.({ [FLOW_RUNTIME_DIAGNOSTICS_STORAGE_KEY]: result })
+    }
+  })
+  flowRuntimeDiagnosticWriteQueue = operation.catch(() => undefined)
+  return operation.then(() => result)
+}
+
+async function appendFlowRuntimeDiagnosticEvent(event: string, payload: Record<string, unknown>): Promise<void> {
+  await updateFlowRuntimeDiagnosticState(async (state) => {
+    if (!state.enabled || !state.runtimeSessionId) return state
+    const safePayload = await sanitizeFlowRuntimeReport(payload) as Record<string, unknown>
+    return {
+      ...state,
+      updatedAt: Date.now(),
+      logs: [...state.logs, {
+        timestamp: Date.now(),
+        event,
+        runtimeSessionId: state.runtimeSessionId,
+        ...safePayload,
+      }].slice(-500),
+    }
+  })
+}
+
+async function recordFlowRuntimeDiagnosticResult(
+  kind: 'handshake' | 'health',
+  result: FlowRuntimeHandshakeResult | FlowRuntimeHealthReport,
+  status: 'pass' | 'fail' | 'unknown',
+): Promise<void> {
+  await updateFlowRuntimeDiagnosticState((state) => {
+    if (!state.enabled || !state.runtimeSessionId) return state
+    const timestamp = Date.now()
+    return {
+      ...state,
+      updatedAt: timestamp,
+      ...(kind === 'handshake'
+        ? { lastHandshake: result as FlowRuntimeHandshakeResult }
+        : { lastHealthProbe: result as FlowRuntimeHealthReport }),
+      testCaseResults: [...state.testCaseResults, {
+        runtimeSessionId: state.runtimeSessionId,
+        timestamp,
+        testCase: kind,
+        status,
+      }].slice(-200),
+    }
+  })
+}
+
+async function recordFlowRuntimeConsoleError(event: string, error: unknown): Promise<void> {
+  await updateFlowRuntimeDiagnosticState(async (state) => {
+    if (!state.enabled || !state.runtimeSessionId) return state
+    const timestamp = Date.now()
+    const safe = await sanitizeFlowRuntimeReport({
+      runtimeSessionId: state.runtimeSessionId,
+      timestamp,
+      event,
+      error: error instanceof Error ? error.message : String(error),
+    }) as Record<string, unknown>
+    return {
+      ...state,
+      updatedAt: timestamp,
+      consoleErrors: [...state.consoleErrors, safe].slice(-100),
+    }
+  })
+}
+
+async function setFlowRuntimeDiagnosticsEnabled(payload: { enabled?: boolean; startNewSession?: boolean }) {
+  const enabled = payload.enabled === true
+  const state = await updateFlowRuntimeDiagnosticState((current) => {
+    if (!enabled) return { ...current, enabled: false, updatedAt: Date.now() }
+    if (payload.startNewSession === true || !current.runtimeSessionId) {
+      return startFlowRuntimeDiagnosticSession(current)
+    }
+    return { ...current, enabled: true, updatedAt: Date.now() }
+  })
+  return {
+    success: true,
+    enabled: state.enabled,
+    runtimeSessionId: state.runtimeSessionId,
+    backgroundMarker: FLOW_BACKGROUND_BUILD_MARKER,
+    backgroundInstanceId: FLOW_BACKGROUND_INSTANCE_ID,
+  }
+}
 
 const WORKFLOW_EDITOR_WINDOW_ID_KEY = 'workflowEditorWindowId'
 const WORKFLOW_EDITOR_TAB_ID_KEY = 'workflowEditorTabId'
@@ -583,6 +722,30 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
     // owner: google-flow — P0 admission lifecycle and Wait-node probes.
     case 'FLOW_GET_ADMISSION_SNAPSHOT':
       return { success: true, snapshot: await flowAdmissionController.getSnapshot() }
+
+    // owner: google-flow — read-only Phase 2.6 runtime verification harness.
+    // Exact-action guards keep these probes out of ChatGPT routing. They do
+    // not dispatch RUN_FLOW_PROMPT, inject scripts, navigate tabs, or mutate UI.
+    case 'FLOW_RUNTIME_SET_ENABLED':
+      return setFlowRuntimeDiagnosticsEnabled((message.payload || {}) as { enabled?: boolean; startNewSession?: boolean })
+
+    case 'FLOW_RUNTIME_HANDSHAKE':
+      return runFlowRuntimeHandshake()
+
+    case 'FLOW_RUNTIME_HEALTH_PROBE':
+      return runFlowRuntimeHealthProbe()
+
+    case 'FLOW_RUNTIME_ADMISSION_DRY_RUN':
+      return runFlowRuntimeAdmissionDryRun()
+
+    case 'GET_FLOW_ADMISSION_DIAGNOSTICS':
+      return { success: true, snapshot: await flowAdmissionController.getDiagnostics() }
+
+    case 'FLOW_RUNTIME_GET_REPORT':
+      return getFlowRuntimeDiagnosticReport()
+
+    case 'FLOW_RUNTIME_RESET_LOGS':
+      return resetFlowRuntimeDiagnosticReportLogs()
 
     case 'FLOW_CANCEL_ADMISSION':
       return cancelFlowAdmission((message.payload || {}) as { jobId?: string; callerId?: string })
@@ -2554,6 +2717,212 @@ async function findOrOpenFlowTab(): Promise<number | null> {
     return tab.id ?? null
   } catch {
     return null
+  }
+}
+
+async function findExistingFlowDiagnosticTab(): Promise<chrome.tabs.Tab | null> {
+  // Diagnostics are observational only: never create, focus, reload, or
+  // navigate a tab. A public landing page may be returned, but a missing
+  // composer remains a runtime signal and never causes selector changes.
+  const tabs = await chrome.tabs.query({ url: 'https://labs.google/fx/*' }).catch(() => [])
+  const flowTabs = tabs.filter((tab) => isGoogleFlowUrl(String(tab.url || tab.pendingUrl || '')))
+  return flowTabs.find((tab) => tab.active) || flowTabs[0] || null
+}
+
+async function runFlowRuntimeHandshake(): Promise<FlowRuntimeHandshakeResult> {
+  const timestamp = Date.now()
+  const tab = await findExistingFlowDiagnosticTab()
+  const tabId = tab?.id
+  const flowUrlValid = !!tab && isGoogleFlowUrl(String(tab.url || tab.pendingUrl || ''))
+  let contentResponse: FlowRuntimeContentHandshakeResponse | null = null
+  let error = ''
+
+  if (tabId !== undefined && flowUrlValid) {
+    try {
+      contentResponse = await chrome.tabs.sendMessage(tabId, { action: 'FLOW_RUNTIME_HANDSHAKE' }) as FlowRuntimeContentHandshakeResponse
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : String(cause)
+      await recordFlowRuntimeConsoleError('FLOW_RUNTIME_HANDSHAKE_FAILED', cause)
+    }
+  } else {
+    error = tab ? 'flow_route_invalid' : 'flow_tab_not_found'
+  }
+
+  const result = buildFlowRuntimeHandshake({
+    timestamp,
+    backgroundInstanceId: FLOW_BACKGROUND_INSTANCE_ID,
+    ...(tabId !== undefined ? { tabId } : {}),
+    flowUrlValid,
+    contentResponse,
+    ...(error ? { error } : {}),
+  })
+  await appendFlowRuntimeDiagnosticEvent('FLOW_RUNTIME_HANDSHAKE', {
+    tabId,
+    flowUrlValid,
+    backgroundBuildMarker: result.backgroundMarker,
+    contentBuildMarker: result.contentMarker,
+    bridgeBuildMarker: result.bridgeMarker,
+    bridgeReady: result.bridgeReady,
+    composerDetected: result.composerDetected,
+    duplicateBridgeDetected: result.duplicateBridgeDetected,
+    duplicateListenerDetected: result.duplicateListenerDetected,
+    markerStatus: result.markerStatus,
+    error: result.error,
+  })
+  await recordFlowRuntimeDiagnosticResult('handshake', result, result.success ? 'pass' : 'fail')
+  return result
+}
+
+function healthReportStatus(report: FlowRuntimeHealthReport): 'pass' | 'fail' | 'unknown' {
+  const statuses = Object.entries(report)
+    .filter(([key]) => key !== 'timestamp')
+    .map(([, value]) => (value as { status?: string }).status)
+  if (statuses.includes('fail')) return 'fail'
+  if (statuses.includes('unknown')) return 'unknown'
+  return 'pass'
+}
+
+async function runFlowRuntimeHealthProbe(): Promise<FlowRuntimeHealthReport> {
+  const timestamp = Date.now()
+  const tab = await findExistingFlowDiagnosticTab()
+  const tabId = tab?.id
+  const tabExists = !!tab
+  const validFlowRoute = tab ? isGoogleFlowUrl(String(tab.url || tab.pendingUrl || '')) : null
+  let raw: Record<string, unknown> | null = null
+
+  if (tabId !== undefined && validFlowRoute === true) {
+    try {
+      raw = await chrome.tabs.sendMessage(tabId, { action: 'FLOW_RUNTIME_HEALTH_PROBE' }) as Record<string, unknown>
+    } catch (cause) {
+      await recordFlowRuntimeConsoleError('FLOW_RUNTIME_HEALTH_PROBE_FAILED', cause)
+    }
+  }
+
+  const bridgeObserved = raw && typeof raw.bridgeReady === 'boolean' ? raw.bridgeReady : null
+  const composerObserved = raw && typeof raw.composerPresent === 'boolean' ? raw.composerPresent : null
+  const dialogObserved = raw && typeof raw.blockingDialog === 'boolean' ? raw.blockingDialog : null
+  const warningClassificationObserved = raw?.contentReady === true && raw?.bridgeReady === true
+  const report = buildFlowRuntimeHealthReport({
+    timestamp,
+    tabExists,
+    validFlowRoute,
+    bridgeReady: bridgeObserved,
+    composerDetected: composerObserved,
+    blockingDialogDetected: dialogObserved,
+    errorCode: warningClassificationObserved ? String(raw?.errorCode || '') : null,
+    processingTileCount: raw && typeof raw.processing === 'number' ? raw.processing : null,
+    pendingTileCount: raw && typeof raw.pending === 'number' ? raw.pending : null,
+    generatingTileCount: raw && typeof raw.generating === 'number' ? raw.generating : null,
+  })
+  const status = healthReportStatus(report)
+  await appendFlowRuntimeDiagnosticEvent('FLOW_RUNTIME_HEALTH_PROBE', {
+    tabId,
+    status,
+    report,
+    injectionCounts: raw?.injectionCounts,
+  })
+  await recordFlowRuntimeDiagnosticResult('health', report, status)
+  return report
+}
+
+async function runFlowRuntimeAdmissionDryRun() {
+  const admission = await flowAdmissionController.getDiagnostics()
+  const health = await runFlowRuntimeHealthProbe()
+  const counts = [health.processingTileCount, health.pendingTileCount, health.generatingTileCount]
+  const activeTileCount = counts.reduce((sum, signal) => sum + (typeof signal.value === 'number' ? signal.value : 0), 0)
+  const unknownHealth = Object.entries(health)
+    .filter(([key]) => key !== 'timestamp')
+    .some(([, signal]) => (signal as { status?: string }).status === 'unknown')
+  const failedHealth = Object.entries(health)
+    .filter(([key]) => key !== 'timestamp')
+    .some(([, signal]) => (signal as { status?: string }).status === 'fail')
+  const wouldAdmit = admission.state === 'idle' && activeTileCount === 0 && !unknownHealth && !failedHealth
+  const statusReason = admission.state !== 'idle'
+    ? `admission_owned_${admission.state}`
+    : activeTileCount > 0
+      ? 'provider_busy_before_dispatch'
+      : unknownHealth
+        ? 'health_unknown_fail_closed'
+        : failedHealth
+          ? 'health_probe_failed'
+          : 'dry_run_would_admit'
+  const result = {
+    success: true,
+    dryRun: true,
+    wouldAdmit,
+    dispatched: false,
+    statusReason,
+    activeTileCount,
+    admission,
+    health,
+    timestamp: Date.now(),
+  }
+  await appendFlowRuntimeDiagnosticEvent('FLOW_RUNTIME_ADMISSION_DRY_RUN', {
+    wouldAdmit,
+    dispatched: false,
+    statusReason,
+    activeTileCount,
+    admissionState: admission.state,
+  })
+  return result
+}
+
+async function getFlowRuntimeDiagnosticReport() {
+  const state = await loadFlowRuntimeDiagnosticState()
+  const admission = await flowAdmissionController.getDiagnostics()
+  const handshake = state.lastHandshake
+  const report = {
+    schemaVersion: FLOW_RUNTIME_DIAGNOSTICS_VERSION,
+    generatedAt: Date.now(),
+    runtimeSessionId: state.runtimeSessionId,
+    diagnosticsEnabled: state.enabled,
+    environment: {
+      extensionVersion: chrome.runtime.getManifest().version,
+      extensionId: chrome.runtime.id,
+      userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown',
+      platform: typeof navigator !== 'undefined' ? navigator.platform : 'unknown',
+      locale: typeof navigator !== 'undefined' ? navigator.language : 'unknown',
+    },
+    markers: {
+      background: {
+        expected: FLOW_BACKGROUND_BUILD_MARKER,
+        actual: FLOW_BACKGROUND_BUILD_MARKER,
+        status: evaluateRuntimeMarker(FLOW_BACKGROUND_BUILD_MARKER, FLOW_BACKGROUND_BUILD_MARKER),
+      },
+      content: {
+        expected: FLOW_CONTENT_BUILD_MARKER,
+        actual: handshake?.contentMarker || null,
+        status: evaluateRuntimeMarker(FLOW_CONTENT_BUILD_MARKER, handshake?.contentMarker),
+      },
+      bridge: {
+        expected: FLOW_BRIDGE_BUILD_MARKER,
+        actual: handshake?.bridgeMarker || null,
+        status: evaluateRuntimeMarker(FLOW_BRIDGE_BUILD_MARKER, handshake?.bridgeMarker),
+      },
+    },
+    instances: {
+      backgroundInstanceId: FLOW_BACKGROUND_INSTANCE_ID,
+      contentInstanceId: handshake?.contentInstanceId || null,
+      bridgeInstanceId: handshake?.bridgeInstanceId || null,
+    },
+    handshake,
+    injectionCounts: handshake?.injectionCounts || null,
+    admissionSnapshots: [admission],
+    stateTransitionLogs: state.logs,
+    healthProbe: state.lastHealthProbe,
+    runtimeTestCaseResults: state.testCaseResults,
+    consoleErrors: state.consoleErrors,
+  }
+  return { success: true, report: await sanitizeFlowRuntimeReport(report) }
+}
+
+async function resetFlowRuntimeDiagnosticReportLogs() {
+  const state = await updateFlowRuntimeDiagnosticState((current) => resetFlowRuntimeDiagnosticLogs(current))
+  return {
+    success: true,
+    enabled: state.enabled,
+    runtimeSessionId: state.runtimeSessionId,
+    admission: await flowAdmissionController.getDiagnostics(),
   }
 }
 

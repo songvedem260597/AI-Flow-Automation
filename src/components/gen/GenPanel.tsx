@@ -57,6 +57,21 @@ const FLOW_VIDEO_MODELS: FlowModelOption[] = [
 const DEFAULT_FLOW_IMAGE_MODEL = 'Nano Banana 2'
 const DEFAULT_FLOW_VIDEO_MODEL = 'Omni Flash'
 
+function flowDiagnosticFilename(now = new Date()): string {
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `flow-runtime-diagnostics-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.json`
+}
+
+function textToBase64DataUrl(value: string): string {
+  const bytes = new TextEncoder().encode(value)
+  let binary = ''
+  const chunkSize = 0x8000
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize))
+  }
+  return `data:application/json;base64,${btoa(binary)}`
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 type Provider = 'flow' | 'chatgpt'
@@ -1769,6 +1784,8 @@ export const GenPanel: React.FC<{
   const addPrompt = usePromptStore((s) => s.addPrompt)
   const savedPrompts = usePromptStore((s) => s.prompts)
   const activeProvider = activeGenProvider as Provider
+  const flowRuntimeDiagnosticsEnabled = useSettingsStore((state) => state.flowRuntimeDiagnosticsEnabled === true)
+  const updateSettings = useSettingsStore((state) => state.updateSettings)
   const [mode, setMode] = usePersistedState<GenMode>('genpanel.mode', 'image')
   const [imageModel, setImageModel] = usePersistedState<string>('genpanel.imageModel', DEFAULT_FLOW_IMAGE_MODEL)
   const [videoModel, setVideoModel] = usePersistedState<string>('genpanel.videoModel', DEFAULT_FLOW_VIDEO_MODEL)
@@ -1897,6 +1914,27 @@ export const GenPanel: React.FC<{
   const [promptSearchQuery, setPromptSearchQuery] = useState('')
   const [promptSearchTab, setPromptSearchTab] = useState<'my' | 'template'>('my')
   const [promptAssistantOpen, setPromptAssistantOpen] = useState(false)
+  const [flowDiagnosticBusyAction, setFlowDiagnosticBusyAction] = useState<string>('')
+  const [flowDiagnosticStatus, setFlowDiagnosticStatus] = useState('Diagnostics are off.')
+  const [flowDiagnosticResult, setFlowDiagnosticResult] = useState<Record<string, unknown> | null>(null)
+  const [flowRuntimeSessionId, setFlowRuntimeSessionId] = useState<string>('')
+  const flowDiagnosticMountedRef = useRef(false)
+
+  useEffect(() => {
+    const startNewSession = flowDiagnosticMountedRef.current && flowRuntimeDiagnosticsEnabled
+    flowDiagnosticMountedRef.current = true
+    chrome.runtime.sendMessage({
+      action: 'FLOW_RUNTIME_SET_ENABLED',
+      payload: { enabled: flowRuntimeDiagnosticsEnabled, startNewSession },
+    }).then((response: { runtimeSessionId?: string } | undefined) => {
+      setFlowRuntimeSessionId(String(response?.runtimeSessionId || ''))
+      setFlowDiagnosticStatus(flowRuntimeDiagnosticsEnabled
+        ? 'Runtime diagnostics are on.'
+        : 'Diagnostics are off.')
+    }).catch((error) => {
+      setFlowDiagnosticStatus(`Diagnostics setting failed: ${error instanceof Error ? error.message : String(error)}`)
+    })
+  }, [flowRuntimeDiagnosticsEnabled])
 
   // ── Multi-Prompt Types ────────────────────────────────────────────────────────
   type PromptRunStatus = 'pending' | 'running' | 'success' | 'partial' | 'failed'
@@ -2677,6 +2715,81 @@ const handleFlowAdmissionReset = useCallback(async () => {
   }
 }, [flowAdmissionResetting])
 
+const handleFlowDiagnosticToggle = useCallback((enabled: boolean) => {
+  updateSettings({ flowRuntimeDiagnosticsEnabled: enabled })
+  setFlowDiagnosticStatus(enabled ? 'Starting a new runtime diagnostic session…' : 'Diagnostics are off.')
+  if (!enabled) setFlowDiagnosticResult(null)
+}, [updateSettings])
+
+const runFlowDiagnosticAction = useCallback(async (action: string, label: string) => {
+  if (!flowRuntimeDiagnosticsEnabled || flowDiagnosticBusyAction) return
+  setFlowDiagnosticBusyAction(action)
+  setFlowDiagnosticStatus(`${label}…`)
+  try {
+    const response = await chrome.runtime.sendMessage({ action }) as Record<string, unknown>
+    setFlowDiagnosticResult(response)
+    const succeeded = response?.success !== false
+    setFlowDiagnosticStatus(succeeded ? `${label} complete.` : `${label} returned a failure.`)
+  } catch (error) {
+    setFlowDiagnosticStatus(`${label} failed: ${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    setFlowDiagnosticBusyAction('')
+  }
+}, [flowRuntimeDiagnosticsEnabled, flowDiagnosticBusyAction])
+
+const handleFlowDiagnosticExport = useCallback(async () => {
+  if (!flowRuntimeDiagnosticsEnabled || flowDiagnosticBusyAction) return
+  setFlowDiagnosticBusyAction('FLOW_RUNTIME_GET_REPORT')
+  setFlowDiagnosticStatus('Preparing sanitized diagnostic report…')
+  try {
+    const response = await chrome.runtime.sendMessage({ action: 'FLOW_RUNTIME_GET_REPORT' }) as {
+      success?: boolean
+      report?: Record<string, unknown>
+      error?: string
+    }
+    if (response?.success !== true || !response.report) {
+      throw new Error(response?.error || 'Diagnostic report was unavailable')
+    }
+    const json = JSON.stringify(response.report, null, 2)
+    const filename = flowDiagnosticFilename()
+    const download = await chrome.runtime.sendMessage({
+      action: 'DOWNLOAD_FILE',
+      payload: {
+        data: textToBase64DataUrl(json),
+        filename,
+        mimeType: 'application/json',
+      },
+    }) as { success?: boolean; error?: string }
+    if (download?.success !== true) throw new Error(download?.error || 'Report download failed')
+    setFlowDiagnosticResult({ reportGenerated: true, filename, runtimeSessionId: flowRuntimeSessionId })
+    setFlowDiagnosticStatus(`Exported ${filename}`)
+  } catch (error) {
+    setFlowDiagnosticStatus(`Export failed: ${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    setFlowDiagnosticBusyAction('')
+  }
+}, [flowRuntimeDiagnosticsEnabled, flowDiagnosticBusyAction, flowRuntimeSessionId])
+
+const handleFlowDiagnosticResetLogs = useCallback(async () => {
+  if (!flowRuntimeDiagnosticsEnabled || flowDiagnosticBusyAction) return
+  setFlowDiagnosticBusyAction('FLOW_RUNTIME_RESET_LOGS')
+  try {
+    const response = await chrome.runtime.sendMessage({ action: 'FLOW_RUNTIME_RESET_LOGS' }) as {
+      success?: boolean
+      runtimeSessionId?: string
+      error?: string
+    }
+    if (response?.success !== true) throw new Error(response?.error || 'Diagnostic reset failed')
+    setFlowRuntimeSessionId(String(response.runtimeSessionId || flowRuntimeSessionId))
+    setFlowDiagnosticResult(null)
+    setFlowDiagnosticStatus('Diagnostic logs cleared. Flow admission was not changed.')
+  } catch (error) {
+    setFlowDiagnosticStatus(`Log reset failed: ${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    setFlowDiagnosticBusyAction('')
+  }
+}, [flowRuntimeDiagnosticsEnabled, flowDiagnosticBusyAction, flowRuntimeSessionId])
+
 interface TileCounts {
   generating: number
   done: number
@@ -3151,6 +3264,76 @@ const handleGenerate = useCallback(async () => {
             })}
           </div>
         </div>
+
+        {/* ── Flow Runtime Verification (read-only) ── */}
+        {activeProvider === 'flow' && (
+          <div className="px-4 pb-3">
+            <div className="rounded-xl border border-sky-400/15 bg-sky-400/[0.04] p-3">
+              <div className="flex items-center gap-2">
+                <Activity className="h-3.5 w-3.5 text-sky-300" />
+                <div className="text-[11px] font-medium text-white/70">Runtime Verification</div>
+                <div className="ml-auto flex items-center gap-2">
+                  <span className={cn('text-[10px] font-medium', flowRuntimeDiagnosticsEnabled ? 'text-emerald-300' : 'text-white/30')}>
+                    Runtime Diagnostics: {flowRuntimeDiagnosticsEnabled ? 'ON' : 'OFF'}
+                  </span>
+                  <Toggle checked={flowRuntimeDiagnosticsEnabled} onChange={handleFlowDiagnosticToggle} />
+                </div>
+              </div>
+              <div className="mt-1.5 text-[10px] text-sky-100/45">These checks do not generate media.</div>
+              {flowRuntimeSessionId && flowRuntimeDiagnosticsEnabled && (
+                <div className="mt-1 truncate font-mono text-[9px] text-white/25" title={flowRuntimeSessionId}>
+                  Session: {flowRuntimeSessionId}
+                </div>
+              )}
+
+              <div className="mt-3 grid grid-cols-2 gap-1.5">
+                {[
+                  ['FLOW_RUNTIME_HANDSHAKE', 'Run Handshake'],
+                  ['FLOW_RUNTIME_HEALTH_PROBE', 'Run Health Probe'],
+                  ['GET_FLOW_ADMISSION_DIAGNOSTICS', 'Show Admission State'],
+                  ['FLOW_RUNTIME_ADMISSION_DRY_RUN', 'Admission Dry-Run'],
+                ].map(([action, label]) => (
+                  <button
+                    key={action}
+                    type="button"
+                    onClick={() => void runFlowDiagnosticAction(action, label)}
+                    disabled={!flowRuntimeDiagnosticsEnabled || !!flowDiagnosticBusyAction}
+                    className="rounded-lg border border-white/[0.07] bg-white/[0.04] px-2 py-1.5 text-[10px] text-white/55 transition-colors hover:bg-white/[0.08] hover:text-white/75 disabled:cursor-not-allowed disabled:opacity-30"
+                  >
+                    {flowDiagnosticBusyAction === action ? 'Running…' : label}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => void handleFlowDiagnosticExport()}
+                  disabled={!flowRuntimeDiagnosticsEnabled || !!flowDiagnosticBusyAction}
+                  className="rounded-lg border border-white/[0.07] bg-white/[0.04] px-2 py-1.5 text-[10px] text-white/55 transition-colors hover:bg-white/[0.08] hover:text-white/75 disabled:cursor-not-allowed disabled:opacity-30"
+                >
+                  {flowDiagnosticBusyAction === 'FLOW_RUNTIME_GET_REPORT' ? 'Exporting…' : 'Export Diagnostic Report'}
+                </button>
+              </div>
+
+              <div className="mt-2 border-t border-white/[0.06] pt-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="min-w-0 flex-1 text-[9px] leading-4 text-white/35">{flowDiagnosticStatus}</span>
+                  <button
+                    type="button"
+                    onClick={() => void handleFlowDiagnosticResetLogs()}
+                    disabled={!flowRuntimeDiagnosticsEnabled || !!flowDiagnosticBusyAction}
+                    className="flex-shrink-0 text-[9px] text-white/30 hover:text-white/55 disabled:cursor-not-allowed disabled:opacity-30"
+                  >
+                    {flowDiagnosticBusyAction === 'FLOW_RUNTIME_RESET_LOGS' ? 'Clearing…' : 'Reset Diagnostic Logs'}
+                  </button>
+                </div>
+                {flowDiagnosticResult && (
+                  <pre className="mt-2 max-h-36 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-black/20 p-2 text-[9px] leading-4 text-white/40">
+                    {JSON.stringify(flowDiagnosticResult, null, 2)}
+                  </pre>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* ── Generation Settings ── */}
         <div className="px-4 pb-3">

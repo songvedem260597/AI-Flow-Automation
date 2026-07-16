@@ -43,6 +43,7 @@ export const DEFAULT_SETTINGS = {
   downloadFormat: 'png' as const,
   defaultProvider: 'chatgpt' as const,
   promptAssistantMode: 'tab' as const,
+  flowRuntimeDiagnosticsEnabled: false,
   apiProvider: {
     enabled: false,
     endpoint: 'http://localhost:20128/v1',

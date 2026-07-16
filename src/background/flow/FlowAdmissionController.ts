@@ -1,5 +1,6 @@
 import type {
   FlowAdmissionHealth,
+  FlowAdmissionDiagnosticSnapshot,
   FlowAdmissionJob,
   FlowAdmissionSnapshot,
   FlowAdmissionState,
@@ -62,6 +63,7 @@ export interface FlowAdmissionControllerOptions {
 }
 
 const GLOBAL_SCOPE = 'google-flow-global' as const
+const FLOW_ADMISSION_PERSISTENCE_VERSION = 1
 
 const cloneJob = (job: FlowAdmissionJob | null): FlowAdmissionJob | null =>
   job ? { ...job } : null
@@ -355,6 +357,41 @@ export class FlowAdmissionController {
     await this.ensureHydrated()
     await this.expireStaleLeaseIfSafe()
     return this.getSnapshotUnsafe()
+  }
+
+  async getDiagnostics(): Promise<FlowAdmissionDiagnosticSnapshot> {
+    // Read-only by contract: hydrate persisted state, but do not call the
+    // lease-expiry path and do not persist. Runtime diagnostics must never
+    // change ownership or release a Flow admission.
+    await this.ensureHydrated()
+    const capturedAt = this.now()
+    const job = this.activeJob
+    const preSubmitStartedAt = job?.admittedAt || job?.requestedAt
+    const preSubmitLeaseRemainingMs = job && (job.state === 'checking' || job.state === 'admitted') && preSubmitStartedAt
+      ? Math.max(0, this.preSubmitLeaseMs - (capturedAt - preSubmitStartedAt))
+      : undefined
+    const safetyTimeoutRemainingMs = job?.state === 'in_flight' && job.submittedAt
+      ? Math.max(0, this.inFlightSafetyMs - (capturedAt - job.submittedAt))
+      : (job?.state === 'submit_uncertain' ? 0 : undefined)
+
+    return {
+      scope: GLOBAL_SCOPE,
+      state: job?.state || 'idle',
+      ...(job?.jobId ? { ownerJobId: job.jobId } : {}),
+      ...(job?.source ? { source: job.source } : {}),
+      ...(job?.tabId !== undefined ? { tabId: job.tabId } : {}),
+      ...(job?.requestedAt !== undefined ? { requestedAt: job.requestedAt } : {}),
+      ...(job?.admittedAt !== undefined ? { admittedAt: job.admittedAt } : {}),
+      ...(job?.submittedAt !== undefined ? { submittedAt: job.submittedAt } : {}),
+      ...(job?.completedAt !== undefined ? { completedAt: job.completedAt } : {}),
+      ...(this.cooldownUntil > capturedAt ? { blockedUntil: this.cooldownUntil } : {}),
+      ...(job?.errorCode ? { errorCode: job.errorCode } : {}),
+      persistenceLoaded: this.hydrated,
+      persistenceVersion: FLOW_ADMISSION_PERSISTENCE_VERSION,
+      ...(safetyTimeoutRemainingMs !== undefined ? { safetyTimeoutRemainingMs } : {}),
+      ...(preSubmitLeaseRemainingMs !== undefined ? { preSubmitLeaseRemainingMs } : {}),
+      capturedAt,
+    }
   }
 
   async resetBlockedState(userAcknowledged: boolean): Promise<FlowAdmissionSnapshot> {
