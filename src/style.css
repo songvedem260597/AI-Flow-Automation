@@ -824,6 +824,7 @@ input::placeholder, textarea::placeholder {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-height: 40px;
   padding: 8px 10px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
   border-top-right-radius: 10px;
@@ -838,6 +839,11 @@ input::placeholder, textarea::placeholder {
   justify-content: center;
   border-radius: 6px;
   flex-shrink: 0;
+  line-height: 0;
+}
+
+.df-node-icon svg {
+  display: block;
 }
 
 .df-node-icon.generate { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
@@ -851,8 +857,12 @@ input::placeholder, textarea::placeholder {
 
 .df-node-title {
   flex: 1;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
   font-size: 12px;
   font-weight: 600;
+  line-height: 1.2;
   color: #e8e8ea;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1319,12 +1329,15 @@ button.df-node-tag {
 .df-node-toggle {
   display: flex;
   align-items: center;
+  justify-content: center;
+  align-self: center;
   margin-left: auto;
   padding: 0;
   background: none;
   border: none;
   cursor: pointer;
   flex-shrink: 0;
+  line-height: 0;
 }
 
 .df-node-toggle-track {
@@ -1739,6 +1752,35 @@ svg.ai-edge-completed path,
   height: 100%;
   object-fit: cover;
   display: block;
+}
+
+/* A Generate output may retain an expired remote URL in an older
+   workflow. The delegated image error handler applies the missing
+   class so Chrome's broken-image icon/alt text is replaced by the
+   same centered icon used by a Generate node with no output. */
+.df-node-output-missing-placeholder {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: none;
+  min-height: 0;
+  background: #0c0c0e;
+  pointer-events: none;
+}
+
+.df-node-output-preview.df-node-output-media-missing > .df-node-preview-media {
+  visibility: hidden;
+}
+
+.df-node-output-preview.df-node-output-media-missing > .df-node-output-missing-placeholder {
+  display: flex;
+}
+
+.df-node-output-preview.df-node-output-media-missing > .df-node-image-preview-button,
+.df-node-output-preview.df-node-output-media-missing > .df-node-video-play-badge,
+.df-node-output-preview.df-node-output-media-missing[data-output-count="1"] > .df-node-output-top-gradient,
+.df-node-output-preview.df-node-output-media-missing[data-output-count="1"] > .df-node-output-carousel-bar {
+  display: none;
 }
 
 /* [Workflow] Generate-node video preview — fills the same area as
@@ -3024,6 +3066,7 @@ button.df-node-pill-trigger {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-height: 22px;
   padding: 2px 4px 0;
 }
 
@@ -3046,14 +3089,22 @@ button.df-node-pill-trigger {
 
 .workflow-media-file-label {
   flex: 1;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
   min-width: 0;
   font-size: 12px;
   font-weight: 600;
+  line-height: 1.2;
   color: #f4f4f5;
   letter-spacing: 0.01em;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.workflow-media-file-header > .df-node-toggle {
+  height: 22px;
 }
 
 .workflow-media-file-preview {

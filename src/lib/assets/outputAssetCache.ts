@@ -4,13 +4,12 @@
  * Strategy:
  *   1. Walk every entry in `output.outputs[]` (rich descriptor) and
  *      the flat `output.images[]` / `output.imageUrls[]` fallbacks.
- *   2. Resolve a single source URL per item using the same priority
- *      `getGenerateOutputImageUrls()` uses: videoUrl → url →
- *      imageUrl → mediaUrl → thumbnailUrl.
- *   3. `fetch(url) → blob → saveAssetFromBlob(...)`. Failure path
- *      (CORS, expired signed URL, network) is non-fatal — the caller
- *      keeps the original descriptor and the renderer falls back to
- *      the URL it already had.
+ *   2. Try embedded media data first, then remote URLs. ChatGPT often
+ *      returns both; embedded bytes are durable while a signed URL may
+ *      require page credentials or expire before workflow reload.
+ *   3. `fetch(candidate) → blob → saveAssetFromBlob(...)`. A failed
+ *      candidate falls through to the next one. Total failure stays
+ *      non-fatal and the caller keeps the original descriptor.
  *   4. For video outputs with an explicit `thumbnailUrl` / `poster`
  *      URL, attempt to cache the poster as a separate asset with
  *      `kind: 'poster'`. Failure stays silent.
@@ -69,18 +68,31 @@ interface OutputLike {
 const asString = (value: unknown): string =>
   typeof value === 'string' && value.length > 0 ? value : ''
 
+const resolveItemSourceUrls = (item: OutputItemLike): string[] => {
+  // ChatGPT's page-context collector can provide a data URL alongside
+  // the visible remote URL. Prefer those bytes: fetching the remote URL
+  // again from the extension side panel can fail because the request no
+  // longer has ChatGPT's page credentials or because the URL expired.
+  const candidates = [
+    item.data,
+    item.mediaData,
+    item.imageData,
+    item.videoData,
+    item.videoUrl,
+    item.url,
+    item.mediaUrl,
+    item.imageUrl,
+    item.thumbnailUrl,
+    item.poster
+  ]
+    .map(asString)
+    .filter(Boolean)
+
+  return Array.from(new Set(candidates))
+}
+
 const resolveItemSourceUrl = (item: OutputItemLike): string =>
-  asString(item.videoUrl)
-  || asString(item.url)
-  || asString(item.mediaUrl)
-  || asString(item.imageUrl)
-  || asString(item.data)
-  || asString(item.mediaData)
-  || asString(item.imageData)
-  || asString(item.videoData)
-  || asString(item.thumbnailUrl)
-  || asString(item.poster)
-  || ''
+  resolveItemSourceUrls(item)[0] || ''
 
 const resolveItemKind = (item: OutputItemLike, blob: Blob | null): 'image' | 'video' => {
   const declared = String(item.mediaType || item.type || '').toLowerCase()
@@ -138,11 +150,19 @@ const enrichItemWithAsset = async (
   item: OutputItemLike,
   index: number
 ): Promise<{ enriched: OutputItemLike; ok: boolean }> => {
-  const sourceUrl = resolveItemSourceUrl(item)
-  if (!sourceUrl) return { enriched: item, ok: false }
+  const sourceUrls = resolveItemSourceUrls(item)
+  if (sourceUrls.length === 0) return { enriched: item, ok: false }
 
-  const blob = await fetchBlobFromUrl(sourceUrl)
-  if (!blob) return { enriched: item, ok: false }
+  let sourceUrl = ''
+  let blob: Blob | null = null
+  for (const candidate of sourceUrls) {
+    blob = await fetchBlobFromUrl(candidate)
+    if (blob) {
+      sourceUrl = candidate
+      break
+    }
+  }
+  if (!sourceUrl || !blob) return { enriched: item, ok: false }
 
   const kind = resolveItemKind(item, blob)
   const fileName = asString(item.savedFilename).split(/[\\/]/).pop()
@@ -155,7 +175,9 @@ const enrichItemWithAsset = async (
     source: 'generated',
     fileName,
     mimeType: blob.type || undefined,
-    originalUrl: sourceUrl
+    // Never duplicate a potentially multi-megabyte data URL inside
+    // IndexedDB metadata; the Blob already contains the durable bytes.
+    originalUrl: /^https?:/i.test(sourceUrl) ? sourceUrl : undefined
   }
 
   try {
@@ -196,7 +218,7 @@ const enrichItemWithAsset = async (
   } catch (err) {
     // eslint-disable-next-line no-console
     console.warn('[AssetStore] output cache failed', {
-      url: sourceUrl,
+      url: sourceUrl.slice(0, 160),
       kind,
       message: err instanceof Error ? err.message : String(err)
     })

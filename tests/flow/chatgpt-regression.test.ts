@@ -59,3 +59,41 @@ test('GenPanel reset controls remain Flow-only and do not alter ChatGPT request 
   assert.match(chatSection, /RUN_CHATGPT_PROMPT/)
   assert.doesNotMatch(chatSection, /FLOW_RESET_ADMISSION|flowAdmissionResetReason/)
 })
+
+test('workflow output cache prefers embedded ChatGPT bytes and falls back across candidates', () => {
+  const cache = read('src/lib/assets/outputAssetCache.ts')
+  const candidatesStart = cache.indexOf('const resolveItemSourceUrls')
+  const candidatesEnd = cache.indexOf('const resolveItemSourceUrl', candidatesStart + 1)
+  assert.ok(candidatesStart >= 0 && candidatesEnd > candidatesStart)
+
+  const candidates = cache.slice(candidatesStart, candidatesEnd)
+  assert.ok(candidates.indexOf('item.data') < candidates.indexOf('item.url'))
+  assert.ok(candidates.indexOf('item.imageData') < candidates.indexOf('item.imageUrl'))
+
+  const enrichStart = cache.indexOf('const enrichItemWithAsset')
+  const enrichEnd = cache.indexOf('const enrichTopLevelPoster', enrichStart)
+  const enrich = cache.slice(enrichStart, enrichEnd)
+  assert.match(enrich, /for \(const candidate of sourceUrls\)/)
+  assert.match(enrich, /fetchBlobFromUrl\(candidate\)/)
+})
+
+test('broken persisted Generate images use the empty-node placeholder', () => {
+  const editor = read('src/components/workflow/WorkflowEditor.tsx')
+  const styles = read('src/style.css')
+
+  assert.match(editor, /df-node-output-missing-placeholder/)
+  assert.match(editor, /classList\.add\('df-node-output-media-missing'\)/)
+  assert.match(editor, /classList\.remove\('df-node-output-media-missing'\)/)
+  assert.match(styles, /\.df-node-output-preview\.df-node-output-media-missing/)
+})
+
+test('workflow node headers vertically center their icon, title, and toggle', () => {
+  const styles = read('src/style.css')
+  const headerStart = styles.indexOf('.df-node-header {')
+  const headerEnd = styles.indexOf('.df-node-body {', headerStart)
+  const headerStyles = styles.slice(headerStart, headerEnd)
+
+  assert.match(headerStyles, /\.df-node-header\s*\{[^}]*align-items:\s*center/s)
+  assert.match(headerStyles, /\.df-node-title\s*\{[^}]*display:\s*flex[^}]*align-items:\s*center/s)
+  assert.match(styles, /\.df-node-toggle\s*\{[^}]*align-self:\s*center/s)
+})

@@ -3108,7 +3108,7 @@ function renderDrawflowNode(node: WorkflowNode) {
     body = `
       <div class="df-node-preview-wrap df-node-generate-preview-wrap">
         ${hasOutput ? `
-          <div class="df-node-output-preview df-node-image-upload-target has-image ${generateRatioClass} ${previewMediaType === 'video' ? 'df-node-output-preview-video' : 'df-node-output-preview-image'}" data-generated-output-preview="true" data-selected-output-index="${selectedOutputIndex}" data-preview-media-type="${previewMediaType}">
+          <div class="df-node-output-preview df-node-image-upload-target has-image ${generateRatioClass} ${previewMediaType === 'video' ? 'df-node-output-preview-video' : 'df-node-output-preview-image'}" data-generated-output-preview="true" data-selected-output-index="${selectedOutputIndex}" data-output-count="${outputImageUrls.length}" data-preview-media-type="${previewMediaType}">
             ${previewMediaType === 'video' ? `
               <video
                 class="df-node-preview-media df-node-preview-video"
@@ -3124,8 +3124,11 @@ function renderDrawflowNode(node: WorkflowNode) {
                 <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
               </span>
             ` : `
-              <img class="df-node-preview-media" src="${escapeHtml(firstPreviewUrl)}" alt="Generated output" draggable="false">
+              <img class="df-node-preview-media" src="${escapeHtml(firstPreviewUrl)}" alt="" draggable="false">
             `}
+            <div class="df-node-preview-placeholder df-node-output-missing-placeholder" aria-hidden="true">
+              ${previewMediaType === 'video' ? DF_ICONS.generate : DF_ICONS.image}
+            </div>
             ${/* [Workflow] Skeleton / shimmer only renders while a
                 generated output is in flight (no usable URL yet). Once
                 `hasOutput` is true — image decoded or video metadata
@@ -10379,15 +10382,19 @@ const groupDragMirrorLog = (
       if (!target || target.tagName !== 'IMG') return
       if (!target.classList.contains('df-node-preview-media')) return
       target.classList.add('df-node-preview-media-loaded')
+      target.closest('.df-node-output-preview')
+        ?.classList.remove('df-node-output-media-missing')
     }
     const handlePreviewMediaError = (event: Event) => {
       const target = event.target as Element | null
       if (!target || target.tagName !== 'IMG') return
       if (!target.classList.contains('df-node-preview-media')) return
-      // Mark loaded anyway so the skeleton fades — the broken-image
-      // icon is preferable to a permanent placeholder behind a
-      // never-resolving image element.
+      // A persisted remote URL can expire before an old workflow is
+      // opened. Hide the browser's broken-image icon/alt text and show
+      // the same centered placeholder used by an empty Generate node.
       target.classList.add('df-node-preview-media-loaded')
+      target.closest('.df-node-output-preview')
+        ?.classList.add('df-node-output-media-missing')
     }
     const zoomOnWheel = (event: WheelEvent) => {
       const target = event.target as HTMLElement | null
