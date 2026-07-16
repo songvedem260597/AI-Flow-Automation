@@ -79,6 +79,29 @@ export function isFlowQueueStatusText(value: string): boolean {
   return /^(?:in (?:the )?queue|queued|waiting(?: in (?:the )?queue)?|(?:hiện )?(?:đang )?(?:ở )?trong hàng đợi|(?:hiện )?đang xếp hàng|(?:hiện )?đang chờ)$/.test(normalized)
 }
 
+export interface FlowWarningIconEvidenceInput {
+  text?: string
+  ariaLabel?: string
+  dataIcon?: string
+}
+
+/** Generated CSS class names are deliberately excluded as error evidence. */
+export function isFlowWarningIconEvidence(input: FlowWarningIconEvidenceInput): boolean {
+  const text = String(input.text || '').toLocaleLowerCase()
+  const ariaLabel = String(input.ariaLabel || '').toLocaleLowerCase()
+  const dataIcon = String(input.dataIcon || '').toLocaleLowerCase()
+  return text === 'warning' ||
+    text.includes('warning') ||
+    ariaLabel.includes('warning') ||
+    dataIcon.includes('warning')
+}
+
+/** Delete/cancel controls also exist on blank and queued cards. */
+export function isFlowRetryIconEvidence(value: string): boolean {
+  const normalized = String(value || '').toLocaleLowerCase()
+  return normalized.includes('refresh') || normalized.includes('retry')
+}
+
 /** Keeps the three health counters explicit without changing the Tile contract. */
 export function countFlowTileActivity(
   tiles: FlowTileActivityObservation[],

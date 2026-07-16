@@ -73,6 +73,21 @@ export function classifyFlowErrorText(text: string): FlowTextClassification | nu
   return null
 }
 
+export interface FlowConfirmedPartialExitInput {
+  expected: number
+  confirmed: number
+  failed: number
+}
+
+/** Partial completion requires at least one real successful output. */
+export function shouldExitFlowConfirmedPartialCollection(
+  input: FlowConfirmedPartialExitInput,
+): boolean {
+  if (input.confirmed <= 0 || input.failed <= 0) return false
+  const targetSuccessful = Math.max(0, input.expected - input.failed)
+  return input.confirmed >= targetSuccessful
+}
+
 export function flowErrorCodeFromLegacy(status: unknown, error: unknown): FlowErrorCode | undefined {
   const combined = `${String(status || '')} ${String(error || '')}`.toLocaleLowerCase()
   const textClassification = classifyFlowErrorText(combined)

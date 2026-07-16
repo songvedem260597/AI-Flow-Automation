@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   dedupeFlowTileObservations,
   createFlowTileLifecycleState,
+  isFlowFailedObservationStable,
   isFlowTileInBaseline,
   observeFlowTileLifecycle,
   wasFlowTileObservedProcessing,
@@ -60,6 +61,27 @@ test('fixture 8: a stable failure is promoted only after debounce', () => {
   assert.equal(observeFlowTileLifecycle(state, { id: 'tile-fail', status: 'failed' }, 1_000), 'pending')
   assert.equal(observeFlowTileLifecycle(state, { id: 'tile-fail', status: 'failed' }, 15_999), 'pending')
   assert.equal(observeFlowTileLifecycle(state, { id: 'tile-fail', status: 'failed' }, 16_000), 'failed')
+})
+
+test('fixture 8b: failure stability uses tile observation age rather than total job age', () => {
+  assert.equal(isFlowFailedObservationStable({
+    status: 'failed',
+    firstSeenAt: 59_000,
+    now: 60_000,
+    minimumDurationMs: 15_000,
+  }), false)
+  assert.equal(isFlowFailedObservationStable({
+    status: 'failed',
+    firstSeenAt: 45_000,
+    now: 60_000,
+    minimumDurationMs: 15_000,
+  }), true)
+  assert.equal(isFlowFailedObservationStable({
+    status: 'unknown',
+    firstSeenAt: 1_000,
+    now: 60_000,
+    minimumDurationMs: 15_000,
+  }), false)
 })
 
 test('fixture 12: a done tile never observed processing remains suspicious', () => {

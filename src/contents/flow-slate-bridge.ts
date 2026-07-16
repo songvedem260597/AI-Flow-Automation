@@ -3,6 +3,8 @@ import {
   classifyFlowAdmissionWarningContexts,
   countFlowTileActivity,
   isFlowQueueStatusText,
+  isFlowRetryIconEvidence,
+  isFlowWarningIconEvidence,
   type FlowWarningContext,
 } from '../lib/flow/healthClassifier'
 import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
@@ -123,7 +125,7 @@ type BridgeRuntimeRegistry = {
   // Bump this every time you make a runtime change so the Flow page console
   // verification (window.__FLOW_BRIDGE_BUILD_TIME__) matches the running bundle.
   // 2026-07-10 05:55:00 — added Flow Video input mode (Khung hình / Thành phần).
-  var FLOW_BRIDGE_BUILD_TIME = "2026-07-17 05:45:28"
+  var FLOW_BRIDGE_BUILD_TIME = "2026-07-17 06:12:27"
   bridgeLog('[Bridge] BUILD_TIME ' + FLOW_BRIDGE_BUILD_TIME + ' instance=' + BRIDGE_INSTANCE_ID)
   ;(window as Record<string, unknown>).__FLOW_BRIDGE_BUILD_TIME__ = FLOW_BRIDGE_BUILD_TIME
   bridgeGlobal.__FLOW_BRIDGE_BUILD_MARKER__ = FLOW_BRIDGE_BUILD_MARKER
@@ -6176,15 +6178,13 @@ type BridgeRuntimeRegistry = {
         var wTxt = (wIcon.textContent || '').trim().toLowerCase()
         var wAria = (wIcon.getAttribute('aria-label') || '').toLowerCase()
         var wDataIcon = (wIcon.getAttribute('data-icon') || '').toLowerCase()
-        var wClass = (wIcon.className || '').toString().toLowerCase()
-        var wTag = wIcon.tagName.toLowerCase()
-        var isWarningIcon =
-          wTxt === 'warning' ||
-          wTxt.includes('warning') ||
-          wAria.includes('warning') ||
-          wDataIcon.includes('warning') ||
-          wClass.includes('warning') ||
-          wClass.includes('error')
+        // Generated/style classes are not provider error evidence. Flow's
+        // blank pre-queue cards can temporarily carry generic error styles.
+        var isWarningIcon = isFlowWarningIconEvidence({
+          text: wTxt,
+          ariaLabel: wAria,
+          dataIcon: wDataIcon,
+        })
         if (!isWarningIcon) continue
         // Additional signal: icon should be a leaf (no child elements with text)
         // or appear in a known failure card container.
@@ -6261,11 +6261,7 @@ type BridgeRuntimeRegistry = {
       }
       for (var rii = 0; rii < iconTexts.length; rii++) {
         var riLower = iconTexts[rii].toLowerCase()
-        if (
-          riLower.includes('delete_forever') ||
-          riLower.includes('refresh') ||
-          riLower.includes('retry')
-        ) {
+        if (isFlowRetryIconEvidence(riLower)) {
           return { status: 'failed', reason: 'retry_button', iconTexts: iconTexts, buttonTexts: buttonTexts }
         }
       }

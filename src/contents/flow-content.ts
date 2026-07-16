@@ -1,6 +1,10 @@
-import { ensureFlowResultContract } from '../lib/flow/resultContract'
+import {
+  ensureFlowResultContract,
+  shouldExitFlowConfirmedPartialCollection,
+} from '../lib/flow/resultContract'
 import {
   dedupeFlowTileObservations,
+  isFlowFailedObservationStable,
   isFlowTileInBaseline,
   wasFlowTileObservedProcessing,
 } from '../lib/flow/tileIdentity'
@@ -1621,31 +1625,33 @@ async function runFlowPrompt(payload: {
       var uniqueRawCandidates = dedupeTilesByIdentity(rawCandidates)
 
       // Track first-seen-as-failed timestamps (independent clock) so we
-      // can promote pending→failed only after MIN_FAIL_DETECT_MS.
+      // can promote pending→failed only after MIN_FAIL_DETECT_MS of
+      // continuous failure. A queue/progress/unknown transition resets it.
       var nowMs = Date.now()
       for (var fsi = 0; fsi < uniqueRawCandidates.length; fsi++) {
         var fsc = uniqueRawCandidates[fsi]
         if (fsc.status === 'failed') {
           if (!failedFirstSeenAt[fsc.id]) failedFirstSeenAt[fsc.id] = nowMs
-        } else if (fsc.status === 'done') {
+        } else {
           delete failedFirstSeenAt[fsc.id]
         }
       }
       // Classification: stable vs fresh failed.
-      // stable = FIRST_SEEN path (tile was failed for >= MIN_FAIL_DETECT_MS)
-      //         OR ELAPSED path (waitedMs >= MIN_FAIL_DETECT_MS AND tile is currently failed)
-      // The elapsed path handles the case where warning icon appears late but
-      // the backend 403'd much earlier — we don't wait another 15s from firstSeen.
+      // Stability is measured from this tile's first continuous failed
+      // observation, never from the job's total elapsed time. Flow first
+      // paints blank transitional cards before queue/progress text appears.
       var stableFailedIds = new Set<string>()
       var freshFailedIds = new Set<string>()
       for (var fsi2 = 0; fsi2 < uniqueRawCandidates.length; fsi2++) {
         var fsc2 = uniqueRawCandidates[fsi2]
         if (fsc2.status === 'failed') {
           var seenAt = failedFirstSeenAt[fsc2.id] || nowMs
-          var ageMs = nowMs - seenAt
-          var stableByFirstSeen = ageMs >= MIN_FAIL_DETECT_MS
-          var stableByElapsed = waitedMs >= MIN_FAIL_DETECT_MS
-          var isStable = stableByFirstSeen || stableByElapsed
+          var isStable = isFlowFailedObservationStable({
+            status: fsc2.status,
+            firstSeenAt: seenAt,
+            now: nowMs,
+            minimumDurationMs: MIN_FAIL_DETECT_MS,
+          })
           if (isStable) {
             stableFailedIds.add(fsc2.id)
           } else {
@@ -1952,7 +1958,11 @@ async function runFlowPrompt(payload: {
       // Pending=0 means "Flow is done emitting tiles" so any
       // confirmed we have IS the partial answer.
       var targetSuccessful = Math.max(0, payload.quantity - failed.length)
-      if (uniqueConfirmed.length >= targetSuccessful && failed.length > 0) {
+      if (shouldExitFlowConfirmedPartialCollection({
+        expected: payload.quantity,
+        confirmed: uniqueConfirmed.length,
+        failed: failed.length,
+      })) {
         console.warn('[FlowContent][RESULT_COLLECTION_PARTIAL_EARLY_EXIT]', JSON.stringify({
           reason: 'confirmed_and_stable_failed_coexist',
           expected: payload.quantity,
@@ -2023,17 +2033,19 @@ async function runFlowPrompt(payload: {
     // grace) or fell through to maxWaitMs.
     cleanupObserver()
 
-    // Promote pending tiles that have been showing a failed signal for
-    // >= MIN_FAIL_DETECT_MS (by firstSeen OR by elapsed time).
+    // Promote pending tiles only when their failed signal has remained
+    // continuous for >= MIN_FAIL_DETECT_MS.
     var promotedFailedFromPending: Array<{ id: string; status: string; fileName: string }> = []
     var pendingIds = Object.keys(pendingCandidatesById)
     for (var pfi = 0; pfi < pendingIds.length; pfi++) {
       var pendingTile = pendingCandidatesById[pendingIds[pfi]]
       var pSeen = failedFirstSeenAt[pendingTile.id]
-      var pAgeMs = pSeen ? Date.now() - pSeen : 0
-      var pStableByFirstSeen = pAgeMs >= MIN_FAIL_DETECT_MS
-      var pStableByElapsed = waitedMs >= MIN_FAIL_DETECT_MS
-      var pIsStable = pStableByFirstSeen || pStableByElapsed
+      var pIsStable = isFlowFailedObservationStable({
+        status: pendingTile.status,
+        firstSeenAt: pSeen,
+        now: Date.now(),
+        minimumDurationMs: MIN_FAIL_DETECT_MS,
+      })
       if (pendingTile.status === 'failed' && pIsStable) {
         promotedFailedFromPending.push(pendingTile)
       }
@@ -2097,7 +2109,7 @@ async function runFlowPrompt(payload: {
       if (at.fileName && refFileNameSet.has(at.fileName)) continue
       afterLoopAll.push(at)
     }
-    // Apply MIN_FAIL_DETECT_MS guard (firstSeen OR elapsed) to after-loop failed.
+    // Apply the same continuous-failure guard to after-loop failed tiles.
     var afterLoopFailed: Array<{ id: string; status: string; fileName: string }> = []
     var afterLoopFreshFailedCount = 0
     var nowLoopMs = Date.now()
@@ -2109,10 +2121,13 @@ async function runFlowPrompt(payload: {
       if (!isFailedStatus && !isDoneButNoFile && !isNonDoneNonFailed) continue
       if (isFailedStatus) {
         var altSeen = failedFirstSeenAt[alt.id] || 0
-        var altAgeMs = nowLoopMs - altSeen
-        var altStableByFirstSeen = altAgeMs >= MIN_FAIL_DETECT_MS
-        var altStableByElapsed = waitedMs >= MIN_FAIL_DETECT_MS
-        if (!altStableByFirstSeen && !altStableByElapsed) {
+        var altStable = isFlowFailedObservationStable({
+          status: alt.status,
+          firstSeenAt: altSeen || undefined,
+          now: nowLoopMs,
+          minimumDurationMs: MIN_FAIL_DETECT_MS,
+        })
+        if (!altStable) {
           afterLoopFreshFailedCount++
           continue
         }

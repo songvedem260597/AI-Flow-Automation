@@ -5,6 +5,8 @@ import {
   classifyFlowAdmissionWarningContexts,
   countFlowTileActivity,
   isFlowQueueStatusText,
+  isFlowRetryIconEvidence,
+  isFlowWarningIconEvidence,
 } from '../../src/lib/flow/healthClassifier.ts'
 
 test('composer prompt text cannot become an admission warning', () => {
@@ -114,4 +116,17 @@ test('explicit English and Vietnamese queue labels are pending signals', () => {
   assert.equal(isFlowQueueStatusText('Hiện đang trong hàng đợi'), true)
   assert.equal(isFlowQueueStatusText('Đang chờ'), true)
   assert.equal(isFlowQueueStatusText('Create a scene about waiting in the queue'), false)
+})
+
+test('blank-card styles and delete controls are not failure evidence', () => {
+  assert.equal(isFlowWarningIconEvidence({}), false)
+  assert.equal(isFlowRetryIconEvidence('delete_forever'), false)
+  assert.equal(isFlowRetryIconEvidence('close'), false)
+})
+
+test('explicit warning and retry icons remain failure evidence', () => {
+  assert.equal(isFlowWarningIconEvidence({ text: 'warning' }), true)
+  assert.equal(isFlowWarningIconEvidence({ ariaLabel: 'Warning' }), true)
+  assert.equal(isFlowRetryIconEvidence('refresh'), true)
+  assert.equal(isFlowRetryIconEvidence('retry'), true)
 })

@@ -84,6 +84,21 @@ export function createFlowTileLifecycleState(): FlowTileLifecycleState {
   return { processingKeys: new Set(), failedFirstSeenAt: new Map() }
 }
 
+export interface FlowFailedObservationStabilityInput {
+  status: string
+  firstSeenAt?: number
+  now: number
+  minimumDurationMs: number
+}
+
+/** A failure is stable only after the same tile stays failed continuously. */
+export function isFlowFailedObservationStable(
+  input: FlowFailedObservationStabilityInput,
+): boolean {
+  if (input.status !== 'failed' || input.firstSeenAt === undefined) return false
+  return Math.max(0, input.now - input.firstSeenAt) >= input.minimumDurationMs
+}
+
 export function observeFlowTileLifecycle(
   state: FlowTileLifecycleState,
   tile: FlowTileObservation,
@@ -101,8 +116,13 @@ export function observeFlowTileLifecycle(
 
   if (status === 'failed') {
     if (key && !state.failedFirstSeenAt.has(key)) state.failedFirstSeenAt.set(key, now)
-    const firstSeenAt = key ? state.failedFirstSeenAt.get(key) || now : now
-    return now - firstSeenAt >= failedDebounceMs ? 'failed' : 'pending'
+    const firstSeenAt = key ? state.failedFirstSeenAt.get(key) : now
+    return isFlowFailedObservationStable({
+      status,
+      firstSeenAt,
+      now,
+      minimumDurationMs: failedDebounceMs,
+    }) ? 'failed' : 'pending'
   }
 
   if (key) state.failedFirstSeenAt.delete(key)

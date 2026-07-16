@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { classifyFlowErrorText, ensureFlowResultContract } from '../../src/lib/flow/resultContract.ts'
+import {
+  classifyFlowErrorText,
+  ensureFlowResultContract,
+  shouldExitFlowConfirmedPartialCollection,
+} from '../../src/lib/flow/resultContract.ts'
 
 test('fixture 9: unusual activity is preserved as a specific error', () => {
   const classified = classifyFlowErrorText('We detected unusual activity. Please try again later.')
@@ -56,4 +60,17 @@ test('legacy failures map to the complete Phase 1 error taxonomy without losing 
     assert.equal(result.errorCode, expected, message)
     assert.equal(typeof result.error, 'string')
   }
+})
+
+test('blank pre-queue tiles cannot trigger the confirmed partial exit', () => {
+  assert.equal(shouldExitFlowConfirmedPartialCollection({
+    expected: 2,
+    confirmed: 0,
+    failed: 2,
+  }), false)
+  assert.equal(shouldExitFlowConfirmedPartialCollection({
+    expected: 2,
+    confirmed: 1,
+    failed: 1,
+  }), true)
 })
