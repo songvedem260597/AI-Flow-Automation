@@ -130,7 +130,13 @@ export interface DownloadNodeData extends BaseNodeData {
 }
 
 export interface WaitNodeData extends BaseNodeData {
-  condition: 'dom-change' | 'text-appear' | 'element-visible' | 'manual'
+  condition:
+    | 'manual'
+    | 'provider-idle'
+    | 'flow-cooldown-ended'
+    | 'selector-exists'
+    | 'selector-disappears'
+    | 'dom-change'
   selector?: string
   expectedText?: string
   timeout?: number
@@ -339,6 +345,21 @@ export type MessageAction =
   | 'FLOW_INJECT_BRIDGE'
   | 'FLOW_GET_TILES'
   | 'FLOW_DEBUG_PING'
+  // owner: google-flow — admission, cancellation, and Wait-node probes.
+  | 'FLOW_CONTENT_PING'
+  | 'FLOW_GET_ADMISSION_HEALTH'
+  | 'FLOW_GET_ADMISSION_SNAPSHOT'
+  | 'FLOW_CANCEL_ADMISSION'
+  | 'FLOW_RESET_ADMISSION'
+  | 'FLOW_CANCEL_JOB'
+  | 'FLOW_CHECK_SELECTOR'
+  | 'FLOW_START_TILE_MONITOR'
+  | 'FLOW_GET_TILE_COUNTS'
+  | 'FLOW_STOP_TILE_MONITOR'
+  | 'FLOW_UPLOAD_IMAGE'
+  | 'FLOW_FETCH_MEDIA_AS_DATA'
+  | 'PREPARE_DOWNLOAD_RENAME'
+  | 'WORKFLOW_DOWNLOAD_OUTPUT'
 
 export interface ChromeMessage<T = unknown> {
   action: MessageAction
@@ -362,6 +383,8 @@ export interface PipelineProgressPayload {
   status: PipelineStatus
   results: Record<string, unknown>
 }
+
+export * from './flow'
 
 // Content Script Types
 export interface ContentScriptResult {

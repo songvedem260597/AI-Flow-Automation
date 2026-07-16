@@ -6,6 +6,8 @@ import { useSettingsStore } from '@/stores/settingsStore'
 import { hasExtensionContext, isContextInvalidated } from '@/lib/extensionContextGuard'
 import { debugLog, debugWarn, DEBUG_FLAGS } from '@/lib/debug'
 import { getAsset } from '@/lib/assets/assetStore'
+import { waitForFlowCondition } from '@/lib/flow/waitForFlowCondition'
+import type { FlowWaitCondition, FlowWaitResult } from '@/types/flow'
 
 // Same helpers, plain JS names (avoid TS-only `unknown` typing here)
 const hasExtensionContextSafe = (): boolean => hasExtensionContext()
@@ -315,7 +317,9 @@ export class PipelineRunner {
   isRunning = false
   private isPaused = false
   private shouldStop = false
-  private taskId: string
+  readonly taskId: string
+  private abortController = new AbortController()
+  private flowRequestPending = false
   private wakeLock: WakeLockSentinel | null = null
   private callbacks: PipelineCallbacks
 
@@ -948,9 +952,9 @@ export class PipelineRunner {
         return this.executeDownloadNode(data as Record<string, unknown>, inputs)
 
       case 'wait': {
-        const waitData = data as { condition?: string; selector?: string; timeout?: number }
-        await this.waitForCondition(waitData)
-        return { type: 'wait', waited: true }
+        const waitData = data as { condition?: FlowWaitCondition; selector?: string; timeout?: number }
+        const waitResult = await this.waitForCondition(waitData)
+        return { type: 'wait', waited: true, ...waitResult }
       }
 
       default:
@@ -1753,6 +1757,7 @@ private isNonRetryableGenerateNode(node: WorkflowNode): boolean {
       // this payload from Gen-tab traffic and refuse auto-download
       // even if upstream callers forget to set suppressAutoDownload.
       source: 'workflow',
+      callerId: this.taskId,
       collectOutputs: true,
       suppressAutoDownload: true,
       // Workflow contract — the Flow tab is already focused by
@@ -1802,10 +1807,16 @@ private isNonRetryableGenerateNode(node: WorkflowNode): boolean {
       flowVideoMode: mediaType === 'video' ? (flowVideoMode ?? null) : null,
     }))
 
-    const response = await this.sendRuntimeMessage({
-      action: 'RUN_FLOW_PROMPT',
-      payload
-    })
+    this.flowRequestPending = true
+    let response: RuntimeResponse
+    try {
+      response = await this.sendRuntimeMessage({
+        action: 'RUN_FLOW_PROMPT',
+        payload
+      })
+    } finally {
+      this.flowRequestPending = false
+    }
 
     const partialSuccess = response.status === 'AUTO_DOWNLOAD_PARTIAL_SUCCESS'
     if (!response.success && !partialSuccess) {
@@ -1815,6 +1826,9 @@ private isNonRetryableGenerateNode(node: WorkflowNode): boolean {
         success: false,
         status: response.status,
         error: response.error,
+        errorCode: response.errorCode,
+        statusReason: response.statusReason,
+        evidenceCount: Array.isArray(response.evidence) ? response.evidence.length : 0,
         outputsCount: Array.isArray(response.outputs) ? (response.outputs as unknown[]).length : 0,
       }))
       throw new Error(response.error || response.status || 'Google Flow automation failed')
@@ -1824,6 +1838,11 @@ private isNonRetryableGenerateNode(node: WorkflowNode): boolean {
       nodeId: node.id,
       success: true,
       status: response.status,
+      errorCode: response.errorCode,
+      statusReason: response.statusReason,
+      evidenceCount: Array.isArray(response.evidence) ? response.evidence.length : 0,
+      generationOutcome: response.generationOutcome,
+      downloadOutcome: response.downloadOutcome,
       outputsCount: Array.isArray(response.outputs) ? (response.outputs as unknown[]).length : 0,
     }))
 
@@ -1914,6 +1933,11 @@ private isNonRetryableGenerateNode(node: WorkflowNode): boolean {
       fileNameMap,
       autoDownload: response.autoDownload,
       status: response.status,
+      errorCode: response.errorCode,
+      statusReason: response.statusReason,
+      evidence: response.evidence,
+      generationOutcome: response.generationOutcome,
+      downloadOutcome: response.downloadOutcome,
       // Top-level output assets — these are what the Workflow UI walks
       // for the Generate-node preview and what downstream
       // Media/Download/Generate nodes see via coerceMediaList.
@@ -2590,18 +2614,84 @@ private isNonRetryableGenerateNode(node: WorkflowNode): boolean {
       || JSON.stringify(value)
   }
 
-  private async waitForCondition(config: { condition?: string; selector?: string; timeout?: number }): Promise<void> {
-    const { condition = 'dom-change', timeout = 30000 } = config
-    return new Promise((resolve, reject) => {
-      const timeoutId = setTimeout(() => reject(new Error('Wait condition timeout')), timeout)
-      if (condition === 'manual') {
-        clearTimeout(timeoutId)
-        resolve()
-      } else {
-        clearTimeout(timeoutId)
-        resolve()
-      }
+  private async waitForCondition(config: { condition?: FlowWaitCondition; selector?: string; timeout?: number }): Promise<FlowWaitResult> {
+    const condition = config.condition || 'provider-idle'
+    const timeoutMs = Math.max(1, Number(config.timeout || 30000))
+    const selector = String(config.selector || '')
+
+    if ((condition === 'selector-exists' || condition === 'selector-disappears') && !selector) {
+      throw new Error(`Wait condition ${condition} requires a selector`)
+    }
+
+    if (condition === 'manual') {
+      this.isPaused = true
+      usePipelineStore.getState().pausePipeline(this.taskId)
+    }
+
+    const result = await waitForFlowCondition({
+      condition,
+      timeoutMs,
+      signal: this.abortController.signal,
+      check: async () => {
+        if (condition === 'manual') {
+          return { satisfied: !this.isPaused, statusReason: this.isPaused ? 'waiting_for_manual_resume' : 'manual_resume_received' }
+        }
+
+        if (condition === 'provider-idle' || condition === 'flow-cooldown-ended') {
+          const response = await this.sendRuntimeMessage({ action: 'FLOW_GET_ADMISSION_SNAPSHOT' })
+          const snapshot = response.snapshot && typeof response.snapshot === 'object'
+            ? response.snapshot as Record<string, unknown>
+            : {}
+          const state = String(snapshot.state || 'idle')
+          const cooldownUntil = Number(snapshot.cooldownUntil || 0)
+          if (condition === 'provider-idle') {
+            return {
+              satisfied: state === 'idle' || state === 'terminal',
+              statusReason: `flow_admission_state:${state}`,
+            }
+          }
+          const providerIdle = state === 'idle' || state === 'terminal'
+          const cooldownEnded = Date.now() >= cooldownUntil
+          return {
+            satisfied: providerIdle && cooldownEnded,
+            statusReason: !providerIdle
+              ? `flow_admission_state:${state}`
+              : (cooldownEnded ? `cooldown_ended_state:${state}` : `cooldown_active_until:${cooldownUntil}`),
+          }
+        }
+
+        if (condition === 'selector-exists' || condition === 'selector-disappears') {
+          const response = await this.sendRuntimeMessage({
+            action: 'FLOW_CHECK_SELECTOR',
+            payload: { selector },
+          })
+          const exists = response.exists === true
+          const satisfied = condition === 'selector-exists' ? exists : !exists
+          return {
+            satisfied,
+            statusReason: `${condition}:${exists ? 'exists' : 'missing'}`,
+            evidence: [{
+              source: 'dom' as const,
+              detectedAt: Date.now(),
+              confidence: response.success === true ? 'high' as const : 'low' as const,
+              statusReason: response.success === true ? 'selector_checked' : String(response.error || 'selector_check_failed'),
+              selector,
+            }],
+          }
+        }
+
+        // Legacy dom-change remains non-immediate and intentionally waits
+        // until timeout. Provider DOM instrumentation is deferred to Phase 3.
+        return { satisfied: false, statusReason: 'dom_change_instrumentation_deferred' }
+      },
     })
+
+    if (!result.success) {
+      const error = new Error(result.statusReason)
+      Object.assign(error, { flowWaitResult: result })
+      throw error
+    }
+    return result
   }
 
   private async downloadSource(source: string, format: string, filename: string): Promise<void> {
@@ -2670,8 +2760,24 @@ private isNonRetryableGenerateNode(node: WorkflowNode): boolean {
 
   stop(): void {
     this.shouldStop = true
-    this.isRunning = false
+    this.abortController.abort('pipeline_stop_requested')
+    if (this.flowRequestPending) {
+      this.sendRuntimeMessage({
+        action: 'FLOW_CANCEL_ADMISSION',
+        payload: { callerId: this.taskId },
+      }).then((response) => {
+        console.log('[WorkflowRun][flowCancellation]', JSON.stringify({
+          workflowRunId: this.taskId,
+          accepted: response.success === true,
+          statusReason: response.statusReason || '',
+        }))
+      }).catch(() => {})
+    }
     usePipelineStore.getState().stopPipeline(this.taskId)
+  }
+
+  hasPendingFlowRequest(): boolean {
+    return this.flowRequestPending
   }
 
   private async acquireWakeLock(): Promise<void> {
@@ -2801,10 +2907,12 @@ export function resumePipeline(): void {
 }
 
 export function stopPipeline(): void {
-  currentRunner?.stop()
-  // Clear the singleton on explicit stop so the next Run can start
-  // a fresh pipeline. The runner's own `run()` finally{} block
-  // covers the natural-completion case; this covers user-initiated
-  // cancellation which never reaches the finally{} block.
-  currentRunner = null
+  const runner = currentRunner
+  runner?.stop()
+  if (!runner?.hasPendingFlowRequest()) {
+    // Preserve the existing stop lifecycle for non-Flow providers. Only a
+    // pending Google Flow request keeps ownership until its call settles;
+    // the global admission controller independently protects old Flow jobs.
+    currentRunner = null
+  }
 }

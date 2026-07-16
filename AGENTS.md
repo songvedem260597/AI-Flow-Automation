@@ -478,7 +478,7 @@ Nếu một trong hai block comment bị xoá / bị rewrite không giữ lại 
 window.__FLOW_BRIDGE_BUILD_TIME__
 ```
 
-Expected value: matches `FLOW_BRIDGE_BUILD_TIME` in `flow-slate-bridge.ts`. Current build: `2026-06-26 01:15:00`.
+Expected value: matches `FLOW_BRIDGE_BUILD_TIME` in `flow-slate-bridge.ts`. Current build: `2026-07-17 21:30:00`.
 
 ---
 
@@ -749,7 +749,7 @@ Runs in the **MAIN world** (via `chrome.scripting.executeScript` with `world: 'M
 ### BUILD_TIME marker
 
 ```ts
-var FLOW_BRIDGE_BUILD_TIME = "2026-06-26 01:15:00"
+var FLOW_BRIDGE_BUILD_TIME = "2026-07-17 21:30:00"
 ;(window as Record<string, unknown>).__FLOW_BRIDGE_BUILD_TIME__ = FLOW_BRIDGE_BUILD_TIME
 ```
 
@@ -1444,7 +1444,7 @@ worker.
 Concise logs visible in console (lifecycle / sentinels only):
 
 ```
-[Bridge] BUILD_TIME 2026-06-26 01:15:00
+[Bridge] BUILD_TIME 2026-07-17 21:30:00
 [FlowContent] Loaded on ...
 [FlowContent] runFlowPrompt START, mode=...
 [FlowContent] Step 3: clearEditor
@@ -1496,7 +1496,8 @@ flag is enabled:
 
 - `[Bridge] Message:` / INSERT/CLEAR/verify per-call details
 - `[Bridge][tileIdentity] getTileSnapshot` — polling heartbeat
-- `[Bridge] debugRunFlowPrompt` [1-4/4] steps
+- `debugRunFlowPrompt` / submit-bearing `__flowTest*` helpers return
+  `FLOW_ADMISSION_REQUIRED`; manual direct submit is disabled
 - `__flowDebugSelectedStates` details
 - `__flowTest*` (manual test helpers)
 - `__flowDebugScan` verbose DOM dump
@@ -1504,7 +1505,7 @@ flag is enabled:
 
 `flow-content.ts` (`FLOW_DEBUG_VERBOSE`) — via `flowDebug()`:
 
-- `debugRunFlowPrompt` [1-4/4] steps
+- `debugRunFlowPrompt` routes through background `RUN_FLOW_PROMPT` admission
 - `[BASELINE]`, `[BASELINE_FILE_NAMES]` — pre-submit tile snapshot
 - `[REF_IDENTITY]` — ref image set
 - `[RESULT_DETECT]` — per-poll cycle diagnostics
@@ -1632,7 +1633,7 @@ Run in the Flow page console after reload:
 window.__FLOW_BRIDGE_BUILD_TIME__
 ```
 
-Expected: `2026-06-26 01:15:00` (matches `FLOW_BRIDGE_BUILD_TIME` in `flow-slate-bridge.ts`).
+Expected: `2026-07-17 21:30:00` (matches `FLOW_BRIDGE_BUILD_TIME` in `flow-slate-bridge.ts`).
 
 > Note: When only documentation (`AGENTS.md`) was modified and no source files were changed, the build time marker remains unchanged. Build pass is still valid — verify the marker in the Flow page console after reloading the extension.
 
@@ -1652,4 +1653,3 @@ Expected: `2026-06-26 01:15:00` (matches `FLOW_BRIDGE_BUILD_TIME` in `flow-slate
 **Manual test steps:**
 
 - Exact steps to reproduce and verify the change in the browser.
-

@@ -295,7 +295,7 @@ const createDefaultNodeData = (type: FlowNodeType): Record<string, unknown> => {
     case 'download':
       return { ...base, format: 'png', autoDownload: true }
     case 'wait':
-      return { ...base, condition: 'dom-change', selector: '', timeout: 30000 }
+      return { ...base, condition: 'provider-idle', selector: '', timeout: 30000 }
     case 'condition':
       return { ...base, condition: '' }
     case 'loop':

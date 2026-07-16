@@ -1,3 +1,10 @@
+import { ensureFlowResultContract } from '../lib/flow/resultContract'
+import {
+  dedupeFlowTileObservations,
+  isFlowTileInBaseline,
+  wasFlowTileObservedProcessing,
+} from '../lib/flow/tileIdentity'
+
 /**
  * Flow Content Script — ISOLATED world on https://labs.google/*
  * Receives RUN_FLOW_PROMPT from background, delegates to bridge (MAIN world).
@@ -5,6 +12,25 @@
  */
 const SOURCE = 'flow-auto-slate'
 const RESULT_SOURCE = SOURCE + '-result'
+
+interface FlowJobControl {
+  controller: AbortController
+  submitStarted: boolean
+}
+
+const activeFlowJobControls = new Map<string, FlowJobControl>()
+
+function flowCancelledResult(jobId?: string, statusReason = 'cancelled_before_submit'): Record<string, unknown> {
+  return ensureFlowResultContract({
+    success: false,
+    status: 'FLOW_CANCELLED',
+    error: statusReason,
+    errorCode: 'cancelled',
+    statusReason,
+    jobId,
+    generation: { expected: 0, generated: 0, failed: 0, pending: 0, partial: false },
+  }, 'orchestrator')
+}
 
 // ── Safe sendMessage helpers (extension context invalidated resilience) ──────
 // After chrome.runtime.reload() the old content script bundle keeps running
@@ -411,23 +437,9 @@ function buildDownloadFilename(
   return base + '_' + resolution
 }
 
-// Dedupe tile snapshots by identity (fileName > id). Used because Flow
-// often paints each tile as multiple nested DOM nodes that all match the
-// broad selectors in the bridge's scanTiles. Even after the bridge dedupes,
-// we re-dedupe here as a safety net so the orchestrator never makes
-// duplicate download calls.
+// Composite identity safety net shared with the fixture suite.
 function dedupeTilesByIdentity(tileList): any[] {
-  var seen = new Set<string>()
-  var out: any[] = []
-  for (var di = 0; di < tileList.length; di++) {
-    var t = tileList[di]
-    var key = (t.fileName && t.fileName.length > 0 ? t.fileName : '') || (t.id || '')
-    if (!key) continue
-    if (seen.has(key)) continue
-    seen.add(key)
-    out.push(t)
-  }
-  return out
+  return dedupeFlowTileObservations(tileList || [])
 }
 
 // Pick up to `expectedQuantity` tiles from a unique list.
@@ -440,45 +452,23 @@ function pickExpectedUniqueResultTiles(tiles: any[], expectedQuantity: number): 
 }
 
 async function debugRunFlowPrompt(prompt: string): Promise<Record<string, unknown>> {
-  if (FLOW_DEBUG_VERBOSE) console.log('[FlowContent] debugRunFlowPrompt START, prompt len:', prompt.length)
-
-  const readyCheck = await waitBridgeReady()
-  if (!readyCheck.ready) {
-    return { success: false, bridgeReady: false, error: readyCheck.error, url: window.location.href }
-  }
-
-  // Step 1: Clear
-  if (FLOW_DEBUG_VERBOSE) console.log('[FlowContent] [1/4] clear...')
-  const clearResult = await bridgeCall('clear')
-  if (FLOW_DEBUG_VERBOSE) console.log('[FlowContent] [1/4] clear result:', JSON.stringify(clearResult))
-  await new Promise(r => setTimeout(r, 400))
-
-  // Step 2: Insert
-  if (FLOW_DEBUG_VERBOSE) console.log('[FlowContent] [2/4] insert...')
-  const insertResult = await bridgeCall('insert', { text: prompt })
-  if (FLOW_DEBUG_VERBOSE) console.log('[FlowContent] [2/4] insert result:', JSON.stringify(insertResult))
-  await new Promise(r => setTimeout(r, 400))
-
-  // Step 3: Submit
-  if (FLOW_DEBUG_VERBOSE) console.log('[FlowContent] [3/4] submit...')
-  const submitResult = await bridgeCall('submit')
-  if (FLOW_DEBUG_VERBOSE) console.log('[FlowContent] [3/4] submit result:', JSON.stringify(submitResult))
-
-  // Step 4: Return summary
-  if (FLOW_DEBUG_VERBOSE) console.log('[FlowContent] [4/4] done')
-  return {
-    success: insertResult.success && submitResult.success,
-    bridgeReady: true,
-    clearSuccess: !!clearResult.success,
-    insertSuccess: !!insertResult.success,
-    submitSuccess: !!submitResult.success,
-    insertMethod: (insertResult as Record<string, unknown>).method || '',
-    submitMethod: (submitResult as Record<string, unknown>).method || '',
-    insertStrategy: (insertResult as Record<string, unknown>).strategy || '',
-    submitButtonText: (submitResult as Record<string, unknown>).buttonText || '',
-    insertError: (insertResult as Record<string, unknown>).error || '',
-    submitError: (submitResult as Record<string, unknown>).error || '',
-  }
+  // Debug entry points are not allowed to click Flow directly. Routing the
+  // request through background gives it the same admission gate as GenPanel,
+  // Workflow, and direct runtime messages.
+  return chrome.runtime.sendMessage({
+    action: 'RUN_FLOW_PROMPT',
+    payload: {
+      prompt,
+      mode: 'image',
+      model: '',
+      aspectRatio: '16:9',
+      quantity: 1,
+      autoDownload: false,
+      source: 'debug-content',
+      collectOutputs: true,
+      suppressAutoDownload: true,
+    },
+  }) as Promise<Record<string, unknown>>
 }
 
 ;(window as unknown as Record<string, unknown>).debugRunFlowPrompt = debugRunFlowPrompt
@@ -539,13 +529,13 @@ async function runFlowPromptInsertGoogleFlowFallback(
 // Invoked when the standard Slate `submit` action fails. Locates the
 // Tạo button and clicks it. The prompt is assumed to already be
 // inserted (Slate path or DOM-first insert fallback).
-async function runFlowPromptSubmitGoogleFlowFallback(): Promise<{ success: boolean; submitResult: Record<string, unknown> }> {
+async function runFlowPromptSubmitGoogleFlowFallback(jobId: string): Promise<{ success: boolean; submitResult: Record<string, unknown> }> {
   console.warn('[FlowContent] Falling back to submitGoogleFlowButtonOnly (DOM-first click only)', JSON.stringify({
     fallbackReason: 'slate_submit_failed',
   }))
   notifyStatus('FLOW_GFLOW_SUBMIT_FALLBACK')
 
-  const gflowButton = await bridgeCall('submitGoogleFlowButtonOnly', {}, 15000)
+  const gflowButton = await bridgeCall('submitGoogleFlowButtonOnly', { jobId }, 15000)
   const gflowOk = !!(gflowButton as Record<string, unknown>).success
   if (!gflowOk) {
     const reason = String((gflowButton as Record<string, unknown>).error || 'unknown')
@@ -590,8 +580,18 @@ async function runFlowPrompt(payload: {
   resolution: string
   videoResolution?: string
   focusTab?: boolean
-}): Promise<Record<string, unknown>> {
+  flowVideoMode?: 'frame' | 'ingredient'
+  source?: string
+  collectOutputs?: boolean
+  suppressAutoDownload?: boolean
+  jobId?: string
+  callerId?: string
+}, control?: FlowJobControl): Promise<Record<string, unknown>> {
   console.log('[FlowContent] runFlowPrompt START, mode=' + payload.mode + ', prompt len:', payload.prompt?.length)
+
+  if (control?.controller.signal.aborted) {
+    return flowCancelledResult(payload.jobId)
+  }
 
   // ── FlowTrace: payload summary ──────────────────────────────────────
   var payloadSummary = {
@@ -631,6 +631,10 @@ async function runFlowPrompt(payload: {
     }
   }
   flowTrace('Content', 'BRIDGE_WAIT_DONE', { ready: true })
+
+  if (control?.controller.signal.aborted) {
+    return flowCancelledResult(payload.jobId)
+  }
 
   // Step 1-2: Apply settings from Gen tab payload (NEVER skip in normal runs)
   // FlowTrace: explicit APPLY_SETTINGS_START (single, predictable key for grep)
@@ -1087,7 +1091,12 @@ async function runFlowPrompt(payload: {
 
   console.log('[FlowContent] Step 7: submit')
   flowTrace('Content', 'STEP_7_SUBMIT_START', {})
-  let submitResult = await bridgeCall('submit')
+  if (control?.controller.signal.aborted) {
+    return flowCancelledResult(payload.jobId)
+  }
+  if (control) control.submitStarted = true
+  notifyStatus('FLOW_SUBMIT_STARTED', { jobId: payload.jobId || '', source: payload.source || 'unknown' })
+  let submitResult = await bridgeCall('submit', { jobId: payload.jobId || '' })
   flowTrace('Content', 'STEP_7_SUBMIT_RAW', submitResult)
   if (!submitResult.success) {
     // ── Fallback: DOM-first Google Flow SUBMIT path (button click only) ─
@@ -1095,7 +1104,7 @@ async function runFlowPrompt(payload: {
       reason: 'slate_submit_failed',
       slateError: (submitResult as Record<string, unknown>).error,
     })
-    const submitFallback = await runFlowPromptSubmitGoogleFlowFallback()
+    const submitFallback = await runFlowPromptSubmitGoogleFlowFallback(payload.jobId || '')
     flowTrace('Content', 'SUBMIT_FALLBACK_RESULT', submitFallback)
     if (!submitFallback.success) {
       flowTraceFail('submitGoogleFlowButtonOnly', 'FLOW_GFLOW_SUBMIT_FALLBACK_FAILED', {
@@ -1103,6 +1112,7 @@ async function runFlowPrompt(payload: {
         payloadSummary: payloadSummary,
         fallback: 'submitGoogleFlowButtonOnly',
       })
+      notifyStatus('FLOW_SUBMIT_FAILED', { jobId: payload.jobId || '', statusReason: 'explicit_submit_failure' })
       return {
         success: false,
         status: 'FLOW_SUBMIT_FAILED',
@@ -1121,7 +1131,8 @@ async function runFlowPrompt(payload: {
     success: !!submitResult.success,
     method: (submitResult as Record<string, unknown>).method,
   })
-  notifyStatus('FLOW_SUBMIT_SUCCESS')
+  notifyStatus('FLOW_SUBMIT_CONFIRMED', { jobId: payload.jobId || '', statusReason: 'submit_click_confirmed' })
+  notifyStatus('FLOW_SUBMIT_SUCCESS', { jobId: payload.jobId || '' })
   await new Promise(r => setTimeout(r, 1000))
 
   // ── Step 8: Auto Download (if enabled) ─────────────────────────────
@@ -1193,6 +1204,12 @@ async function runFlowPrompt(payload: {
     attempted: shouldAutoDownload,
     skipped: !shouldAutoDownload,
   }
+  var observedStructuredError: {
+    code: string
+    message: string
+    statusReason: string
+    evidence: Array<Record<string, unknown>>
+  } | null = null
   if (!shouldCollectOutputs) {
     console.log('[FlowContent][RESULT_COLLECTION_SKIP] reason=collectOutputs_disabled', JSON.stringify({
       source: payloadSource,
@@ -1268,7 +1285,6 @@ async function runFlowPrompt(payload: {
     // old images (new tileId, same fileName as a prior run) slip through
     // because the pre-submit baseline only captures visible tile cards.
     var seenProcessingIds: Set<string> = new Set()
-    var seenProcessingFileNames: Set<string> = new Set()
 
     // Suspicious-done accumulator across polls. A done-without-processing
     // tile is the textbook lazy-loaded old image. We track it across polls
@@ -1368,6 +1384,8 @@ async function runFlowPrompt(payload: {
         status: string
         failedFirstSeenAt?: number
         statusReason?: string
+        errorCode?: string
+        evidence?: Array<Record<string, unknown>>
         textPreview?: string
         iconTexts?: string[]
         buttonTexts?: string[]
@@ -1382,19 +1400,44 @@ async function runFlowPrompt(payload: {
         mediaReadyReason?: string
       }>) || []
 
+      for (var oei = 0; oei < allSnapTiles.length; oei++) {
+        var errorTile = allSnapTiles[oei]
+        if (!errorTile.errorCode) continue
+        var priority: Record<string, number> = {
+          unusual_activity: 4,
+          rate_limited: 3,
+          session_expired: 3,
+          generation_failed: 1,
+        }
+        var currentPriority = observedStructuredError ? (priority[observedStructuredError.code] || 0) : -1
+        var nextPriority = priority[errorTile.errorCode] || 0
+        if (!observedStructuredError || nextPriority > currentPriority) {
+          var statusReason = errorTile.statusReason || errorTile.errorCode
+          observedStructuredError = {
+            code: errorTile.errorCode,
+            message: statusReason,
+            statusReason: statusReason,
+            evidence: (errorTile.evidence || []).map(function (entry) {
+              return { ...entry, tileId: errorTile.id, fileName: errorTile.fileName || '' }
+            }),
+          }
+        }
+      }
+
       // Record DOM order
       lastDomOrder = allSnapTiles.map(function (t) { return t.id })
 
       // Stage 1: Apply dual filter (id + fileName) to find candidates
       var rawCandidates: Array<{ id: string; status: string; fileName: string; failedFirstSeenAt?: number; statusReason?: string }> = []
       var skippedOld = 0
-      var skippedLazyLoaded = 0
+      var baselineFilenameReusedEvaluated = 0
       for (var ci = 0; ci < allSnapTiles.length; ci++) {
         var t = allSnapTiles[ci]
-        if (preSubmitIdSet.has(t.id)) { skippedOld++; continue }
-        // A tile is "lazy-loaded old" if its fileName was already in baseline
-        // (the id might be new but the underlying media is an old one Flow re-painted).
-        if (t.fileName && preSubmitFileNameSet.has(t.fileName)) { skippedLazyLoaded++; continue }
+        // Reject only an exact composite baseline observation. A new ID with
+        // a reused filename, or a reused ID with a new filename, must reach
+        // the recency guard instead of being discarded by one field alone.
+        if (isFlowTileInBaseline(t, preSubmitDetails)) { skippedOld++; continue }
+        if (t.fileName && preSubmitFileNameSet.has(t.fileName)) baselineFilenameReusedEvaluated++
         // Skip ref tiles by id and fileName
         if (refIdSet.has(t.id)) continue
         if (t.fileName && refFileNameSet.has(t.fileName)) continue
@@ -1462,9 +1505,6 @@ async function runFlowPrompt(payload: {
         //    also non-terminal (Flow can retry), so we track it too.
         if (cand.status !== 'done') {
           seenProcessingIds.add(cand.id)
-          if (cand.fileName && cand.fileName.length > 4 && cand.fileName !== 'media.getMediaUrlRedirect') {
-            seenProcessingFileNames.add(cand.fileName)
-          }
         }
         if (cand.status === 'failed' && stableFailedIds.has(cand.id)) {
           failed.push(cand)
@@ -1482,8 +1522,7 @@ async function runFlowPrompt(payload: {
           // a fallback and emit [RESULT_DETECT_SUSPICIOUS_DONE_WITHOUT_PROCESSING].
           var inBaselineId = preSubmitIdSet.has(cand.id)
           var inBaselineFileName = !!(cand.fileName && preSubmitFileNameSet.has(cand.fileName))
-          var seenProcessing = seenProcessingIds.has(cand.id) ||
-            (cand.fileName && seenProcessingFileNames.has(cand.fileName))
+          var seenProcessing = wasFlowTileObservedProcessing(cand, seenProcessingIds)
           if (FLOW_DEBUG_VERBOSE) {
             console.log('[FlowContent][RESULT_CANDIDATE_TRACE]', JSON.stringify({
               tileId: cand.id,
@@ -1512,22 +1551,11 @@ async function runFlowPrompt(payload: {
           pendingCandidatesById[cand.id] = cand
         }
       }
-      // Merge per-poll suspicious-done tiles into the top-level accumulator,
-      // deduped by fileName > id (matches dedupeTilesByIdentity behavior).
+      // Merge per-poll suspicious-done tiles by composite observation.
       if (pollSuspiciousThisIteration.length > 0) {
-        var suspSeen = new Set<string>()
-        for (var sspi = 0; sspi < suspiciousDoneWithoutProcessing.length; sspi++) {
-          var prev = suspiciousDoneWithoutProcessing[sspi]
-          var prevKey = (prev.fileName && prev.fileName.length > 0 ? prev.fileName : '') || prev.id
-          if (prevKey) suspSeen.add(prevKey)
-        }
-        for (var spii = 0; spii < pollSuspiciousThisIteration.length; spii++) {
-          var cur = pollSuspiciousThisIteration[spii]
-          var curKey = (cur.fileName && cur.fileName.length > 0 ? cur.fileName : '') || cur.id
-          if (!curKey || suspSeen.has(curKey)) continue
-          suspSeen.add(curKey)
-          suspiciousDoneWithoutProcessing.push(cur)
-        }
+        suspiciousDoneWithoutProcessing = dedupeTilesByIdentity(
+          suspiciousDoneWithoutProcessing.concat(pollSuspiciousThisIteration)
+        )
       }
       if (FLOW_DEBUG_VERBOSE && (traceSeenRecencyAccepted > 0 || traceSeenRecencyRejected > 0)) {
         console.log('[FlowContent][RESULT_RECENCY_SUMMARY]', JSON.stringify({
@@ -1582,7 +1610,7 @@ async function runFlowPrompt(payload: {
         rawCandidates: rawCandidates.length,
         uniqueRawCandidates: uniqueRawCandidates.length,
         skippedOld: skippedOld,
-        skippedLazyLoaded: skippedLazyLoaded,
+        baselineFilenameReusedEvaluated: baselineFilenameReusedEvaluated,
         confirmed: confirmed.length,
         uniqueConfirmed: uniqueConfirmed.length,
         pending: uniquePending.length,
@@ -1878,8 +1906,7 @@ async function runFlowPrompt(payload: {
       }>) || []
     for (var alci = 0; alci < allSnapTilesLatest.length; alci++) {
       var at = allSnapTilesLatest[alci]
-      if (preSubmitIdSet.has(at.id)) continue
-      if (at.fileName && preSubmitFileNameSet.has(at.fileName)) continue
+      if (isFlowTileInBaseline(at, preSubmitDetails)) continue
       if (refIdSet.has(at.id)) continue
       if (at.fileName && refFileNameSet.has(at.fileName)) continue
       afterLoopAll.push(at)
@@ -1926,16 +1953,14 @@ async function runFlowPrompt(payload: {
       for (var provI = 0; provI < allSnapTilesLatest.length; provI++) {
         var pt = allSnapTilesLatest[provI]
         if (pt.status === 'failed' && stableFailedIds.has(pt.id)) continue
-        if (preSubmitIdSet.has(pt.id)) continue
-        if (pt.fileName && preSubmitFileNameSet.has(pt.fileName)) continue
+        if (isFlowTileInBaseline(pt, preSubmitDetails)) continue
         if (refIdSet.has(pt.id)) continue
         if (pt.fileName && refFileNameSet.has(pt.fileName)) continue
         // Strict recency guard: provisionalDone must also be a tile we
         // observed as non-terminal after submit. Otherwise Flow's
         // lazy-loaded old tiles with stale media would slip through the
         // provisional path even though Stage 2 already rejected them.
-        var provSeen = seenProcessingIds.has(pt.id) ||
-          (pt.fileName && seenProcessingFileNames.has(pt.fileName))
+        var provSeen = wasFlowTileObservedProcessing(pt, seenProcessingIds)
         if (!provSeen) continue
         var ptMediaReady = !!(pt.hasVideo || pt.hasImg)
         if (!ptMediaReady) continue
@@ -2010,6 +2035,12 @@ async function runFlowPrompt(payload: {
         success: false,
         status: 'AUTO_DOWNLOAD_NO_SUCCESSFUL_RESULTS',
         error: 'No successful result tiles. expected=' + payload.quantity,
+        ...(observedStructuredError ? {
+          errorCode: observedStructuredError.code,
+          flowError: observedStructuredError,
+          statusReason: observedStructuredError.statusReason,
+          evidence: observedStructuredError.evidence,
+        } : {}),
         bridgeReady: true,
         autoDownload: autoDownloadResult,
         generation: {
@@ -2256,6 +2287,12 @@ async function runFlowPrompt(payload: {
         success: false,
         status: 'AUTO_DOWNLOAD_NO_SUCCESSFUL_RESULTS',
         error: 'No successful result tiles after classification. expected=' + payload.quantity,
+        ...(observedStructuredError ? {
+          errorCode: observedStructuredError.code,
+          flowError: observedStructuredError,
+          statusReason: observedStructuredError.statusReason,
+          evidence: observedStructuredError.evidence,
+        } : {}),
         bridgeReady: true,
         autoDownload: autoDownloadResult,
         generation: {
@@ -2831,6 +2868,12 @@ async function runFlowPrompt(payload: {
     return {
       success: runSucceeded,
       status: finalStatus,
+      ...(observedStructuredError ? {
+        errorCode: observedStructuredError.code,
+        flowError: observedStructuredError,
+        statusReason: observedStructuredError.statusReason,
+        evidence: observedStructuredError.evidence,
+      } : {}),
       bridgeReady: true,
       submitMethod: (submitResult as Record<string, unknown>).method as string || '',
       insertStrategy: (insertResult as Record<string, unknown>).strategy as string || '',
@@ -3043,6 +3086,73 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true
   }
 
+  // owner: google-flow — read-only P0 admission probes and cancellation.
+  if (action === 'FLOW_GET_ADMISSION_HEALTH') {
+    ;(async () => {
+      const health = await bridgeCall('getAdmissionHealth', {}, 5000)
+      if (health.success === false) {
+        sendResponse({
+          ...health,
+          healthy: false,
+          bridgeReady: false,
+          composerPresent: false,
+          processing: 0,
+          pending: 0,
+          generating: 0,
+          blockingDialog: false,
+          errorCode: 'bridge_unavailable',
+          statusReason: String(health.error || 'flow_admission_health_bridge_failed'),
+          evidence: [],
+        })
+      } else {
+        sendResponse(health)
+      }
+    })().catch((error) => {
+      sendResponse({
+        success: false,
+        healthy: false,
+        bridgeReady: false,
+        composerPresent: false,
+        processing: 0,
+        pending: 0,
+        generating: 0,
+        blockingDialog: false,
+        errorCode: 'bridge_unavailable',
+        statusReason: error instanceof Error ? error.message : String(error),
+        evidence: [],
+      })
+    })
+    return true
+  }
+
+  if (action === 'FLOW_CHECK_SELECTOR') {
+    const selector = String(((message as Record<string, unknown>).payload as Record<string, unknown> | undefined)?.selector || '')
+    try {
+      const matches = selector ? document.querySelectorAll(selector) : []
+      sendResponse({ success: true, selector, exists: matches.length > 0, count: matches.length, checkedAt: Date.now() })
+    } catch (error) {
+      sendResponse({ success: false, selector, exists: false, count: 0, error: error instanceof Error ? error.message : String(error) })
+    }
+    return true
+  }
+
+  if (action === 'FLOW_CANCEL_JOB') {
+    const cancelPayload = ((message as Record<string, unknown>).payload || {}) as Record<string, unknown>
+    const jobId = String(cancelPayload.jobId || '')
+    const control = activeFlowJobControls.get(jobId)
+    if (!control) {
+      sendResponse({ success: false, jobId, statusReason: 'flow_job_not_found' })
+      return true
+    }
+    if (control.submitStarted) {
+      sendResponse({ success: true, jobId, cancelledBeforeSubmit: false, submitStarted: true, statusReason: 'submit_already_started' })
+      return true
+    }
+    control.controller.abort('background_cancelled_before_submit')
+    sendResponse({ success: true, jobId, cancelledBeforeSubmit: true, submitStarted: false, statusReason: 'cancelled_before_submit' })
+    return true
+  }
+
   // In-page fetch of a Flow media URL → data URL.
   //
   // The workflow runner cannot fetch `https://labs.google/fx/api/trpc/
@@ -3211,17 +3321,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         timeoutMs: responseTimeoutMs,
         url: window.location.href,
       }))
-      safeRespondOnce({
+      safeRespondOnce(ensureFlowResultContract({
         success: false,
         status: 'RUN_FLOW_PROMPT_TIMEOUT',
         error: 'RUN_FLOW_PROMPT did not respond within ' + Math.round(responseTimeoutMs / 1000) + 's',
+        errorCode: 'submit_uncertain',
+        statusReason: 'content_response_timeout_after_dispatch',
         bridgeReady: isBridgeLoaded(),
-      })
+      }, 'timeout'))
     }, responseTimeoutMs)
 
     try {
     const rawPayload = ((message as Record<string, unknown>).payload || {}) as Record<string, unknown>
-    settingsDebug('[FlowContent][RUN_FLOW_PROMPT_PAYLOAD]', JSON.stringify(rawPayload, null, 2))
+    settingsDebug('[FlowContent][RUN_FLOW_PROMPT_PAYLOAD]', JSON.stringify({
+      mode: rawPayload.mode,
+      model: rawPayload.model,
+      quantity: rawPayload.quantity,
+      promptLength: typeof rawPayload.prompt === 'string' ? rawPayload.prompt.length : 0,
+      fileIdsCount: Array.isArray(rawPayload.fileIds) ? rawPayload.fileIds.length : 0,
+      source: rawPayload.source,
+      jobId: rawPayload.jobId,
+    }, null, 2))
+    if (!rawPayload.jobId) {
+      safeRespondOnce(ensureFlowResultContract({
+        success: false,
+        status: 'FLOW_ADMISSION_REQUIRED',
+        error: 'RUN_FLOW_PROMPT must be admitted by the background controller',
+        errorCode: 'flow_busy',
+        statusReason: 'missing_flow_admission_job_id',
+      }, 'orchestrator'))
+      return true
+    }
 
     const debugGenState = rawPayload.debugGenState as Record<string, unknown> | undefined
     if (debugGenState) {
@@ -3330,26 +3460,39 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       resolution: (rawPayload.resolution as string) || (rawPayload.downloadRes as string) || '1k',
       videoResolution: (rawPayload.videoResolution as string) || (rawPayload.videoDownloadResolution as string) || '720p',
       focusTab: (rawPayload.focusTab as boolean) || false,
+      source: (rawPayload.source as string) || 'gen-panel',
+      collectOutputs: rawPayload.collectOutputs !== false,
+      suppressAutoDownload: rawPayload.suppressAutoDownload === true,
+      jobId: (rawPayload.jobId as string) || '',
+      callerId: (rawPayload.callerId as string) || '',
     }
-    runFlowPrompt(fullPayload)
+    const jobControl: FlowJobControl = {
+      controller: new AbortController(),
+      submitStarted: false,
+    }
+    if (fullPayload.jobId) activeFlowJobControls.set(fullPayload.jobId, jobControl)
+    runFlowPrompt(fullPayload, jobControl)
       .then((result) => {
-        safeRespondOnce(result)
+        safeRespondOnce(ensureFlowResultContract(result, 'bridge'))
       })
       .catch((err) => {
         console.error('[FlowTrace][Content] RUN_FLOW_PROMPT_CAUGHT', err)
-        safeRespondOnce({
+        safeRespondOnce(ensureFlowResultContract({
           success: false,
           status: 'RUN_FLOW_PROMPT_EXCEPTION',
           error: (err as Error)?.message || String(err),
-        })
+        }, 'orchestrator'))
+      })
+      .finally(() => {
+        if (fullPayload.jobId) activeFlowJobControls.delete(fullPayload.jobId)
       })
     } catch (err) {
       console.error('[FlowTrace][Content] RUN_FLOW_PROMPT_SYNC_THROW', err)
-      safeRespondOnce({
+      safeRespondOnce(ensureFlowResultContract({
         success: false,
         status: 'RUN_FLOW_PROMPT_SYNC_THROW',
         error: (err as Error)?.message || String(err),
-      })
+      }, 'orchestrator'))
     }
     return true
   }

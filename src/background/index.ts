@@ -19,6 +19,15 @@
 import type { ChromeMessage } from '@/types'
 import { PROVIDER_TABS } from '@/constants'
 import { DEBUG_FLAGS, debugLog } from '@/lib/debug'
+import { FlowAdmissionController } from './flow/FlowAdmissionController'
+import { createFlowEvidence, ensureFlowResultContract } from '@/lib/flow/resultContract'
+import type {
+  FlowAdmissionHealth,
+  FlowAdmissionSnapshot,
+  FlowErrorCode,
+  FlowErrorEvidence,
+  FlowResultContract,
+} from '@/types/flow'
 
 // Enable with: localStorage.setItem('AI_FLOW_DEBUG', '1') in the extension page/tab
 // Guard: localStorage does not exist in service worker contexts.
@@ -35,6 +44,29 @@ function readBgDebugFlag(): boolean {
 var BG_DEBUG = readBgDebugFlag()
 var workflowEditorWindowId: number | null = null
 var workflowEditorTabId: number | null = null
+
+const FLOW_ADMISSION_STORAGE_KEY = 'flowAdmissionP0'
+const flowDispatchedJobIds = new Set<string>()
+const flowAdmissionController = new FlowAdmissionController({
+  // Conservative extension-side safety debounce, not a claimed Google Flow
+  // rate limit. The controller option remains configurable for runtime tuning.
+  minimumCooldownMs: 1_000,
+  storage: {
+    async load(): Promise<FlowAdmissionSnapshot | null> {
+      const stored = await chrome.storage.session?.get?.(FLOW_ADMISSION_STORAGE_KEY).catch(() => null)
+      const value = stored?.[FLOW_ADMISSION_STORAGE_KEY]
+      return value && typeof value === 'object' ? value as FlowAdmissionSnapshot : null
+    },
+    async save(snapshot: FlowAdmissionSnapshot): Promise<void> {
+      await chrome.storage.session?.set?.({ [FLOW_ADMISSION_STORAGE_KEY]: snapshot })
+    },
+  },
+  log(event, payload) {
+    // Admission logs intentionally exclude prompt text, cookies, tokens, and
+    // response bodies. These lifecycle fields are safe for default logging.
+    console.log(`[FlowAdmission] ${event} ${JSON.stringify(payload)}`)
+  },
+})
 
 const WORKFLOW_EDITOR_WINDOW_ID_KEY = 'workflowEditorWindowId'
 const WORKFLOW_EDITOR_TAB_ID_KEY = 'workflowEditorTabId'
@@ -546,6 +578,29 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
 
     case 'RUN_FLOW_PROMPT':
       return runFlowPrompt(message.payload as RunFlowPromptPayload, sender.tab?.id)
+
+    // owner: google-flow — P0 admission lifecycle and Wait-node probes.
+    case 'FLOW_GET_ADMISSION_SNAPSHOT':
+      return { success: true, snapshot: await flowAdmissionController.getSnapshot() }
+
+    case 'FLOW_CANCEL_ADMISSION':
+      return cancelFlowAdmission((message.payload || {}) as { jobId?: string; callerId?: string })
+
+    case 'FLOW_RESET_ADMISSION': {
+      const before = await flowAdmissionController.getSnapshot()
+      const acknowledged = ((message.payload || {}) as { userAcknowledged?: boolean }).userAcknowledged === true
+      const snapshot = await flowAdmissionController.resetBlockedState(acknowledged)
+      if (acknowledged && before.activeJob && snapshot.state === 'idle') {
+        flowDispatchedJobIds.delete(before.activeJob.jobId)
+      }
+      return {
+        success: acknowledged && before.activeJob !== null && snapshot.state === 'idle',
+        snapshot,
+      }
+    }
+
+    case 'FLOW_CHECK_SELECTOR':
+      return checkFlowSelector((message.payload || {}) as { selector?: string; tabId?: number })
 
     case 'RUN_CHATGPT_PROMPT':
       return runChatGPTPrompt(message.payload as ChatGPTPromptPayload)
@@ -2131,6 +2186,10 @@ interface RunFlowPromptPayload {
   duration?: string
   style: string | null
   referenceImages: string[]
+  fileIds?: string[]
+  fileNameMap?: Record<string, string>
+  frameFileIds?: { frame1?: string; frame2?: string }
+  flowVideoMode?: 'frame' | 'ingredient'
   autoDownload: boolean
   outputFolder: string
   resolution: string
@@ -2138,11 +2197,21 @@ interface RunFlowPromptPayload {
   focusTab?: boolean
   preserveEditor?: boolean
   source?: string
+  callerId?: string
+  jobId?: string
+  tabId?: number
+  collectOutputs?: boolean
+  suppressAutoDownload?: boolean
+  videoDownloadResolution?: string
+  debugGenState?: Record<string, unknown>
 }
 
 interface FlowStatusPayload {
   status: string
   timestamp: number
+  jobId?: string
+  source?: string
+  statusReason?: string
   tiles?: string[]
   error?: string
 }
@@ -2487,10 +2556,155 @@ async function findOrOpenFlowTab(): Promise<number | null> {
   }
 }
 
+async function probeFlowAdmissionHealth(tabId: number, signal: AbortSignal): Promise<FlowAdmissionHealth> {
+  const detectedAt = Date.now()
+  if (signal.aborted) throw new Error('flow_admission_probe_cancelled')
+
+  const tab = await chrome.tabs.get(tabId).catch(() => null)
+  if (!tab) {
+    return {
+      healthy: false,
+      tabExists: false,
+      bridgeReady: false,
+      composerPresent: false,
+      processing: 0,
+      pending: 0,
+      generating: 0,
+      blockingDialog: false,
+      errorCode: 'bridge_unavailable',
+      statusReason: 'flow_tab_not_found',
+      evidence: [createFlowEvidence('orchestrator', 'flow_tab_not_found', { detectedAt, confidence: 'high' })],
+    }
+  }
+
+  const url = String(tab.url || tab.pendingUrl || '')
+  if (!url.includes('labs.google/fx/')) {
+    return {
+      healthy: false,
+      tabExists: true,
+      url,
+      bridgeReady: false,
+      composerPresent: false,
+      processing: 0,
+      pending: 0,
+      generating: 0,
+      blockingDialog: false,
+      errorCode: 'bridge_unavailable',
+      statusReason: 'flow_tab_url_not_ready',
+      evidence: [createFlowEvidence('orchestrator', 'flow_tab_url_not_ready', { detectedAt, confidence: 'high' })],
+    }
+  }
+
+  const bridge = await pingFlowBridgeViaMainWorld(tabId)
+  if (signal.aborted) throw new Error('flow_admission_probe_cancelled')
+  if (bridge?.bridgeReady !== true) {
+    return {
+      healthy: false,
+      tabExists: true,
+      url,
+      bridgeReady: false,
+      composerPresent: false,
+      processing: 0,
+      pending: 0,
+      generating: 0,
+      blockingDialog: false,
+      errorCode: 'bridge_unavailable',
+      statusReason: 'flow_bridge_not_ready_before_submit',
+      evidence: [createFlowEvidence('bridge', 'flow_bridge_not_ready_before_submit', { detectedAt, confidence: 'high' })],
+    }
+  }
+
+  const raw = await chrome.tabs.sendMessage(tabId, { action: 'FLOW_GET_ADMISSION_HEALTH' }).catch((error) => ({
+    success: false,
+    healthy: false,
+    bridgeReady: false,
+    errorCode: 'bridge_unavailable',
+    statusReason: error instanceof Error ? error.message : String(error),
+  })) as Record<string, unknown>
+  const evidence = Array.isArray(raw.evidence)
+    ? raw.evidence.filter((item): item is FlowErrorEvidence => !!item && typeof item === 'object')
+    : []
+  const processing = Math.max(0, Number(raw.processing || 0))
+  const pending = Math.max(0, Number(raw.pending || 0))
+  const generating = Math.max(0, Number(raw.generating || 0))
+  const busy = processing + pending + generating > 0
+  const errorCode = (raw.errorCode as FlowErrorCode | undefined) || (busy ? 'flow_busy' : undefined)
+  const statusReason = String(raw.statusReason || (busy ? 'provider_busy_before_submit' : 'flow_provider_idle'))
+
+  return {
+    healthy: raw.healthy === true && !busy && !errorCode,
+    tabExists: true,
+    url,
+    bridgeReady: raw.bridgeReady === true,
+    composerPresent: raw.composerPresent === true,
+    processing,
+    pending,
+    generating,
+    blockingDialog: raw.blockingDialog === true,
+    ...(errorCode ? { errorCode } : {}),
+    statusReason,
+    evidence: evidence.length > 0
+      ? evidence
+      : (errorCode ? [createFlowEvidence('orchestrator', statusReason, { detectedAt, confidence: 'medium' })] : []),
+  }
+}
+
+async function cancelFlowAdmission(payload: { jobId?: string; callerId?: string }) {
+  const snapshot = await flowAdmissionController.getSnapshot()
+  const job = snapshot.activeJob
+  if (!job || (payload.jobId && payload.jobId !== job.jobId) || (payload.callerId && payload.callerId !== job.callerId)) {
+    return { success: false, statusReason: 'no_matching_active_flow_job', snapshot }
+  }
+
+  let contentDecision: Record<string, unknown> | null = null
+  const wasDispatched = flowDispatchedJobIds.has(job.jobId)
+  if (job.state === 'in_flight' || job.state === 'submit_uncertain' || wasDispatched) {
+    contentDecision = await chrome.tabs.sendMessage(job.tabId, {
+      action: 'FLOW_CANCEL_JOB',
+      payload: { jobId: job.jobId },
+    }).catch(() => null) as Record<string, unknown> | null
+
+    if (contentDecision?.submitStarted === true && job.state === 'admitted') {
+      await flowAdmissionController.markSubmitStarted(job.jobId, 'content_reported_submit_started_during_cancellation')
+    } else if (!contentDecision && job.state === 'admitted' && wasDispatched) {
+      // The request may already have crossed the message boundary. Keep the
+      // mutex conservative rather than reopening a duplicate-submit window.
+      await flowAdmissionController.markSubmitStarted(job.jobId, 'cancel_probe_unreachable_after_dispatch')
+    }
+  }
+
+  const decision = await flowAdmissionController.requestCancellation({ jobId: job.jobId, callerId: payload.callerId })
+  return { success: decision.accepted, ...decision, contentDecision }
+}
+
+async function checkFlowSelector(payload: { selector?: string; tabId?: number }) {
+  const selector = String(payload.selector || '')
+  if (!selector) return { success: false, exists: false, error: 'selector is required' }
+  const tabId = payload.tabId || await findOrOpenFlowTab()
+  if (!tabId) return { success: false, exists: false, error: 'Flow tab not found' }
+  try {
+    return await chrome.tabs.sendMessage(tabId, { action: 'FLOW_CHECK_SELECTOR', payload: { selector } })
+  } catch (error) {
+    return { success: false, exists: false, error: error instanceof Error ? error.message : String(error), tabId }
+  }
+}
+
+function flowPreAdmissionFailure(statusReason: string, error: string, tabId?: number): FlowResultContract {
+  return ensureFlowResultContract({
+    success: false,
+    ...(tabId ? { tabId } : {}),
+    status: 'FLOW_PRE_ADMISSION_FAILED',
+    error,
+    errorCode: 'bridge_unavailable',
+    statusReason,
+    evidence: [createFlowEvidence('orchestrator', statusReason, { confidence: 'high' })],
+  }, 'orchestrator')
+}
+
 async function runFlowPrompt(
   payload: RunFlowPromptPayload,
   senderTabId?: number
-): Promise<{ success: boolean; tabId?: number; status?: string; error?: string; tiles?: string[] }> {
+): Promise<Record<string, unknown>> {
   console.log('[Background] runFlowPrompt called, prompt len:', payload.prompt?.length)
   console.log('[Background][RUN_FLOW_PROMPT_PAYLOAD]', JSON.stringify({
     mode: payload.mode,
@@ -2515,7 +2729,7 @@ async function runFlowPrompt(
     payloadTabId: payload.tabId,
   }))
 
-  let tabId = payload.tabId || senderTabId
+  let tabId: number | null | undefined = payload.tabId || senderTabId
   if (!tabId) {
     tabId = await findOrOpenFlowTab()
     if (!tabId) {
@@ -2525,7 +2739,7 @@ async function runFlowPrompt(
         rawResult: null,
         payloadSummary: { mode: payload.mode, model: payload.model, quantity: payload.quantity },
       }))
-      return { success: false, error: 'Could not find or open Flow tab' }
+      return flowPreAdmissionFailure('flow_tab_not_found', 'Could not find or open Flow tab')
     }
   }
   // Log tab URL so we can detect stale / wrong tab
@@ -2596,7 +2810,7 @@ async function runFlowPrompt(
           reason: 'FLOW_SCRIPTS_NOT_FOUND',
           rawResult: null,
         }))
-        return { success: false, error: 'Could not find flow-content script in manifest' }
+        return flowPreAdmissionFailure('flow_content_bundle_not_found', 'Could not find flow-content script in manifest', tabId)
       }
 
       // Inject content script (ISOLATED world)
@@ -2613,7 +2827,7 @@ async function runFlowPrompt(
           reason: 'FLOW_CONTENT_INJECTION_FAILED',
           rawResult: { message: (e as Error).message },
         }))
-        return { success: false, error: 'Content script injection failed: ' + (e as Error).message }
+        return flowPreAdmissionFailure('flow_content_injection_failed', 'Content script injection failed: ' + (e as Error).message, tabId)
       }
 
       // Inject bridge (MAIN world)
@@ -2632,7 +2846,7 @@ async function runFlowPrompt(
             reason: 'FLOW_BRIDGE_INJECTION_FAILED',
             rawResult: { message: (e as Error).message },
           }))
-          return { success: false, error: 'Bridge MAIN world injection failed: ' + (e as Error).message }
+          return flowPreAdmissionFailure('flow_bridge_injection_failed', 'Bridge MAIN world injection failed: ' + (e as Error).message, tabId)
         }
       }
 
@@ -2722,6 +2936,33 @@ async function runFlowPrompt(
     }))
   }
 
+  // owner: google-flow â€” every GenPanel, Workflow, and direct
+  // RUN_FLOW_PROMPT message reaches this single background admission gate.
+  // Conservative P0 policy: one global Google Flow generation at a time.
+  // The actual provider limits have not been runtime-verified yet.
+  const admission = await flowAdmissionController.requestAdmission({
+    source: payload.source || 'gen-panel',
+    callerId: payload.callerId,
+    tabId,
+    mediaType: payload.mode,
+  }, (signal) => probeFlowAdmissionHealth(tabId as number, signal))
+
+  if (!admission.granted || !admission.job) {
+    return ensureFlowResultContract({
+      success: false,
+      tabId,
+      status: 'FLOW_ADMISSION_DENIED',
+      error: admission.statusReason,
+      errorCode: admission.errorCode || 'unknown',
+      statusReason: admission.statusReason,
+      evidence: admission.health?.evidence || [],
+      admission: admission.snapshot,
+    }, 'orchestrator')
+  }
+
+  const admissionJob = admission.job
+  payload.jobId = admissionJob.jobId
+
   if (payload.preserveEditor === true || payload.focusTab === false) {
     console.log('[Workflow][ProviderRoute] flowNoFocus', JSON.stringify({
       tabId,
@@ -2732,6 +2973,21 @@ async function runFlowPrompt(
   }
 
   try {
+    const preDispatchSnapshot = await flowAdmissionController.getSnapshot()
+    if (preDispatchSnapshot.activeJob?.jobId !== admissionJob.jobId || preDispatchSnapshot.activeJob.state !== 'admitted') {
+      const cancelledBeforeDispatch = preDispatchSnapshot.activeJob?.jobId !== admissionJob.jobId
+      return ensureFlowResultContract({
+        success: false,
+        tabId,
+        jobId: admissionJob.jobId,
+        status: cancelledBeforeDispatch ? 'FLOW_CANCELLED' : 'FLOW_SUBMIT_UNCERTAIN',
+        error: cancelledBeforeDispatch ? 'Flow admission was cancelled before dispatch' : 'Flow admission is no longer safe to dispatch',
+        errorCode: cancelledBeforeDispatch ? 'cancelled' : 'submit_uncertain',
+        statusReason: cancelledBeforeDispatch ? 'admission_cancelled_before_message_dispatch' : 'admission_state_changed_before_message_dispatch',
+        admission: preDispatchSnapshot,
+      }, 'orchestrator')
+    }
+    flowDispatchedJobIds.add(admissionJob.jobId)
     console.log('[FlowTrace][BG] SEND_RUN_FLOW_PROMPT_START ' + JSON.stringify({
       tabId,
       mode: payload.mode,
@@ -2747,7 +3003,6 @@ async function runFlowPrompt(
       payload,
       tabId
     })
-    console.log('[Background] runFlowPrompt result:', result)
     console.log('[FlowTrace][BG] SEND_RUN_FLOW_PROMPT_RESPONSE ' + JSON.stringify({
       tabId,
       success: result?.success,
@@ -2757,25 +3012,24 @@ async function runFlowPrompt(
       outputsCount: Array.isArray(result?.outputs) ? (result?.outputs as unknown[]).length : 0,
       imagesCount: Array.isArray(result?.images) ? (result?.images as unknown[]).length : 0,
       imageUrlsCount: Array.isArray(result?.imageUrls) ? (result?.imageUrls as unknown[]).length : 0,
-      responseRaw: result,
     }))
+    const structured = ensureFlowResultContract(result, 'bridge')
+    const uncertain = structured.errorCode === 'submit_uncertain' || structured.status === 'RUN_FLOW_PROMPT_TIMEOUT'
+    if (uncertain) {
+      await flowAdmissionController.markSubmitUncertain(admissionJob.jobId, structured.statusReason || 'flow_response_uncertain')
+    } else {
+      await flowAdmissionController.completeJob(
+        admissionJob.jobId,
+        structured.success ? undefined : structured.errorCode,
+        structured.statusReason || String(structured.status || 'flow_job_terminal'),
+      )
+      flowDispatchedJobIds.delete(admissionJob.jobId)
+    }
     return {
-      success: result?.success ?? false,
+      ...structured,
       tabId,
-      status: result?.status,
-      tiles: result?.tiles,
-      error: result?.error,
-      autoDownload: result?.autoDownload,
-      downloadDetails: result?.downloadDetails,
-      // Output assets for workflow node preview + downstream media.
-      // Forwarded as-is from flow-content.ts. The runner reads
-      // `outputs` (rich descriptor) and `images` (MediaItem shape) to
-      // populate node output + feed downstream nodes. The UI renderer
-      // reads `imageUrls` (string[]) and walks `images[]` for the
-      // preview thumbnail.
-      outputs: Array.isArray(result?.outputs) ? result?.outputs : [],
-      images: Array.isArray(result?.images) ? result?.images : [],
-      imageUrls: Array.isArray(result?.imageUrls) ? result?.imageUrls : [],
+      jobId: admissionJob.jobId,
+      admission: await flowAdmissionController.getSnapshot(),
     }
   } catch (e) {
     const message = (e as Error).message || String(e)
@@ -2798,7 +3052,18 @@ async function runFlowPrompt(
       rawResult: { message },
       extra: isContextInvalidated ? { hint: 'Reload the Flow tab and retry.', contextInvalidated: true } : undefined,
     }))
-    return { success: false, status: reason, error: message }
+    await flowAdmissionController.markSubmitUncertain(admissionJob.jobId, reason)
+    return ensureFlowResultContract({
+      success: false,
+      tabId,
+      jobId: admissionJob.jobId,
+      status: reason,
+      error: message,
+      errorCode: 'submit_uncertain',
+      statusReason: reason,
+      evidence: [createFlowEvidence('orchestrator', reason, { confidence: 'high' })],
+      admission: await flowAdmissionController.getSnapshot(),
+    }, 'orchestrator')
   }
 }
 
@@ -2971,9 +3236,16 @@ async function pingFlowBridgeViaMainWorld(tabId: number): Promise<Record<string,
   }
 }
 
-function handleFlowStatus(payload: FlowStatusPayload) {
+async function handleFlowStatus(payload: FlowStatusPayload) {
   console.log('[Background] Flow status:', payload.status, 'timestamp:', payload.timestamp)
-  return { received: true, status: payload.status }
+  if (payload.jobId) {
+    if (payload.status === 'FLOW_SUBMIT_STARTED') {
+      await flowAdmissionController.markSubmitStarted(payload.jobId, payload.statusReason || 'content_submit_started')
+    } else if (payload.status === 'FLOW_SUBMIT_CONFIRMED' || payload.status === 'FLOW_SUBMIT_SUCCESS') {
+      await flowAdmissionController.markSubmitConfirmed(payload.jobId, payload.statusReason || 'content_submit_confirmed')
+    }
+  }
+  return { received: true, status: payload.status, jobId: payload.jobId }
 }
 
 // ── Tile Monitor ─────────────────────────────────────────────────────────────

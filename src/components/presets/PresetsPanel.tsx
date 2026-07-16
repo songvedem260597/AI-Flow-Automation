@@ -41,7 +41,7 @@ const PRESET_TEMPLATES: PresetTemplateData[] = [
     nodes: [
       { id: 'p1', type: 'prompt' as FlowNodeType, position: { x: 100, y: 100 }, data: { label: 'Prompt 1', prompt: '', provider: 'chatgpt' as const } },
       { id: 'g1', type: 'generate' as FlowNodeType, position: { x: 350, y: 100 }, data: { label: 'Generate', provider: 'chatgpt' as const } },
-      { id: 'w1', type: 'wait' as FlowNodeType, position: { x: 600, y: 100 }, data: { label: 'Wait', condition: 'dom-change' as const } }
+      { id: 'w1', type: 'wait' as FlowNodeType, position: { x: 600, y: 100 }, data: { label: 'Wait', condition: 'provider-idle' as const } }
     ],
     edges: [
       { id: 'e1', source: 'p1', target: 'g1' },

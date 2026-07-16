@@ -3785,11 +3785,18 @@ const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, nodeId, onClose
               <span className={fieldLabelClass}>Condition</span>
               <div className="relative">
                 <select
-                  value={String(data.condition || 'dom-change')}
+                  value={String(data.condition || 'provider-idle')}
                   onChange={(event) => update('condition', event.target.value)}
                   className={fieldSelectClass}
                 >
-                  {['dom-change', 'text-appear', 'element-visible', 'manual'].map((condition) => (
+                  {[
+                    'manual',
+                    'provider-idle',
+                    'flow-cooldown-ended',
+                    'selector-exists',
+                    'selector-disappears',
+                    'dom-change',
+                  ].map((condition) => (
                     <option key={condition} value={condition}>{condition}</option>
                   ))}
                 </select>
@@ -3801,6 +3808,16 @@ const NodeInspector: React.FC<NodeInspectorProps> = ({ workflow, nodeId, onClose
               <input
                 value={String(data.selector || '')}
                 onChange={(event) => update('selector', event.target.value)}
+                className={fieldControlClass}
+              />
+            </label>
+            <label className="block">
+              <span className={fieldLabelClass}>Timeout (ms)</span>
+              <input
+                type="number"
+                min={1}
+                value={Number(data.timeout || 30000)}
+                onChange={(event) => update('timeout', Math.max(1, Number(event.target.value) || 30000))}
                 className={fieldControlClass}
               />
             </label>

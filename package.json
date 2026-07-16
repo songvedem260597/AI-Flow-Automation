@@ -7,6 +7,7 @@
     "dev": "node prebuild.js && plasmo dev",
     "build": "node prebuild.js && plasmo build && node postbuild.js",
     "package": "node prebuild.js && plasmo package && node postbuild.js",
+    "test:flow": "node --no-warnings --experimental-strip-types --test tests/flow/*.test.ts",
     "test:e2e:chatgpt": "node scripts/e2e-chatgpt-extension.mjs",
     "test:e2e:chatgpt:interactive": "node scripts/e2e-chatgpt-extension.mjs --interactive",
     "test:e2e:templates": "node scripts/e2e-template-layout.mjs --non-interactive",

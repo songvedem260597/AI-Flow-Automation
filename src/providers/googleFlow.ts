@@ -1,5 +1,7 @@
 import type { ProviderAdapter } from '@/types'
 import { PROVIDER_TABS } from '@/constants'
+import { ensureFlowResultContract } from '@/lib/flow/resultContract'
+import type { FlowResultContract } from '@/types/flow'
 
 // Resolves the runtime-bundled flow content script file name by
 // inspecting the live manifest. Plasmo emits hashed bundle names
@@ -87,11 +89,18 @@ export class GoogleFlowAdapter implements ProviderAdapter {
   }
 
   async clickGenerate(): Promise<void> {
-    const tabId = this.requireTabId()
-    await this.injectScript()
-    await chrome.tabs.sendMessage(tabId, {
-      action: 'CLICK_GENERATE'
+    // owner: google-flow â€” a direct CLICK_GENERATE would bypass the
+    // background admission mutex. Production callers must submit the full
+    // prompt through runPrompt()/RUN_FLOW_PROMPT instead.
+    throw new Error('FLOW_DIRECT_CLICK_BLOCKED_USE_RUN_FLOW_PROMPT')
+  }
+
+  async runPrompt(payload: Record<string, unknown>): Promise<FlowResultContract> {
+    const response = await chrome.runtime.sendMessage({
+      action: 'RUN_FLOW_PROMPT',
+      payload: { ...payload, source: String(payload.source || 'google-flow-adapter') },
     })
+    return ensureFlowResultContract(response, 'orchestrator')
   }
 
   async waitForResult(): Promise<string> {

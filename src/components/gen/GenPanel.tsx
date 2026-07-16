@@ -1879,6 +1879,7 @@ export const GenPanel: React.FC<{
   const [isGenerating, setIsGenerating] = useState(false)
   const [genStatus, setGenStatus] = useState<'idle' | 'generating' | 'done'>('idle')
   const [flowStep, setFlowStep] = useState('')
+  const [flowAdmissionResetReason, setFlowAdmissionResetReason] = useState('')
   const [tileCounts, setTileCounts] = useState({ generating: 0, done: 0, failed: 0, total: 0 })
   const [tileMonitorActive, setTileMonitorActive] = useState(false)
   const [genCount, setGenCount] = useState(0)
@@ -2316,6 +2317,7 @@ interface FlowPayload {
   // Defaults to 'gen-tab' for any pre-existing code path that
   // doesn't set this explicitly (back-compat).
   source?: 'gen-tab' | 'workflow'
+  callerId?: string
   // Whether the caller wants the output assets collected and
   // returned via `outputs[]` / `images[]` / `imageUrls[]` even
   // when auto-download is suppressed. Default true.
@@ -2453,12 +2455,27 @@ function buildGenerationPayload(
   return payload
 }
 
-async function runFlowGeneration(payload: FlowPayload): Promise<Record<string, unknown>> {
-  const response = await chrome.runtime.sendMessage({
-    action: 'RUN_FLOW_PROMPT',
-    payload,
-  })
-  return response as Record<string, unknown>
+async function runFlowGeneration(payload: FlowPayload, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  const callerId = payload.callerId || `gen-panel_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+  const onAbort = () => {
+    chrome.runtime.sendMessage({
+      action: 'FLOW_CANCEL_ADMISSION',
+      payload: { callerId },
+    }).catch(() => {})
+  }
+  if (signal?.aborted) {
+    throw signal.reason || new DOMException('Generation cancelled before admission', 'AbortError')
+  }
+  signal?.addEventListener('abort', onAbort, { once: true })
+  try {
+    const response = await chrome.runtime.sendMessage({
+      action: 'RUN_FLOW_PROMPT',
+      payload: { ...payload, callerId },
+    })
+    return response as Record<string, unknown>
+  } finally {
+    signal?.removeEventListener('abort', onAbort)
+  }
 }
 
 // ── classifyResult — shared for both single and multi paths ──────────────────
@@ -2475,6 +2492,14 @@ function classifyResult(
     return 'failed'
   }
   return result?.success ? 'success' : 'failed'
+}
+
+function flowResultNeedsAcknowledgedReset(result: Record<string, unknown> | null | undefined): boolean {
+  const admission = result?.admission && typeof result.admission === 'object'
+    ? result.admission as Record<string, unknown>
+    : {}
+  const state = String(admission.state || '')
+  return result?.errorCode === 'submit_uncertain' || state === 'submit_uncertain' || state === 'blocked'
 }
 
 // ── runPromptQueue — multi-prompt orchestration ─────────────────────────────
@@ -2556,8 +2581,14 @@ const runPromptQueue = useCallback(async (
       payload.promptIndex = i
       payload.promptTotal = queue.length
 
-      const result = await runFlowGeneration(payload)
+      const result = await runFlowGeneration(payload, controller.signal)
       completed++
+
+      if (flowResultNeedsAcknowledgedReset(result)) {
+        setFlowAdmissionResetReason(String(result.statusReason || result.error || result.errorCode || 'Flow admission is blocked'))
+      } else if (result.success) {
+        setFlowAdmissionResetReason('')
+      }
 
       const status = classifyResult(result, autoDownload)
 
@@ -2617,6 +2648,25 @@ const handleRetryAll = useCallback(async () => {
 const handleCancel = useCallback(() => {
   runAbortController?.abort()
 }, [runAbortController])
+
+const handleFlowAdmissionReset = useCallback(async () => {
+  const acknowledged = window.confirm(
+    'Google Flow may still be processing a previous submit. Resetting only unlocks this extension; it does not cancel Flow. Check the Flow tab before generating again. Continue?'
+  )
+  if (!acknowledged) return
+
+  const response = await chrome.runtime.sendMessage({
+    action: 'FLOW_RESET_ADMISSION',
+    payload: { userAcknowledged: true },
+  }) as { snapshot?: { state?: string } }
+  const state = String(response?.snapshot?.state || '')
+  if (state === 'idle' || state === 'terminal') {
+    setFlowAdmissionResetReason('')
+    setFlowStep('Flow admission reset. Review the Flow tab before generating again.')
+    return
+  }
+  setFlowStep(`Flow admission remains ${state || 'blocked'}`)
+}, [])
 
 interface TileCounts {
   generating: number
@@ -2698,6 +2748,7 @@ const handleGenerate = useCallback(async () => {
       const result = await runFlowGeneration(payload)
 
       if (result.success) {
+        setFlowAdmissionResetReason('')
         setFlowStep('Generate started! Monitoring tiles...')
 
         // Start tile monitor in bridge via background
@@ -2742,11 +2793,22 @@ const handleGenerate = useCallback(async () => {
         const downloaded = dl?.downloaded ?? (result.autoDownload as { successCount?: number } | undefined)?.successCount ?? 0
         const expected = dl?.expected ?? 0
         const failed = expected - downloaded
-        setFlowStep(
-          downloaded > 0
-            ? `Partial success: downloaded ${downloaded}${failed > 0 ? `, ${failed} failed in Flow` : ''}`
-            : `Flow partial: ${expected} expected, downloaded 0`
+        const statusReason = String(result.statusReason || result.error || result.status || '')
+        const errorCode = String(result.errorCode || '')
+        setFlowStep(downloaded > 0
+          ? `Partial success: downloaded ${downloaded}${failed > 0 ? `, ${failed} failed in Flow` : ''}`
+          : `${errorCode ? `${errorCode}: ` : ''}${statusReason || `Flow partial: ${expected} expected, downloaded 0`}`
         )
+        console.warn('[FlowAdmission][GenPanelResult]', JSON.stringify({
+          jobId: result.jobId || '',
+          success: false,
+          errorCode,
+          statusReason,
+          evidenceCount: Array.isArray(result.evidence) ? result.evidence.length : 0,
+        }))
+        if (flowResultNeedsAcknowledgedReset(result)) {
+          setFlowAdmissionResetReason(statusReason || errorCode || 'Flow admission is blocked')
+        }
         setGenStatus('idle')
         setIsGenerating(false)
         return
@@ -3463,6 +3525,18 @@ const handleGenerate = useCallback(async () => {
 
       {/* ── Bottom Action Bar ── */}
       <div className="px-4 py-3 border-t border-white/5 bg-[#0A0A0A]">
+        {activeProvider === 'flow' && flowAdmissionResetReason && (
+          <div className="mb-2 rounded-lg border border-amber-400/20 bg-amber-400/5 px-2.5 py-2">
+            <div className="text-[10px] leading-4 text-amber-200/80">{flowAdmissionResetReason}</div>
+            <button
+              type="button"
+              onClick={handleFlowAdmissionReset}
+              className="mt-1 text-[10px] font-medium text-amber-300 hover:text-amber-200"
+            >
+              Review Flow and reset admission…
+            </button>
+          </div>
+        )}
         {/* Status row */}
         {genStatus !== 'idle' && (
           <div className="flex items-center gap-3 mb-2">

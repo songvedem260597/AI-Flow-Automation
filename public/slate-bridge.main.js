@@ -1,3 +1,6 @@
+import { classifyFlowErrorText } from '../lib/flow/resultContract'
+import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
+
 /**
  * Flow Slate Bridge — MAIN world
  *
@@ -58,7 +61,7 @@
   // Bump this every time you make a runtime change so the Flow page console
   // verification (window.__FLOW_BRIDGE_BUILD_TIME__) matches the running bundle.
   // 2026-07-10 05:55:00 — added Flow Video input mode (Khung hình / Thành phần).
-  var FLOW_BRIDGE_BUILD_TIME = "2026-07-10 05:55:00"
+  var FLOW_BRIDGE_BUILD_TIME = "2026-07-17 21:30:00"
   bridgeLog('[Bridge] BUILD_TIME ' + FLOW_BRIDGE_BUILD_TIME + ' instance=' + BRIDGE_INSTANCE_ID)
   ;(window as Record<string, unknown>).__FLOW_BRIDGE_BUILD_TIME__ = FLOW_BRIDGE_BUILD_TIME
 
@@ -2919,69 +2922,29 @@
   // ═══════════════════════════════════════════════════════════════
 
   ;(window as Record<string, unknown>).debugRunFlowPrompt = async function (prompt: string): Promise<Record<string, unknown>> {
-    bridgeDebug('[Bridge] debugRunFlowPrompt START, prompt len=' + prompt.length)
-
-    // Wait for page/editor to be ready
-    await sleep(500)
-
-    // Step 1: Clear
-    bridgeDebug('[Bridge] [1/4] clear...')
-    var clearResult = clearEditor()
-    bridgeDebug('[Bridge] [1/4] clear result:', JSON.stringify(clearResult))
-    await sleep(400)
-
-    // Step 2: Insert
-    bridgeDebug('[Bridge] [2/4] insert...')
-    var insertResult = insertText(prompt)
-    if (!insertResult.success) {
-      bridgeDebug('[Bridge] [2/4] insert failed, retrying once...')
-      await sleep(800)
-      insertResult = insertText(prompt)
-    }
-    bridgeDebug('[Bridge] [2/4] insert result:', JSON.stringify(insertResult))
-    await sleep(400)
-
-    // Step 3: Submit
-    bridgeDebug('[Bridge] [3/4] submit...')
-    var submitResult = submit()
-    if (!submitResult.success) {
-      bridgeDebug('[Bridge] [3/4] submit failed, retrying once...')
-      await sleep(500)
-      submitResult = submit()
-    }
-    bridgeDebug('[Bridge] [3/4] submit result:', JSON.stringify(submitResult))
-
-    // Step 4: Return summary
-    bridgeDebug('[Bridge] [4/4] done')
     return {
-      success: insertResult.success && submitResult.success,
-      clearSuccess: !!clearResult.success,
-      insertSuccess: !!insertResult.success,
-      submitSuccess: !!submitResult.success,
-      insertMethod: insertResult.method,
-      submitMethod: submitResult.method || '',
-      insertStrategy: insertResult.strategy,
-      submitButtonText: submitResult.buttonText,
-      insertError: insertResult.success ? '' : insertResult.method,
-      submitError: submitResult.error || '',
+      success: false,
+      error: 'FLOW_ADMISSION_REQUIRED',
+      statusReason: 'Use the extension RUN_FLOW_PROMPT route; MAIN-world direct submit is disabled',
+      promptLength: prompt.length,
     }
   }
 
-  bridgeLog('[Bridge] debugRunFlowPrompt exposed on window')
+  bridgeLog('[Bridge] debugRunFlowPrompt direct submit disabled; use background admission route')
 
   // ── Bridge API object (accessible from content script via postMessage) ─────────
 
   ;(window as Record<string, unknown>).__FLOW_BRIDGE__ = {
     clear: clearEditor,
     insertText: insertText,
-    submit: submit,
+    submit: function () { return { success: false, method: null, buttonText: '', error: 'FLOW_ADMISSION_REQUIRED' } },
     verify: verifyEditor,
-    submitGoogleFlow: submitGoogleFlow,
-    submitGoogleFlowButtonOnly: submitGoogleFlowButtonOnly,
+    submitGoogleFlow: async function () { return { ok: false, reason: 'FLOW_ADMISSION_REQUIRED', method: 'blocked-direct-submit' } },
+    submitGoogleFlowButtonOnly: function () { return { success: false, method: 'blocked-direct-submit', error: 'FLOW_ADMISSION_REQUIRED' } },
     insertGoogleFlowPromptOnly: insertGoogleFlowPromptOnly,
     findGoogleFlowEditor: findGoogleFlowEditor,
     findGoogleFlowCreateButton: findGoogleFlowCreateButton,
-    debugRunFlowPrompt: (window as Record<string, unknown>).debugRunFlowPrompt as typeof debugRunFlowPrompt,
+    debugRunFlowPrompt: (window as Record<string, unknown>).debugRunFlowPrompt as (prompt: string) => Promise<Record<string, unknown>>,
   }
   ;(window as Record<string, unknown>).__FLOW_SLATE_BRIDGE_READY__ = true
   bridgeLog('[Bridge] __FLOW_BRIDGE__ exposed, __FLOW_SLATE_BRIDGE_READY__ = true')
@@ -3064,12 +3027,20 @@
       postResult(rid, { pong: true, ready: true, url: window.location.href })
 
     } else if (action === 'submit') {
+      if (!safeText(d.jobId)) {
+        postResult(rid, { success: false, method: null, buttonText: '', error: 'FLOW_ADMISSION_REQUIRED' })
+        return
+      }
       bridgeLog('[Bridge] === SUBMIT START ===')
       var submitResult = submit()
       bridgeLog('[Bridge] === SUBMIT END, success=' + submitResult.success + ' method=' + submitResult.method + ' ===')
       postResult(rid, submitResult)
 
     } else if (action === 'submitGoogleFlow') {
+      if (!safeText(d.jobId)) {
+        postResult(rid, { success: false, method: 'blocked-direct-submit', error: 'FLOW_ADMISSION_REQUIRED', buttonText: '' })
+        return
+      }
       // DOM-first submit path for the current Google Flow composer.
       // Used when the Slate editor object is not reachable via React
       // fiber. See submitGoogleFlow() + insertGoogleFlowPrompt() in
@@ -3128,6 +3099,10 @@
       })()
 
     } else if (action === 'submitGoogleFlowButtonOnly') {
+      if (!safeText(d.jobId)) {
+        postResult(rid, { success: false, method: 'blocked-direct-submit', error: 'FLOW_ADMISSION_REQUIRED', buttonText: '' })
+        return
+      }
       // Click-only DOM fallback. Used when the standard `submit` Slate
       // path fails. The prompt is assumed to already be inserted.
       bridgeLog('[Bridge] === SUBMIT GOOGLE FLOW BUTTON START ===')
@@ -3201,10 +3176,20 @@
         status: string
         failedFirstSeenAt?: number
         statusReason?: string
+        errorCode?: string
+        evidence?: Array<Record<string, unknown>>
         textPreview?: string
         iconTexts?: string[]
         buttonTexts?: string[]
         className?: string
+        hasVideo?: boolean
+        hasImg?: boolean
+        videoSrc?: string
+        videoCurrentSrc?: string
+        videoPoster?: string
+        imgSrc?: string
+        imgAlt?: string
+        mediaReadyReason?: string
       }> = []
       for (var si = 0; si < rawTiles.length; si++) {
         snapIds.push(rawTiles[si].id)
@@ -3215,6 +3200,8 @@
           status: rawTiles[si].status,
           failedFirstSeenAt: rawTiles[si].failedFirstSeenAt || 0,
           statusReason: rawTiles[si].statusReason || '',
+          errorCode: rawTiles[si].errorCode || '',
+          evidence: rawTiles[si].evidence || [],
           textPreview: rawTiles[si].textPreview || '',
           iconTexts: rawTiles[si].iconTexts || [],
           buttonTexts: rawTiles[si].buttonTexts || [],
@@ -3238,6 +3225,9 @@
         counts: getTileCounts(rawTiles),
         rawCount: snapIds.length, // already unique after scanTiles dedupe
       })
+
+    } else if (action === 'getAdmissionHealth') {
+      postResult(rid, getFlowAdmissionHealth())
 
     } else if (action === 'startTileMonitor') {
       var intervalMs = (d.intervalMs as number) || 1000
@@ -5880,6 +5870,8 @@
     failedFirstSeenAt?: number
     // Diagnostic: which detection rule matched for the current status.
     statusReason?: string
+    errorCode?: string
+    evidence?: Array<Record<string, unknown>>
     // Rich diagnostics for PENDING_SIGNAL_DEBUG.
     textPreview?: string       // tile.textContent.slice(0, 300)
     iconTexts?: string[]       // visible icon texts: ["warning", "refresh", ...]
@@ -5901,21 +5893,10 @@
   var _knownTileIds = new Set<string>()
   var _tileMonitorCallback: ((tiles: Tile[]) => void) | null = null
 
-  // Dedupe tile snapshots by identity (fileName > id). Used because Flow
-  // often paints each tile as multiple nested DOM nodes that all match the
-  // broad selectors below.
+  // Dedupe nested DOM observations by composite identity. Different IDs are
+  // never collapsed solely because Flow reused a filename.
   function dedupeTilesByIdentity(tileList): any[] {
-    var seen = new Set<string>()
-    var out: any[] = []
-    for (var di = 0; di < tileList.length; di++) {
-      var t = tileList[di]
-      var key = (t.fileName && t.fileName.length > 0 ? t.fileName : '') || (t.id || '')
-      if (!key) continue
-      if (seen.has(key)) continue
-      seen.add(key)
-      out.push(t)
-    }
-    return out
+    return dedupeFlowTileObservations(tileList || [])
   }
 
   // Detect the status of a tile using priority order:
@@ -5933,6 +5914,8 @@
     reason: string
     iconTexts: string[]
     buttonTexts: string[]
+    errorCode?: string
+    evidence?: Array<Record<string, unknown>>
   } {
     var iconTexts: string[] = []
     var buttonTexts: string[] = []
@@ -5985,6 +5968,27 @@
     } catch (_) {}
 
     // ── C. WARNING ICON VISIBLE ───────────────────────────────────────────────
+    // Account/session/rate evidence is stronger than a generic warning icon.
+    // Evaluate only those specific classes here; ordinary generation failure
+    // still follows the established warning/text/retry priority below.
+    var accountTextClassification = classifyFlowErrorText((tileEl.textContent || '').toLowerCase())
+    if (accountTextClassification && accountTextClassification.errorCode !== 'generation_failed') {
+      return {
+        status: 'failed',
+        reason: accountTextClassification.statusReason,
+        iconTexts: iconTexts,
+        buttonTexts: buttonTexts,
+        errorCode: accountTextClassification.errorCode,
+        evidence: [{
+          source: 'dom',
+          detectedAt: Date.now(),
+          confidence: accountTextClassification.confidence,
+          statusReason: accountTextClassification.statusReason,
+          matchedText: accountTextClassification.matchedText,
+        }],
+      }
+    }
+
     // Match: text === "warning" / includes "warning" / aria-label contains warning /
     // icon inside a visible failed card.  Strict visibility check:
     // - icon display != none, visibility != hidden, opacity != 0
@@ -6058,6 +6062,23 @@
     // with an explicit failure phrase — the help link can appear elsewhere on
     // Flow's UI and would otherwise false-positive.
     var tileText = (tileEl.textContent || '').toLowerCase()
+    var textClassification = classifyFlowErrorText(tileText)
+    if (textClassification) {
+      return {
+        status: 'failed',
+        reason: textClassification.statusReason,
+        iconTexts: iconTexts,
+        buttonTexts: buttonTexts,
+        errorCode: textClassification.errorCode,
+        evidence: [{
+          source: 'dom',
+          detectedAt: Date.now(),
+          confidence: textClassification.confidence,
+          statusReason: textClassification.statusReason,
+          matchedText: textClassification.matchedText,
+        }],
+      }
+    }
     var hasExplicitFailurePhrase =
       tileText.includes('không thành công') ||
       tileText.includes('chúng tôi nhận thấy') ||
@@ -6243,6 +6264,8 @@
         var statusReason = detectResult.reason
         var tileIconTexts = detectResult.iconTexts
         var tileButtonTexts = detectResult.buttonTexts
+        var tileErrorCode = detectResult.errorCode || ''
+        var tileEvidence = detectResult.evidence || []
 
         // Extract textPreview and className for PENDING_SIGNAL_DEBUG.
         var textPreview = ''
@@ -6324,6 +6347,8 @@
             createdAt: 0,
             failedFirstSeenAt: _failedFirstSeenAtByTile[uniqueId] || 0,
             statusReason: statusReason,
+            errorCode: tileErrorCode,
+            evidence: tileEvidence,
             // Rich diagnostic fields.
             textPreview: textPreview,
             iconTexts: tileIconTexts,
@@ -6407,6 +6432,77 @@
       else if (t.status === 'failed') counts.failed++
     })
     return counts
+  }
+
+  // Non-generating health probe used by the background admission gate.
+  // It never inserts text, clicks Generate, reads cookies, or calls a Flow API.
+  function getFlowAdmissionHealth(): Record<string, unknown> {
+    var tiles = scanTiles()
+    var counts = getTileCounts(tiles)
+    var composer = findEditorElement() || findGoogleFlowEditor()
+    var pageText = ''
+    try { pageText = (document.body?.innerText || document.body?.textContent || '').slice(0, 200000) } catch (_) {}
+    var pageClassification = classifyFlowErrorText(pageText)
+    // Old failed tiles may remain in the gallery. Only provider-wide account,
+    // session, and rate warnings are blockers at admission time.
+    if (pageClassification?.errorCode === 'generation_failed') pageClassification = null
+
+    var blockingDialog = false
+    var blockingSelector = ''
+    try {
+      var dialogSelectors = ['[role="dialog"]', '[aria-modal="true"]']
+      for (var dsi = 0; dsi < dialogSelectors.length && !blockingDialog; dsi++) {
+        var dialogs = Array.from(document.querySelectorAll(dialogSelectors[dsi])) as HTMLElement[]
+        for (var di = 0; di < dialogs.length; di++) {
+          if (isVisible(dialogs[di])) {
+            blockingDialog = true
+            blockingSelector = dialogSelectors[dsi]
+            break
+          }
+        }
+      }
+    } catch (_) {}
+
+    var errorCode = pageClassification?.errorCode || ''
+    var statusReason = pageClassification?.statusReason || ''
+    var evidence: Array<Record<string, unknown>> = []
+    if (pageClassification) {
+      evidence.push({
+        source: 'dom',
+        detectedAt: Date.now(),
+        confidence: pageClassification.confidence,
+        statusReason: pageClassification.statusReason,
+        matchedText: pageClassification.matchedText,
+      })
+    } else if (!composer) {
+      errorCode = 'composer_missing'
+      statusReason = 'flow_composer_not_found'
+      evidence.push({ source: 'dom', detectedAt: Date.now(), confidence: 'high', statusReason: statusReason })
+    } else if (blockingDialog) {
+      errorCode = 'flow_busy'
+      statusReason = 'blocking_dialog_visible'
+      evidence.push({ source: 'dom', detectedAt: Date.now(), confidence: 'high', statusReason: statusReason, selector: blockingSelector })
+    } else if (counts.generating > 0) {
+      errorCode = 'flow_busy'
+      statusReason = 'provider_has_generating_tiles'
+      evidence.push({ source: 'dom', detectedAt: Date.now(), confidence: 'high', statusReason: statusReason })
+    }
+
+    return {
+      success: true,
+      healthy: !errorCode,
+      bridgeReady: true,
+      composerPresent: !!composer,
+      processing: counts.generating,
+      pending: 0,
+      generating: counts.generating,
+      counts: counts,
+      blockingDialog: blockingDialog,
+      errorCode: errorCode || undefined,
+      statusReason: statusReason || 'flow_provider_idle',
+      evidence: evidence,
+      url: window.location.href,
+    }
   }
 
   ;(window as Record<string, unknown>).__flowGetTiles = function (): Tile[] {
@@ -7266,26 +7362,14 @@
   }
 
   ;(window as Record<string, unknown>).__flowTestSubmit = function () {
-    bridgeDebug('[Bridge] __flowTestSubmit()')
-    var result = submit()
-    bridgeDebug('[Bridge] __flowTestSubmit result:', JSON.stringify(result, null, 2))
-    return result
+    return { success: false, method: null, buttonText: '', error: 'FLOW_ADMISSION_REQUIRED' }
   }
 
   // Manual test helper for the DOM-first Google Flow submit path.
   // Usage from the Flow page console:
   //   window.__flowTestSubmitGoogleFlow('rô bot chiến đấu')
   ;(window as Record<string, unknown>).__flowTestSubmitGoogleFlow = async function (text?: string) {
-    var promptText = text || 'rô bot chiến đấu'
-    bridgeLog('[Bridge] __flowTestSubmitGoogleFlow()', JSON.stringify({ text: promptText }))
-    try {
-      var result = await submitGoogleFlow(promptText)
-      bridgeLog('[Bridge] __flowTestSubmitGoogleFlow result:', JSON.stringify(result))
-      return result
-    } catch (err) {
-      bridgeError('[Bridge] __flowTestSubmitGoogleFlow error:', (err as Error)?.message || String(err))
-      return { ok: false, reason: 'EXCEPTION', error: (err as Error)?.message || String(err) }
-    }
+    return { ok: false, reason: 'FLOW_ADMISSION_REQUIRED', promptLength: (text || '').length }
   }
 
   bridgeLog('[Bridge] Flow Slate Bridge loaded (MAIN world, deepScan + DOM fallback + submit + tileMonitor)')
