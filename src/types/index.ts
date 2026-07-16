@@ -264,6 +264,7 @@ export interface AppSettings {
   defaultAspectRatio?: string
   promptAssistantMode: 'tab' | 'api'
   flowRuntimeDiagnosticsEnabled: boolean
+  showFlowUtilityPanels: boolean
   apiProvider: {
     enabled: boolean
     endpoint: string

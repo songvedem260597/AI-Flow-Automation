@@ -24,6 +24,8 @@ Trong màn hình **Google Flow**, nhìn các vị trí sau:
 3. Khung màu vàng phía trên nút Generate: xuất hiện khi ứng dụng đang chặn tác vụ mới để tránh tạo trùng.
 4. **Runtime Verification**: chỉ dùng để kiểm tra chi tiết hoặc xuất báo cáo khi cần hỗ trợ.
 
+Nếu không thấy hai khối này, mở tab **Settings** → phần **Google Flow** → bật **Show Recovery & Verification**.
+
 ## Cách xử lý nhanh nhất
 
 Làm lần lượt, không bấm nhiều nút cùng lúc:

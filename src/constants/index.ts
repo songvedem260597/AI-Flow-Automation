@@ -44,6 +44,7 @@ export const DEFAULT_SETTINGS = {
   defaultProvider: 'chatgpt' as const,
   promptAssistantMode: 'tab' as const,
   flowRuntimeDiagnosticsEnabled: false,
+  showFlowUtilityPanels: true,
   apiProvider: {
     enabled: false,
     endpoint: 'http://localhost:20128/v1',

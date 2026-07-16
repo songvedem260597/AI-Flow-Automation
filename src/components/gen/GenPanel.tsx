@@ -1804,6 +1804,7 @@ export const GenPanel: React.FC<{
   const savedPrompts = usePromptStore((s) => s.prompts)
   const activeProvider = activeGenProvider as Provider
   const flowRuntimeDiagnosticsEnabled = useSettingsStore((state) => state.flowRuntimeDiagnosticsEnabled === true)
+  const showFlowUtilityPanels = useSettingsStore((state) => state.showFlowUtilityPanels !== false)
   const updateSettings = useSettingsStore((state) => state.updateSettings)
   const [mode, setMode] = usePersistedState<GenMode>('genpanel.mode', 'image')
   const [imageModel, setImageModel] = usePersistedState<string>('genpanel.imageModel', DEFAULT_FLOW_IMAGE_MODEL)
@@ -3327,7 +3328,7 @@ const handleGenerate = useCallback(async () => {
         </div>
 
         {/* Flow Recovery */}
-        {activeProvider === 'flow' && (
+        {activeProvider === 'flow' && showFlowUtilityPanels && (
           <div className="px-4 pb-3">
             <div className={FLOW_UTILITY_PANEL_CLASS}>
               <div className="flex items-center gap-2">
@@ -3395,7 +3396,7 @@ const handleGenerate = useCallback(async () => {
         )}
 
         {/* Flow Runtime Verification (read-only) */}
-        {activeProvider === 'flow' && (
+        {activeProvider === 'flow' && showFlowUtilityPanels && (
           <div className="px-4 pb-3">
             <div className={FLOW_UTILITY_PANEL_CLASS}>
               <div className="flex items-center gap-2">
