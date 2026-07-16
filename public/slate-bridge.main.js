@@ -2,6 +2,7 @@ import { classifyFlowErrorText } from '../lib/flow/resultContract'
 import {
   classifyFlowAdmissionWarningContexts,
   countFlowTileActivity,
+  isFlowQueueStatusText,
   type FlowWarningContext,
 } from '../lib/flow/healthClassifier'
 import { dedupeFlowTileObservations } from '../lib/flow/tileIdentity'
@@ -122,7 +123,7 @@ type BridgeRuntimeRegistry = {
   // Bump this every time you make a runtime change so the Flow page console
   // verification (window.__FLOW_BRIDGE_BUILD_TIME__) matches the running bundle.
   // 2026-07-10 05:55:00 — added Flow Video input mode (Khung hình / Thành phần).
-  var FLOW_BRIDGE_BUILD_TIME = "2026-07-17 03:43:47"
+  var FLOW_BRIDGE_BUILD_TIME = "2026-07-17 04:20:56"
   bridgeLog('[Bridge] BUILD_TIME ' + FLOW_BRIDGE_BUILD_TIME + ' instance=' + BRIDGE_INSTANCE_ID)
   ;(window as Record<string, unknown>).__FLOW_BRIDGE_BUILD_TIME__ = FLOW_BRIDGE_BUILD_TIME
   bridgeGlobal.__FLOW_BRIDGE_BUILD_MARKER__ = FLOW_BRIDGE_BUILD_MARKER
@@ -6065,6 +6066,22 @@ type BridgeRuntimeRegistry = {
     if (extra.progressPercent > 0) {
       return { status: 'generating', reason: 'progress_percent', iconTexts: [], buttonTexts: [] }
     }
+
+    // Flow can keep a freshly submitted tile in a provider queue before it
+    // starts painting a percentage. Match only exact status-label text from
+    // leaf/status elements so prompt text cannot create a false busy signal.
+    try {
+      var queueStatusEls = tileEl.querySelectorAll('[role="status"], [aria-live], div, span')
+      for (var qsi = 0; qsi < queueStatusEls.length; qsi++) {
+        var queueStatusEl = queueStatusEls[qsi] as HTMLElement
+        var isExplicitStatus = queueStatusEl.getAttribute('role') === 'status' || queueStatusEl.hasAttribute('aria-live')
+        if (!isExplicitStatus && queueStatusEl.childElementCount > 0) continue
+        var queueStatusText = (queueStatusEl.innerText || queueStatusEl.textContent || '').trim()
+        if (isFlowQueueStatusText(queueStatusText)) {
+          return { status: 'unknown', reason: 'queued_pending', iconTexts: [], buttonTexts: [] }
+        }
+      }
+    } catch (_) {}
 
     // Collect all visible icons and buttons for C/D/E below (single DOM pass).
     try {

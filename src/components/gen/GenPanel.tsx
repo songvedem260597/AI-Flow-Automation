@@ -78,6 +78,7 @@ function textToBase64DataUrl(value: string): string {
 function flowRecoveryStatusText(snapshot: FlowRecoverySnapshot | null): string {
   if (!snapshot) return 'Flow recovery status unavailable'
   if (snapshot.persistenceError) return 'Flow recovery persistence unavailable — admission blocked'
+  if (snapshot.lastProbeResult?.overall === 'busy') return 'Flow busy — queued or generating'
   if (snapshot.errorCode === 'submit_uncertain') return 'Flow job status uncertain'
   if (snapshot.state === 'healthy') return 'Flow healthy'
   if (snapshot.state === 'session_suspect') return 'Flow session needs recovery'

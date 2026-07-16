@@ -67,6 +67,16 @@ export interface FlowTileActivityCounts {
   generating: number
 }
 
+export function isFlowQueueStatusText(value: string): boolean {
+  const normalized = String(value || '')
+    .toLocaleLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[.…]+$/g, '')
+    .trim()
+
+  return /^(?:in (?:the )?queue|queued|waiting(?: in (?:the )?queue)?|(?:hiện )?(?:đang )?(?:ở )?trong hàng đợi|(?:hiện )?đang xếp hàng|(?:hiện )?đang chờ)$/.test(normalized)
+}
+
 /** Keeps the three health counters explicit without changing the Tile contract. */
 export function countFlowTileActivity(
   tiles: FlowTileActivityObservation[],

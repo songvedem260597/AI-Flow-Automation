@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   classifyFlowAdmissionWarningContexts,
   countFlowTileActivity,
+  isFlowQueueStatusText,
 } from '../../src/lib/flow/healthClassifier.ts'
 
 test('composer prompt text cannot become an admission warning', () => {
@@ -80,4 +81,12 @@ test('health activity counters preserve processing, pending, and generating', ()
     pending: 1,
     generating: 1,
   })
+})
+
+test('explicit English and Vietnamese queue labels are pending signals', () => {
+  assert.equal(isFlowQueueStatusText('In queue'), true)
+  assert.equal(isFlowQueueStatusText('Waiting in the queue…'), true)
+  assert.equal(isFlowQueueStatusText('Hiện đang trong hàng đợi'), true)
+  assert.equal(isFlowQueueStatusText('Đang chờ'), true)
+  assert.equal(isFlowQueueStatusText('Create a scene about waiting in the queue'), false)
 })

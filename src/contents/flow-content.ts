@@ -1326,6 +1326,8 @@ async function runFlowPrompt(payload: {
     // This prevents lazy-loaded old tiles or mis-identified ref tiles from appearing
     // as "new" results. A result tile must have BOTH a new id AND a new fileName.
     var maxWaitMs = 120000
+    var queuedMaxWaitMs = 600000
+    var queueWaitExtended = false
     var pollIntervalMs = 2000
     var waitedMs = 0
     var newTileIds: string[] = []
@@ -1663,6 +1665,19 @@ async function runFlowPrompt(payload: {
       // Dedupe confirmed by identity — only count UNIQUE generated tiles.
       var uniqueConfirmed = dedupeTilesByIdentity(confirmed)
       var uniquePending = dedupeTilesByIdentity(Object.values(pendingCandidatesById))
+      var hasExplicitQueuedTile = uniquePending.some(function (candidate) {
+        return candidate.statusReason === 'queued_pending'
+      })
+      if (hasExplicitQueuedTile && !queueWaitExtended) {
+        queueWaitExtended = true
+        maxWaitMs = queuedMaxWaitMs
+        console.log('[FlowContent][RESULT_COLLECTION_QUEUE_WAIT_EXTENDED]', JSON.stringify({
+          waitedMs: waitedMs,
+          maxWaitMs: maxWaitMs,
+          pending: uniquePending.length,
+          reason: 'provider_queue_detected_before_progress',
+        }))
+      }
       var uniqueFailed = dedupeTilesByIdentity(failed)
 
       // Progress tracking: update timestamp when confirmed count INCREASES
@@ -3480,7 +3495,10 @@ const flowContentRuntimeMessageListener: Parameters<typeof chrome.runtime.onMess
 
     let responded = false
     let timeoutId: ReturnType<typeof setTimeout> | null = null
-    const responseTimeoutMs = 270000
+    // A Flow video can remain explicitly queued before percentage progress
+    // begins. Keep the response channel alive beyond the queue-aware result
+    // collection deadline, while retaining a finite safety timeout.
+    const responseTimeoutMs = 720000
     const safeRespondOnce = (payload: Record<string, unknown>) => {
       if (responded) return
       responded = true

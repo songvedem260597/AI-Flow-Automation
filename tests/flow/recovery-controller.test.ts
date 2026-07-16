@@ -460,6 +460,32 @@ test('active generation health classifies as busy instead of session suspect', (
   assert.equal(probe.overall, 'busy')
 })
 
+test('busy probe preserves the current recovery state instead of creating a transient failure', async () => {
+  const busyProbe = createFlowHealthProbeResult({
+    checkedAt: 6_001,
+    tabExists: true,
+    routeValid: true,
+    bridgeReady: true,
+    composerReady: true,
+    loginRequired: false,
+    sessionWarning: false,
+    unusualActivityWarning: false,
+    rateLimitWarning: false,
+    blockingDialog: false,
+    activeGenerationCount: 1,
+  })
+  const harness = createController({ probeHealth: async () => busyProbe })
+  await harness.controller.handleFailure({ errorCode: 'rate_limited', jobId: 'job-1', tabId: 7 })
+  harness.setNow(61_001)
+
+  const decision = await harness.controller.getAdmissionDecision()
+  const snapshot = await harness.controller.getSnapshot()
+  assert.equal(decision.allowed, false)
+  assert.equal(snapshot.state, 'rate_limited')
+  assert.equal(snapshot.lastProbeResult?.overall, 'busy')
+  assert.equal(snapshot.terminalDecision, 'health_probe_busy')
+})
+
 test('healthy transient probe reopens recovery only after cooldown expires', async () => {
   const harness = createController()
   await harness.controller.handleFailure({ errorCode: 'generation_failed', jobId: 'job-1', tabId: 7 })

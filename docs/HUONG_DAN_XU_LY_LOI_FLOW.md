@@ -43,6 +43,7 @@ Nếu vẫn không khỏe, xem đúng lỗi trong bảng dưới đây.
 | Dòng bạn nhìn thấy | Nghĩa đơn giản | Bạn nên làm |
 | --- | --- | --- |
 | **Flow healthy** | Flow hoạt động bình thường. | Có thể Generate. |
+| **Flow busy — queued or generating** | Flow đang xếp hàng hoặc đã bắt đầu tạo nội dung. | Chờ tác vụ hiện tại hoàn tất; không Generate thêm. |
 | **Flow transient failure — health check required** | Lỗi tạm thời hoặc ứng dụng chưa kết nối được với Flow. | Mở tab Flow, chờ trang tải xong rồi bấm **Run health probe**. |
 | **Flow session needs recovery** | Phiên đăng nhập Flow có thể đã hết hạn. | Bấm **Open Flow tab**, đăng nhập lại nếu cần, sau đó bấm **Attempt session recovery**. |
 | **Refreshing Flow session** | Ứng dụng đang thử khôi phục phiên Flow. | Chờ hoàn tất, không bấm Generate. |

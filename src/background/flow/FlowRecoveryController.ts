@@ -520,6 +520,29 @@ export class FlowRecoveryController {
     }
     const now = this.now()
     const previousState = this.snapshot.state
+    if (probe.overall === 'busy') {
+      const busy = {
+        ...this.snapshot,
+        recoveryAttemptCount: attempt,
+        lastProbeAt: probe.checkedAt,
+        lastProbeResult: probe,
+        terminalDecision: 'health_probe_busy',
+        probeHistory: [...this.snapshot.probeHistory, { timestamp: probe.checkedAt, overall: probe.overall }].slice(-100),
+        recoveryAttemptHistory: [...this.snapshot.recoveryAttemptHistory, {
+          attempt,
+          timestamp: now,
+          action: 'health_probe' as const,
+          result: probe.overall,
+        }].slice(-100),
+        capturedAt: now,
+      }
+      // Busy/queued is an admission condition, not a recovery failure. Keep
+      // the existing recovery state and let Admission Controller reject any
+      // duplicate submit until the provider becomes idle.
+      await this.commit(busy, [])
+      this.emit('FLOW_RECOVERY_PROBE_RESULT', { incidentId, jobId: this.snapshot.triggeringJobId, attempt, overall: probe.overall })
+      return
+    }
     const nextState: FlowRecoveryState = probe.overall === 'healthy'
       ? 'healthy'
       : probe.overall === 'rate_limited'
