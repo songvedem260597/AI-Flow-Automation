@@ -66,6 +66,13 @@ const flush = async () => {
   await Promise.resolve()
 }
 
+const waitForCondition = async (condition: () => boolean) => {
+  for (let attempt = 0; attempt < 20 && !condition(); attempt += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve))
+  }
+  assert.equal(condition(), true)
+}
+
 test('injected RNG samples deterministic inclusive pacing bounds', () => {
   const range = { minMs: 300, maxMs: 900 }
   assert.equal(sampleFlowSubmissionPacingDelay(range, () => 0), 300)
@@ -262,9 +269,155 @@ test('cancelling the between-job wait clears its timer before the next job', asy
   assert.equal((await controller.getSnapshot()).activeJob?.jobId, next.job?.jobId)
 })
 
+test('provider queue and percentage activity wait until idle before first submit', async () => {
+  const timer = new FakePacingTimer()
+  let probeCount = 0
+  const waitLogs: Array<Record<string, unknown>> = []
+  const controller = new FlowAdmissionController({
+    now: () => timer.now,
+    createJobId: () => 'provider-idle-job',
+    pacingTimer: timer,
+    minimumCooldownMs: 0,
+    providerBusyWaitTimeoutMs: 5_000,
+    providerBusyPollIntervalMs: 1_000,
+    log(event, payload) {
+      if (event === 'FLOW_ADMISSION_WAITING_PROVIDER') waitLogs.push(payload)
+    },
+  })
+  const pending = controller.requestAdmission(
+    { source: 'gen-panel', tabId: 7, mediaType: 'video' },
+    async () => {
+      probeCount += 1
+      if (probeCount === 1) {
+        return {
+          ...healthy(),
+          healthy: false,
+          pending: 1,
+          errorCode: 'flow_busy',
+          statusReason: 'provider_has_pending_tiles',
+        }
+      }
+      if (probeCount === 2) {
+        return {
+          ...healthy(),
+          healthy: false,
+          processing: 1,
+          generating: 1,
+          errorCode: 'flow_busy',
+          statusReason: 'provider_has_generating_tiles',
+        }
+      }
+      return healthy()
+    },
+  )
+
+  await waitForCondition(() => timer.pendingCount === 1)
+  assert.equal(timer.nextDelayMs, 1_000)
+  timer.advanceBy(1_000)
+  await waitForCondition(() => probeCount === 2 && timer.pendingCount === 1)
+  assert.equal(probeCount, 2)
+  assert.equal(timer.nextDelayMs, 1_000)
+  timer.advanceBy(1_000)
+
+  const admitted = await pending
+  assert.equal(admitted.granted, true)
+  assert.equal(probeCount, 3)
+  assert.deepEqual(waitLogs, [{ jobId: 'provider-idle-job', durationMs: 2_000 }])
+  assert.deepEqual(Object.keys(waitLogs[0]).sort(), ['durationMs', 'jobId'])
+})
+
+test('provider-idle wait times out without submitting or leaving a timer', async () => {
+  const timer = new FakePacingTimer()
+  const controller = new FlowAdmissionController({
+    now: () => timer.now,
+    createJobId: () => 'provider-idle-timeout',
+    pacingTimer: timer,
+    minimumCooldownMs: 0,
+    providerBusyWaitTimeoutMs: 2_000,
+    providerBusyPollIntervalMs: 1_000,
+  })
+  const pending = controller.requestAdmission(
+    { source: 'gen-panel', tabId: 7, mediaType: 'video' },
+    async () => ({
+      ...healthy(),
+      healthy: false,
+      generating: 1,
+      errorCode: 'flow_busy',
+      statusReason: 'provider_has_generating_tiles',
+    }),
+  )
+
+  await waitForCondition(() => timer.pendingCount === 1)
+  timer.advanceBy(1_000)
+  await waitForCondition(() => timer.pendingCount === 1)
+  timer.advanceBy(1_000)
+  const result = await pending
+
+  assert.equal(result.granted, false)
+  assert.equal(result.errorCode, 'flow_busy')
+  assert.equal(timer.pendingCount, 0)
+})
+
+test('cancelling provider-idle wait clears its timer and never submits', async () => {
+  const timer = new FakePacingTimer()
+  const controller = new FlowAdmissionController({
+    now: () => timer.now,
+    createJobId: () => 'provider-idle-cancel',
+    pacingTimer: timer,
+    minimumCooldownMs: 0,
+    providerBusyWaitTimeoutMs: 5_000,
+    providerBusyPollIntervalMs: 1_000,
+  })
+  const pending = controller.requestAdmission(
+    { source: 'gen-panel', callerId: 'cancel-provider-wait', tabId: 7, mediaType: 'image' },
+    async () => ({
+      ...healthy(),
+      healthy: false,
+      generating: 1,
+      errorCode: 'flow_busy',
+      statusReason: 'provider_has_generating_tiles',
+    }),
+  )
+
+  await waitForCondition(() => timer.pendingCount === 1)
+  assert.equal(timer.pendingCount, 1)
+  const cancelled = await controller.requestCancellation({ callerId: 'cancel-provider-wait' })
+  const result = await pending
+  assert.equal(cancelled.accepted, true)
+  assert.equal(result.granted, false)
+  assert.equal(result.errorCode, 'cancelled')
+  assert.equal(timer.pendingCount, 0)
+})
+
+test('recovery failures bypass provider-idle waiting', async () => {
+  const timer = new FakePacingTimer()
+  const controller = new FlowAdmissionController({
+    now: () => timer.now,
+    createJobId: () => 'provider-recovery',
+    pacingTimer: timer,
+    minimumCooldownMs: 0,
+    providerBusyWaitTimeoutMs: 5_000,
+    providerBusyPollIntervalMs: 1_000,
+  })
+  const result = await controller.requestAdmission(
+    { source: 'gen-panel', tabId: 7, mediaType: 'image' },
+    async () => ({
+      ...healthy(),
+      healthy: false,
+      errorCode: 'rate_limited',
+      statusReason: 'provider_rate_limited',
+    }),
+  )
+
+  assert.equal(result.granted, false)
+  assert.equal(result.errorCode, 'rate_limited')
+  assert.equal(timer.pendingCount, 0)
+})
+
 test('content requests controller permits in verify-before-click order', () => {
   const content = readFileSync('src/contents/flow-content.ts', 'utf8')
   const background = readFileSync('src/background/index.ts', 'utf8')
+  const genPanel = readFileSync('src/components/gen/GenPanel.tsx', 'utf8')
 
   const insertPermit = content.indexOf('const insertPacing = await requestFlowSubmissionPacing(')
   const insertCall = content.indexOf("bridgeCall('insert'", insertPermit)
@@ -279,6 +432,9 @@ test('content requests controller permits in verify-before-click order', () => {
   assert.ok(submitCall > submitPermit)
   assert.match(background, /case 'FLOW_REQUEST_SUBMISSION_PACING':[\s\S]*handleFlowSubmissionPacing/)
   assert.match(background, /flowAdmissionController\.waitForSubmissionPacing\(jobId, phase\)/)
+  assert.match(background, /providerBusyWaitTimeoutMs:\s*30_000/)
+  assert.match(genPanel, /persistResolvedFlowReferences\(selectedRefImages, resolved\.resolvedRefImages\)/)
+  assert.doesNotMatch(genPanel, /console\.warn\('\[FlowAdmission\]\[GenPanelResult\]'/)
 })
 
 test('recovery or rate-limit cooldown owns the wait without submission pacing', async () => {

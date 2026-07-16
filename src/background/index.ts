@@ -86,6 +86,11 @@ const flowAdmissionController = new FlowAdmissionController({
   // duration and submit permit; content never samples timing independently.
   minimumCooldownMs: 0,
   submissionPacing: DEFAULT_FLOW_SUBMISSION_PACING,
+  // A provider tile can move from queue -> percentage -> done while a new
+  // request is waiting. Hold the first submit permit briefly instead of
+  // returning a transient flow_busy result to GenPanel.
+  providerBusyWaitTimeoutMs: 30_000,
+  providerBusyPollIntervalMs: 1_000,
   recoveryOwnsBlockingFailures: true,
   recoveryGate: async () => flowRecoveryController.getAdmissionDecision(),
   storage: {

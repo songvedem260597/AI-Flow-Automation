@@ -32,6 +32,7 @@ export type FlowAdmissionLogEvent =
   | 'FLOW_ADMISSION_TRANSITION_REJECTED'
   | 'FLOW_ADMISSION_MANUAL_RESET'
   | 'FLOW_ADMISSION_PERSISTENCE_FAILED'
+  | 'FLOW_ADMISSION_WAITING_PROVIDER'
   | 'FLOW_PACING_BEFORE_INSERT'
   | 'FLOW_PACING_BEFORE_SUBMIT'
   | 'FLOW_PACING_BETWEEN_JOBS'
@@ -86,6 +87,8 @@ export interface FlowAdmissionControllerOptions {
   submissionPacing?: FlowSubmissionPacingOptions
   random?: () => number
   pacingTimer?: FlowPacingTimerAdapter
+  providerBusyWaitTimeoutMs?: number
+  providerBusyPollIntervalMs?: number
 }
 
 const GLOBAL_SCOPE = 'google-flow-global' as const
@@ -121,6 +124,8 @@ export class FlowAdmissionController {
   private readonly submissionPacing: FlowSubmissionPacingConfig
   private readonly random: () => number
   private readonly pacingTimer?: FlowPacingTimerAdapter
+  private readonly providerBusyWaitTimeoutMs: number
+  private readonly providerBusyPollIntervalMs: number
   private readonly pacingPhasePromises = new Map<string, Promise<FlowSubmissionPacingDecision>>()
   private readonly completedPacingPhases = new Set<string>()
 
@@ -137,6 +142,8 @@ export class FlowAdmissionController {
     this.submissionPacing = resolveFlowSubmissionPacingConfig(options.submissionPacing)
     this.random = options.random || Math.random
     this.pacingTimer = options.pacingTimer
+    this.providerBusyWaitTimeoutMs = Math.max(0, Math.floor(Number(options.providerBusyWaitTimeoutMs ?? 0)))
+    this.providerBusyPollIntervalMs = Math.max(1, Math.floor(Number(options.providerBusyPollIntervalMs ?? 1_000)))
   }
 
   async requestAdmission(
@@ -274,7 +281,11 @@ export class FlowAdmissionController {
 
       let health: FlowAdmissionHealth
       try {
-        health = await probe(jobAbortController.signal)
+        health = await this.probeUntilProviderIdle(
+          requestedJob,
+          probe,
+          jobAbortController.signal,
+        )
       } catch (error) {
         health = {
           healthy: false,
@@ -660,6 +671,56 @@ export class FlowAdmissionController {
 
   private shouldPaceAutomaticSource(source: string): boolean {
     return this.submissionPacing.enabled && this.submissionPacing.automaticSources.includes(source)
+  }
+
+  private shouldWaitForProviderIdle(health: FlowAdmissionHealth): boolean {
+    return health.healthy !== true
+      && health.errorCode === 'flow_busy'
+      && health.blockingDialog !== true
+      && (health.processing + health.pending + health.generating) > 0
+  }
+
+  private async probeUntilProviderIdle(
+    job: FlowAdmissionJob,
+    probe: (signal: AbortSignal) => Promise<FlowAdmissionHealth>,
+    signal: AbortSignal,
+  ): Promise<FlowAdmissionHealth> {
+    let health = await probe(signal)
+    if (this.providerBusyWaitTimeoutMs <= 0 || !this.shouldWaitForProviderIdle(health)) {
+      return health
+    }
+
+    // This is admission readiness waiting, not an automatic resubmit. The
+    // provider has not been clicked yet and this controller still owns the
+    // only permit that can reach submit.
+    const startedAt = this.now()
+    const deadline = startedAt + this.providerBusyWaitTimeoutMs
+    try {
+      while (this.shouldWaitForProviderIdle(health) && this.now() < deadline) {
+        const durationMs = Math.min(
+          this.providerBusyPollIntervalMs,
+          Math.max(0, deadline - this.now()),
+        )
+        if (durationMs <= 0) break
+        await waitForFlowSubmissionPacingDelay(durationMs, signal, this.pacingTimer)
+        if (
+          signal.aborted
+          || this.activeJob?.jobId !== job.jobId
+          || this.activeJob.state !== 'checking'
+        ) {
+          const error = new Error('stale_provider_idle_wait_ignored')
+          error.name = 'AbortError'
+          throw error
+        }
+        health = await probe(signal)
+      }
+      return health
+    } finally {
+      const durationMs = Math.max(0, this.now() - startedAt)
+      if (durationMs > 0) {
+        this.emitPacing('FLOW_ADMISSION_WAITING_PROVIDER', job.jobId, durationMs)
+      }
+    }
   }
 
   private resolvePostJobCooldownMs(job: FlowAdmissionJob, errorCode?: FlowErrorCode): number {

@@ -2309,6 +2309,27 @@ export const GenPanel: React.FC<{
     return { resolvedRefImages, resolvedFileIds, resolvedFileNameMap }
   }
 
+  function persistResolvedFlowReferences(
+    originalRefs: RefImage[],
+    resolvedRefs: RefImage[],
+  ): void {
+    const replacements = new Map<string, RefImage>()
+    originalRefs.forEach((ref, index) => {
+      const resolved = resolvedRefs[index]
+      if (resolved && ref.id.startsWith('upload_')) replacements.set(ref.id, resolved)
+    })
+    if (replacements.size === 0) return
+
+    // owner: google-flow — keep successful upload resolution across an
+    // admission wait/denial so retry never uploads the same reference twice.
+    setRefImages((current) => current.map((ref) => replacements.get(ref.id) || ref))
+    setPendingUploads((current) => {
+      const next = { ...current }
+      replacements.forEach((_, uploadKey) => { delete next[uploadKey] })
+      return next
+    })
+  }
+
   const handleFileSelect = useCallback((files: FileList | null) => {
     if (!files) return
     const imageFiles = Array.from(files).filter(f => f.type.startsWith('image/'))
@@ -2624,6 +2645,7 @@ const runPromptQueue = useCallback(async (
       const resolved = await resolveReferenceImagesBeforeRun(queueRefImages, pendingUploads)
       resolvedRefImages = resolved.resolvedRefImages
       resolvedFileNameMap = resolved.resolvedFileNameMap
+      persistResolvedFlowReferences(queueRefImages, resolved.resolvedRefImages)
     }
 
     // ── Sequential loop ───────────────────────────────────────────────────────
@@ -2923,13 +2945,14 @@ const handleGenerate = useCallback(async () => {
         resolvedRefImages = resolved.resolvedRefImages
         resolvedFileIds = resolved.resolvedFileIds
         resolvedFileNameMap = resolved.resolvedFileNameMap
+        persistResolvedFlowReferences(selectedRefImages, resolved.resolvedRefImages)
       }
 
       // Build base payload with resolved ref data (no upload_xxx, no File objects)
       const payload = buildGenerationPayload(resolvedRefImages, resolvedFileIds, resolvedFileNameMap)
 
       // Build payload throws REF_UPLOAD_NOT_RESOLVED if any upload_xxx slips through
-      setFlowStep('Sending prompt to Flow...')
+      setFlowStep('Waiting for Flow to be ready...')
       const result = await runFlowGeneration(payload)
 
       if (result.success) {
@@ -2980,11 +3003,20 @@ const handleGenerate = useCallback(async () => {
         const failed = expected - downloaded
         const statusReason = String(result.statusReason || result.error || result.status || '')
         const errorCode = String(result.errorCode || '')
+        const providerBusy = errorCode === 'flow_busy'
+          && (statusReason === 'provider_has_pending_tiles' || statusReason === 'provider_has_generating_tiles')
+        const providerBusyMessage = selectedRefImages.length > 0
+          ? 'Flow is still processing another job. Your reference image is ready; wait for the queued/% tile to finish, then press Generate again.'
+          : 'Flow is still processing another job. Wait for the queued/% tile to finish, then press Generate again.'
         setFlowStep(downloaded > 0
           ? `Partial success: downloaded ${downloaded}${failed > 0 ? `, ${failed} failed in Flow` : ''}`
-          : `${errorCode ? `${errorCode}: ` : ''}${statusReason || `Flow partial: ${expected} expected, downloaded 0`}`
+          : providerBusy
+            ? providerBusyMessage
+            : `${errorCode ? `${errorCode}: ` : ''}${statusReason || `Flow partial: ${expected} expected, downloaded 0`}`
         )
-        console.warn('[FlowAdmission][GenPanelResult]', JSON.stringify({
+        // A handled admission denial is UI state, not an extension runtime
+        // warning. console.warn makes Chrome list it under extension Errors.
+        console.log('[FlowAdmission][GenPanelResult]', JSON.stringify({
           jobId: result.jobId || '',
           success: false,
           errorCode,
