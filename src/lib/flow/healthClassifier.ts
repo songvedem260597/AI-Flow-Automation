@@ -60,6 +60,7 @@ export interface FlowTileActivityObservation {
   progress?: number
   statusReason?: string
   visible?: boolean
+  providerIdentity?: boolean
 }
 
 export interface FlowTileActivityCounts {
@@ -90,6 +91,9 @@ export function countFlowTileActivity(
     // Flow retains stale/virtualized cards in the DOM after their visible UI
     // is gone. Their old percentage/queue labels are not provider activity.
     if (tile.visible === false) continue
+    // Admission must fail closed on real Flow jobs, not on broad fallback
+    // wrappers synthesized by scanTiles for result-detection compatibility.
+    if (tile.providerIdentity === false) continue
     const status = String(tile.status || '').toLocaleLowerCase()
     const reason = String(tile.statusReason || '').toLocaleLowerCase()
     const progress = Number(tile.progress || 0)

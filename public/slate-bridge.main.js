@@ -123,7 +123,7 @@ type BridgeRuntimeRegistry = {
   // Bump this every time you make a runtime change so the Flow page console
   // verification (window.__FLOW_BRIDGE_BUILD_TIME__) matches the running bundle.
   // 2026-07-10 05:55:00 — added Flow Video input mode (Khung hình / Thành phần).
-  var FLOW_BRIDGE_BUILD_TIME = "2026-07-17 05:31:55"
+  var FLOW_BRIDGE_BUILD_TIME = "2026-07-17 05:45:28"
   bridgeLog('[Bridge] BUILD_TIME ' + FLOW_BRIDGE_BUILD_TIME + ' instance=' + BRIDGE_INSTANCE_ID)
   ;(window as Record<string, unknown>).__FLOW_BRIDGE_BUILD_TIME__ = FLOW_BRIDGE_BUILD_TIME
   bridgeGlobal.__FLOW_BRIDGE_BUILD_MARKER__ = FLOW_BRIDGE_BUILD_MARKER
@@ -6019,6 +6019,7 @@ type BridgeRuntimeRegistry = {
     mediaReadyReason?: string // which signal made the tile media-ready
     rect?: { top: number; bottom: number; left: number; right: number }
     visible?: boolean
+    providerIdentity?: boolean
   }
 
   var _tileMonitorInterval: ReturnType<typeof setInterval> | null = null
@@ -6315,20 +6316,32 @@ type BridgeRuntimeRegistry = {
     try {
       // Find all tile containers — try multiple selectors
       var containers = document.querySelectorAll(
-        '[data-tile-id], [class*="tile"], [class*="result"], [class*="generation"]'
+        '[data-tile-id], [data-gen-tile], [class*="tile"], [class*="result"], [class*="generation"]'
       )
 
       // Track containers already processed so a nested element with both
       // [data-tile-id] and [class*="tile"] does not emit twice.
       var processedElements = new Set<HTMLElement>()
       // Track first-occurrence DOM order so dedupe preserves order
-      var orderedUnique: Array<{ el: HTMLElement; id: string }> = []
+      var orderedUnique: Array<{ el: HTMLElement; id: string; providerIdentity: boolean }> = []
       var seenIds = new Set<string>()
       var rawCount = 0
 
       containers.forEach(function (container) {
         rawCount++
         var el = container as HTMLElement
+
+        var id = ''
+        try {
+          id = el.dataset.tileId || el.dataset.genTile || ''
+        } catch (_) {}
+        var providerIdentity = id.length > 0
+        // Broad class selectors can match a visible grid/wrapper around
+        // real [data-tile-id] cards. Treating that wrapper as a synthetic
+        // tile lets one descendant percentage poison admission health.
+        // Skip it before registering processedElements so its real child
+        // cards are still visited below.
+        if (!id && el.querySelector('[data-tile-id], [data-gen-tile]')) return
 
         // Find the outermost ancestor that already matches our tile selectors.
         // If `el` is nested inside an already-seen tile ancestor, skip.
@@ -6344,11 +6357,6 @@ type BridgeRuntimeRegistry = {
         if (nestedInKnownTile) return
         processedElements.add(el)
 
-        var id = ''
-        try {
-          id = el.dataset.tileId || el.dataset.genTile || ''
-        } catch (_) {}
-
         if (!id) {
           try {
             var path = window.location.pathname
@@ -6362,13 +6370,14 @@ type BridgeRuntimeRegistry = {
 
         if (seenIds.has(id)) return
         seenIds.add(id)
-        orderedUnique.push({ el: el, id: id })
+        orderedUnique.push({ el: el, id: id, providerIdentity: providerIdentity })
       })
 
       // Now process each unique element exactly once
       for (var uoi = 0; uoi < orderedUnique.length; uoi++) {
         var uniqueEl = orderedUnique[uoi].el
         var uniqueId = orderedUnique[uoi].id
+        var providerIdentity = orderedUnique[uoi].providerIdentity
 
         // Extract media + progress context before calling detectTileStatus.
         // These are used both for success detection and for the
@@ -6515,6 +6524,7 @@ type BridgeRuntimeRegistry = {
             imgAlt: imgAlt,
             mediaReadyReason: mediaReadyReason,
             visible: isVisible(uniqueEl),
+            providerIdentity: providerIdentity,
             rect: {
               top: Math.round(tileRect.top),
               bottom: Math.round(tileRect.bottom),

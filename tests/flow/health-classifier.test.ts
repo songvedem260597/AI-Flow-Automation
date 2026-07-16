@@ -95,6 +95,18 @@ test('hidden stale activity signals do not block Flow admission', () => {
   })
 })
 
+test('synthetic fallback wrappers do not block Flow admission', () => {
+  assert.deepEqual(countFlowTileActivity([
+    { status: 'generating', progress: 71, statusReason: 'progress_percent', visible: true, providerIdentity: false },
+    { status: 'unknown', progress: 0, statusReason: 'queued_pending', visible: true, providerIdentity: false },
+    { status: 'generating', progress: 9, statusReason: 'progress_percent', visible: true, providerIdentity: true },
+  ]), {
+    processing: 1,
+    pending: 0,
+    generating: 1,
+  })
+})
+
 test('explicit English and Vietnamese queue labels are pending signals', () => {
   assert.equal(isFlowQueueStatusText('In queue'), true)
   assert.equal(isFlowQueueStatusText('Waiting in the queue…'), true)
