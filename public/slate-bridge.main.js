@@ -123,7 +123,7 @@ type BridgeRuntimeRegistry = {
   // Bump this every time you make a runtime change so the Flow page console
   // verification (window.__FLOW_BRIDGE_BUILD_TIME__) matches the running bundle.
   // 2026-07-10 05:55:00 — added Flow Video input mode (Khung hình / Thành phần).
-  var FLOW_BRIDGE_BUILD_TIME = "2026-07-17 04:20:56"
+  var FLOW_BRIDGE_BUILD_TIME = "2026-07-17 05:31:55"
   bridgeLog('[Bridge] BUILD_TIME ' + FLOW_BRIDGE_BUILD_TIME + ' instance=' + BRIDGE_INSTANCE_ID)
   ;(window as Record<string, unknown>).__FLOW_BRIDGE_BUILD_TIME__ = FLOW_BRIDGE_BUILD_TIME
   bridgeGlobal.__FLOW_BRIDGE_BUILD_MARKER__ = FLOW_BRIDGE_BUILD_MARKER
@@ -6018,6 +6018,7 @@ type BridgeRuntimeRegistry = {
     imgAlt?: string           // img.getAttribute('alt')
     mediaReadyReason?: string // which signal made the tile media-ready
     rect?: { top: number; bottom: number; left: number; right: number }
+    visible?: boolean
   }
 
   var _tileMonitorInterval: ReturnType<typeof setInterval> | null = null
@@ -6076,6 +6077,7 @@ type BridgeRuntimeRegistry = {
         var queueStatusEl = queueStatusEls[qsi] as HTMLElement
         var isExplicitStatus = queueStatusEl.getAttribute('role') === 'status' || queueStatusEl.hasAttribute('aria-live')
         if (!isExplicitStatus && queueStatusEl.childElementCount > 0) continue
+        if (!isVisible(queueStatusEl)) continue
         var queueStatusText = (queueStatusEl.innerText || queueStatusEl.textContent || '').trim()
         if (isFlowQueueStatusText(queueStatusText)) {
           return { status: 'unknown', reason: 'queued_pending', iconTexts: [], buttonTexts: [] }
@@ -6394,7 +6396,9 @@ type BridgeRuntimeRegistry = {
           // Extract progress percent: Flow paints "N%" in a leaf div/span.
           var textEls = uniqueEl.querySelectorAll('div, span')
           for (var ppi = 0; ppi < textEls.length; ppi++) {
-            var pt = (textEls[ppi].textContent || '').trim()
+            var progressEl = textEls[ppi] as HTMLElement
+            if (!isVisible(progressEl)) continue
+            var pt = (progressEl.textContent || '').trim()
             if (/^\d{1,3}%$/.test(pt)) {
               progressPercent = parseInt(pt, 10)
               break
@@ -6510,6 +6514,7 @@ type BridgeRuntimeRegistry = {
             imgSrc: imgSrc,
             imgAlt: imgAlt,
             mediaReadyReason: mediaReadyReason,
+            visible: isVisible(uniqueEl),
             rect: {
               top: Math.round(tileRect.top),
               bottom: Math.round(tileRect.bottom),

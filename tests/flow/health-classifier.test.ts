@@ -83,6 +83,18 @@ test('health activity counters preserve processing, pending, and generating', ()
   })
 })
 
+test('hidden stale activity signals do not block Flow admission', () => {
+  assert.deepEqual(countFlowTileActivity([
+    { status: 'generating', progress: 64, statusReason: 'progress_percent', visible: false },
+    { status: 'unknown', progress: 0, statusReason: 'queued_pending', visible: false },
+    { status: 'generating', progress: 12, statusReason: 'progress_percent', visible: true },
+  ]), {
+    processing: 1,
+    pending: 0,
+    generating: 1,
+  })
+})
+
 test('explicit English and Vietnamese queue labels are pending signals', () => {
   assert.equal(isFlowQueueStatusText('In queue'), true)
   assert.equal(isFlowQueueStatusText('Waiting in the queue…'), true)

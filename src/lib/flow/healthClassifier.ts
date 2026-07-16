@@ -59,6 +59,7 @@ export interface FlowTileActivityObservation {
   status: string
   progress?: number
   statusReason?: string
+  visible?: boolean
 }
 
 export interface FlowTileActivityCounts {
@@ -86,6 +87,9 @@ export function countFlowTileActivity(
   let generating = 0
 
   for (const tile of tiles) {
+    // Flow retains stale/virtualized cards in the DOM after their visible UI
+    // is gone. Their old percentage/queue labels are not provider activity.
+    if (tile.visible === false) continue
     const status = String(tile.status || '').toLocaleLowerCase()
     const reason = String(tile.statusReason || '').toLocaleLowerCase()
     const progress = Number(tile.progress || 0)
