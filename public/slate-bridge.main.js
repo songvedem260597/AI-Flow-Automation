@@ -122,7 +122,7 @@ type BridgeRuntimeRegistry = {
   // Bump this every time you make a runtime change so the Flow page console
   // verification (window.__FLOW_BRIDGE_BUILD_TIME__) matches the running bundle.
   // 2026-07-10 05:55:00 — added Flow Video input mode (Khung hình / Thành phần).
-  var FLOW_BRIDGE_BUILD_TIME = "2026-07-17 02:52:02"
+  var FLOW_BRIDGE_BUILD_TIME = "2026-07-17 03:43:47"
   bridgeLog('[Bridge] BUILD_TIME ' + FLOW_BRIDGE_BUILD_TIME + ' instance=' + BRIDGE_INSTANCE_ID)
   ;(window as Record<string, unknown>).__FLOW_BRIDGE_BUILD_TIME__ = FLOW_BRIDGE_BUILD_TIME
   bridgeGlobal.__FLOW_BRIDGE_BUILD_MARKER__ = FLOW_BRIDGE_BUILD_MARKER
@@ -3073,6 +3073,24 @@ type BridgeRuntimeRegistry = {
         duplicateBridgeDetected: runtimeInjectionCounts.duplicateBridgeDetected === true,
         duplicateListenerDetected: runtimeInjectionCounts.duplicateListenerDetected === true,
         injectionCounts: runtimeInjectionCounts,
+      })
+
+    } else if (action === 'sessionRevalidate') {
+      // Read-only, conservative contract. No stable Flow router/session
+      // revalidation API is proven in this repository, so do not guess one.
+      // This action never reads credentials, navigates, reloads, edits the
+      // composer, changes settings, or submits generation.
+      var sessionHealth = getFlowAdmissionHealth()
+      postResult(rid, {
+        success: false,
+        supported: false,
+        attempted: false,
+        statusReason: 'no_stable_flow_router_revalidation_api',
+        documentReadyState: document.readyState,
+        route: { origin: window.location.origin, pathname: window.location.pathname },
+        bridgeReady: sessionHealth.bridgeReady === true,
+        composerPresent: sessionHealth.composerPresent === true,
+        errorCode: sessionHealth.errorCode || '',
       })
 
     } else if (action === 'insert') {

@@ -3,9 +3,9 @@ export const FLOW_RUNTIME_DIAGNOSTICS_VERSION = 1
 // Independent runtime markers. The background compares the values returned by
 // each execution world with these expected values; bundle presence alone is
 // never treated as proof that the live page is current.
-export const FLOW_BACKGROUND_BUILD_MARKER = 'flow-background:phase-2.6:2026-07-17-025202'
-export const FLOW_CONTENT_BUILD_MARKER = 'flow-content:phase-2.6:2026-07-17-025202'
-export const FLOW_BRIDGE_BUILD_MARKER = 'flow-bridge:phase-2.6:2026-07-17-025202'
+export const FLOW_BACKGROUND_BUILD_MARKER = 'flow-background:phase-3:2026-07-17-034347'
+export const FLOW_CONTENT_BUILD_MARKER = 'flow-content:phase-3:2026-07-17-034347'
+export const FLOW_BRIDGE_BUILD_MARKER = 'flow-bridge:phase-3:2026-07-17-034347'
 
 export type RuntimeMarkerStatus = 'MATCH' | 'MISSING' | 'MISMATCH'
 export type SignalStatus = 'pass' | 'fail' | 'unknown'

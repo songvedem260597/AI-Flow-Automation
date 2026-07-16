@@ -2697,18 +2697,38 @@ private isNonRetryableGenerateNode(node: WorkflowNode): boolean {
           const state = String(snapshot.state || 'idle')
           const cooldownUntil = Number(snapshot.cooldownUntil || 0)
           if (condition === 'provider-idle') {
+            // Activity-only check. An idle provider does not imply that the
+            // Flow session or recovery health is safe for a new admission.
             return {
               satisfied: state === 'idle' || state === 'terminal',
               statusReason: `flow_admission_state:${state}`,
             }
           }
+
+          const recoveryResponse = await this.sendRuntimeMessage({ action: 'FLOW_GET_RECOVERY_SNAPSHOT' })
+          if (!recoveryResponse.success) {
+            return {
+              satisfied: false,
+              statusReason: `flow_recovery_snapshot_unavailable:${String(recoveryResponse.error || 'unknown')}`,
+            }
+          }
+          const recovery = recoveryResponse.snapshot && typeof recoveryResponse.snapshot === 'object'
+            ? recoveryResponse.snapshot as Record<string, unknown>
+            : {}
+          const recoveryState = String(recovery.state || 'blocked')
+          const recoveryBlockedUntil = Number(recovery.blockedUntil || 0)
           const providerIdle = state === 'idle' || state === 'terminal'
-          const cooldownEnded = Date.now() >= cooldownUntil
+          const cooldownEnded = Date.now() >= Math.max(cooldownUntil, recoveryBlockedUntil)
+          const recoveryAllowsAdmission = recoveryState === 'healthy'
           return {
-            satisfied: providerIdle && cooldownEnded,
+            satisfied: providerIdle && cooldownEnded && recoveryAllowsAdmission,
             statusReason: !providerIdle
               ? `flow_admission_state:${state}`
-              : (cooldownEnded ? `cooldown_ended_state:${state}` : `cooldown_active_until:${cooldownUntil}`),
+              : !cooldownEnded
+                ? `flow_cooldown_active_until:${Math.max(cooldownUntil, recoveryBlockedUntil)}`
+                : recoveryAllowsAdmission
+                  ? `flow_recovery_healthy:${recoveryState}`
+                  : `flow_recovery_state:${recoveryState}`,
           }
         }
 

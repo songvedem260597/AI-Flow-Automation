@@ -5,6 +5,7 @@ import type {
   FlowAdmissionSnapshot,
   FlowAdmissionState,
   FlowErrorCode,
+  FlowRecoveryAdmissionDecision,
 } from '../../types/flow.ts'
 
 export type FlowAdmissionLogEvent =
@@ -60,6 +61,8 @@ export interface FlowAdmissionControllerOptions {
   preSubmitLeaseMs?: number
   inFlightSafetyMs?: number
   minimumCooldownMs?: number
+  recoveryGate?: () => Promise<FlowRecoveryAdmissionDecision>
+  recoveryOwnsBlockingFailures?: boolean
 }
 
 const GLOBAL_SCOPE = 'google-flow-global' as const
@@ -90,6 +93,8 @@ export class FlowAdmissionController {
   private readonly preSubmitLeaseMs: number
   private readonly inFlightSafetyMs: number
   private readonly minimumCooldownMs: number
+  private readonly recoveryGate?: FlowAdmissionControllerOptions['recoveryGate']
+  private readonly recoveryOwnsBlockingFailures: boolean
 
   constructor(options: FlowAdmissionControllerOptions = {}) {
     this.now = options.now || (() => Date.now())
@@ -99,6 +104,8 @@ export class FlowAdmissionController {
     this.preSubmitLeaseMs = options.preSubmitLeaseMs || 45_000
     this.inFlightSafetyMs = options.inFlightSafetyMs || 5 * 60_000
     this.minimumCooldownMs = options.minimumCooldownMs ?? 1_000
+    this.recoveryGate = options.recoveryGate
+    this.recoveryOwnsBlockingFailures = options.recoveryOwnsBlockingFailures === true
   }
 
   async requestAdmission(
@@ -161,6 +168,36 @@ export class FlowAdmissionController {
       }
     }
 
+    // owner: google-flow — Recovery is a precondition of the single P0
+    // admission gate. Recovery can deny admission, but it cannot dispatch a
+    // generation or acquire/release this controller's job mutex.
+    if (this.recoveryGate) {
+      let recovery: FlowRecoveryAdmissionDecision
+      try {
+        recovery = await this.recoveryGate()
+      } catch (error) {
+        this.pendingAdmissionJob = null
+        const statusReason = `flow_recovery_gate_unavailable:${error instanceof Error ? error.message : String(error)}`
+        this.emit('FLOW_ADMISSION_DENIED_BUSY', requestedJob, statusReason)
+        return {
+          granted: false,
+          errorCode: 'unknown',
+          statusReason,
+          snapshot: this.getSnapshotUnsafe(),
+        }
+      }
+      if (!recovery.allowed) {
+        this.pendingAdmissionJob = null
+        this.emit('FLOW_ADMISSION_DENIED_BUSY', requestedJob, recovery.statusReason)
+        return {
+          granted: false,
+          errorCode: recovery.errorCode || 'flow_busy',
+          statusReason: recovery.statusReason,
+          snapshot: this.getSnapshotUnsafe(),
+        }
+      }
+    }
+
     this.activeJob = requestedJob
     this.pendingAdmissionJob = null
     this.emitTransition(requestedJob, 'idle', 'checking', 'pre_submit_reservation_acquired')
@@ -202,7 +239,8 @@ export class FlowAdmissionController {
 
       if (!health.healthy) {
         const errorCode = health.errorCode || 'unknown'
-        const blocking = errorCode === 'unusual_activity' || errorCode === 'rate_limited' || errorCode === 'session_expired'
+        const blocking = !this.recoveryOwnsBlockingFailures
+          && (errorCode === 'unusual_activity' || errorCode === 'rate_limited' || errorCode === 'session_expired')
         this.transition(
           requestedJob,
           blocking ? 'blocked' : 'terminal',

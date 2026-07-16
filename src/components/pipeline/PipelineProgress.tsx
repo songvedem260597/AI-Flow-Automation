@@ -7,9 +7,21 @@ import {
   Play, Pause, Square, Loader2, CheckCircle2, XCircle,
   ChevronRight, X, Minimize2, Maximize2
 } from 'lucide-react'
+import type { FlowRecoverySnapshot } from '@/types/flow'
 
 interface PipelineProgressProps {
   compact?: boolean
+}
+
+function workflowRecoveryText(snapshot: FlowRecoverySnapshot | null): string {
+  if (!snapshot) return 'Flow recovery status unavailable'
+  if (snapshot.errorCode === 'submit_uncertain') return 'Flow job status uncertain — open GenPanel'
+  if (snapshot.state === 'healthy') return 'Flow healthy'
+  if (snapshot.state === 'session_suspect') return 'Flow session needs recovery — open GenPanel'
+  if (snapshot.state === 'recovering') return 'Refreshing Flow session'
+  if (snapshot.state === 'rate_limited' || snapshot.state === 'cooldown') return 'Flow rate limited — waiting for cooldown'
+  if (snapshot.state === 'blocked') return 'Flow blocked — open GenPanel for user action'
+  return 'Flow transient failure — open GenPanel'
 }
 
 export const PipelineProgress: React.FC<PipelineProgressProps> = ({ compact }) => {
@@ -22,10 +34,33 @@ export const PipelineProgress: React.FC<PipelineProgressProps> = ({ compact }) =
 
   const activeTask = tasks.find((t) => t.id === activeTaskId)
   const activeWorkflow = activeTask ? workflows.find((w) => w.id === activeTask.workflowId) : null
+  const workflowUsesFlow = activeWorkflow?.nodes.some((node) => (
+    node.type === 'generate' && (node.data as { provider?: string }).provider === 'google-flow'
+  )) === true
   const taskLogs = logs.filter((l) => l.pipelineId === activeTaskId).slice(0, 10)
 
   const [isExpanded, setIsExpanded] = React.useState(!compact)
   const [isMinimized, setIsMinimized] = React.useState(false)
+  const [flowRecovery, setFlowRecovery] = React.useState<FlowRecoverySnapshot | null>(null)
+
+  useEffect(() => {
+    if (!activeTask || !workflowUsesFlow) {
+      setFlowRecovery(null)
+      return
+    }
+    let disposed = false
+    const refresh = () => {
+      chrome.runtime.sendMessage({ action: 'FLOW_GET_RECOVERY_SNAPSHOT' }).then((response: { success?: boolean; snapshot?: FlowRecoverySnapshot } | undefined) => {
+        if (!disposed && response?.success === true && response.snapshot) setFlowRecovery(response.snapshot)
+      }).catch(() => undefined)
+    }
+    refresh()
+    const interval = window.setInterval(refresh, 3_000)
+    return () => {
+      disposed = true
+      window.clearInterval(interval)
+    }
+  }, [activeTask?.id, workflowUsesFlow])
 
   if (!isRunning && !activeTask) return null
 
@@ -110,6 +145,16 @@ export const PipelineProgress: React.FC<PipelineProgressProps> = ({ compact }) =
       </div>
 
       <div className="p-4 space-y-4">
+        {workflowUsesFlow && (
+          <div className={cn(
+            'rounded-lg border px-3 py-2 text-[10px]',
+            flowRecovery?.state === 'healthy'
+              ? 'border-emerald-400/15 bg-emerald-400/5 text-emerald-200/70'
+              : 'border-amber-400/20 bg-amber-400/5 text-amber-200/80',
+          )}>
+            {workflowRecoveryText(flowRecovery)}
+          </div>
+        )}
         <div className="space-y-2">
           <div className="flex items-center justify-between text-xs">
             <span className="text-white/40">Progress</span>

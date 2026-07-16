@@ -139,6 +139,105 @@ export interface FlowAdmissionDiagnosticSnapshot {
   capturedAt: number
 }
 
+export type FlowRecoveryState =
+  | 'healthy'
+  | 'transient_failure'
+  | 'session_suspect'
+  | 'rate_limited'
+  | 'cooldown'
+  | 'recovering'
+  | 'blocked'
+
+export type FlowHealthSignalStatus = 'pass' | 'fail' | 'unknown'
+
+export interface FlowHealthSignal<T = boolean> {
+  status: FlowHealthSignalStatus
+  value?: T
+  reason?: string
+}
+
+export interface FlowHealthProbeResult {
+  checkedAt: number
+  tabExists: FlowHealthSignal
+  routeValid: FlowHealthSignal
+  bridgeReady: FlowHealthSignal
+  composerReady: FlowHealthSignal
+  loginRequired: FlowHealthSignal
+  sessionWarning: FlowHealthSignal
+  unusualActivityWarning: FlowHealthSignal
+  rateLimitWarning: FlowHealthSignal
+  blockingDialog: FlowHealthSignal
+  activeGenerationCount: FlowHealthSignal<number>
+  overall: 'healthy' | 'session_suspect' | 'rate_limited' | 'blocked' | 'busy' | 'unknown'
+}
+
+export interface FlowRecoveryStateHistoryEntry {
+  previousState: FlowRecoveryState
+  nextState: FlowRecoveryState
+  timestamp: number
+  reason: string
+}
+
+export interface FlowRecoveryAttemptHistoryEntry {
+  attempt: number
+  timestamp: number
+  action: 'session_refresh' | 'bridge_reconnect' | 'health_probe' | 'controlled_reload' | 'reconciliation'
+  result: string
+}
+
+export interface FlowRecoveryProbeHistoryEntry {
+  timestamp: number
+  overall: FlowHealthProbeResult['overall']
+}
+
+export interface FlowRecoverySnapshot {
+  state: FlowRecoveryState
+  incidentId?: string
+  errorCode?: FlowErrorCode
+  failureCount: number
+  recoveryAttemptCount: number
+  firstFailureAt?: number
+  lastFailureAt?: number
+  cooldownStartedAt?: number
+  blockedUntil?: number
+  recoveryStartedAt?: number
+  recoveryCompletedAt?: number
+  lastProbeAt?: number
+  lastProbeResult?: FlowHealthProbeResult
+  sessionRefreshAttempted: boolean
+  sessionRefreshSucceeded?: boolean
+  userInterventionRequired: boolean
+  persistenceVersion: number
+  persistenceError?: string
+  triggeringJobId?: string
+  triggeringTabId?: number
+  triggeringEvidence?: FlowErrorEvidence[]
+  startedAt?: number
+  stateHistory: FlowRecoveryStateHistoryEntry[]
+  recoveryAttemptHistory: FlowRecoveryAttemptHistoryEntry[]
+  probeHistory: FlowRecoveryProbeHistoryEntry[]
+  terminalDecision?: string
+  reloadCount: number
+  lastSessionRefreshAt?: number
+  recentIncidentStartedAt: number[]
+  capturedAt: number
+}
+
+export interface FlowRecoveryAdmissionDecision {
+  allowed: boolean
+  state: FlowRecoveryState
+  statusReason: string
+  errorCode?: FlowErrorCode
+  blockedUntil?: number
+  snapshot?: FlowRecoverySnapshot
+}
+
+export type FlowReconciliationResult =
+  | { status: 'job_found_active'; reason: string }
+  | { status: 'job_found_terminal'; reason: string }
+  | { status: 'no_evidence'; reason: string }
+  | { status: 'ambiguous'; reason: string }
+
 export type FlowWaitCondition =
   | 'manual'
   | 'provider-idle'

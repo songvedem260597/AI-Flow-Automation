@@ -3228,6 +3228,24 @@ const flowContentRuntimeMessageListener: Parameters<typeof chrome.runtime.onMess
     return true
   }
 
+  // owner: google-flow — Phase 3 read-only session revalidation request.
+  // The MAIN bridge intentionally reports unsupported when Flow exposes no
+  // stable router revalidation API; background recovery may then reconnect
+  // scripts and, only under policy, use one controlled page reload.
+  if (action === 'FLOW_SESSION_REVALIDATE') {
+    ;(async () => {
+      const result = await bridgeCall('sessionRevalidate', {}, 5000)
+      sendResponse(result)
+    })().catch((error) => {
+      sendResponse({
+        success: false,
+        supported: false,
+        statusReason: error instanceof Error ? error.message : String(error),
+      })
+    })
+    return true
+  }
+
   if (action === 'FLOW_DEBUG_PING') {
     const scan = (window as unknown as Record<string, unknown>).__flowDebugScan?.()
     sendResponse({

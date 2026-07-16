@@ -21,7 +21,7 @@ if (manifest.content_scripts) {
       const hasFlowBridge = cs.js.some((f) => f.includes('flow-slate-bridge.'))
 
       if (hasFlowContent || hasFlowBridge) {
-        cs.matches = ['https://labs.google/*']
+        cs.matches = ['https://labs.google/fx/*']
       }
 
       // Add world MAIN for bridge

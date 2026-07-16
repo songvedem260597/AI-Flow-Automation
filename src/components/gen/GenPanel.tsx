@@ -12,6 +12,7 @@ import { promptAssistantProviderLabel, runPromptAssistant, type PromptAssistantM
 import { PROMPT_ASSISTANT_STYLE_THUMBNAIL_URLS } from '@/lib/promptAssistantStyleThumbnails'
 import { useSettingsStore } from '@/stores/settingsStore'
 import { usePromptStore } from '@/stores/dataStore'
+import type { FlowRecoverySnapshot } from '@/types/flow'
 
 // ─── Flow Model Constants ───────────────────────────────────────────────────────
 
@@ -70,6 +71,22 @@ function textToBase64DataUrl(value: string): string {
     binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize))
   }
   return `data:application/json;base64,${btoa(binary)}`
+}
+
+function flowRecoveryStatusText(snapshot: FlowRecoverySnapshot | null): string {
+  if (!snapshot) return 'Flow recovery status unavailable'
+  if (snapshot.persistenceError) return 'Flow recovery persistence unavailable — admission blocked'
+  if (snapshot.errorCode === 'submit_uncertain') return 'Flow job status uncertain'
+  if (snapshot.state === 'healthy') return 'Flow healthy'
+  if (snapshot.state === 'session_suspect') return 'Flow session needs recovery'
+  if (snapshot.state === 'recovering') return 'Refreshing Flow session'
+  if (snapshot.state === 'rate_limited' || snapshot.state === 'cooldown') {
+    return snapshot.blockedUntil && snapshot.blockedUntil > Date.now()
+      ? `Flow rate limited — retry after ${new Date(snapshot.blockedUntil).toLocaleTimeString()}`
+      : 'Flow cooldown awaiting health probe'
+  }
+  if (snapshot.state === 'blocked') return 'Flow blocked — user action required'
+  return 'Flow transient failure — health check required'
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -1918,7 +1935,27 @@ export const GenPanel: React.FC<{
   const [flowDiagnosticStatus, setFlowDiagnosticStatus] = useState('Diagnostics are off.')
   const [flowDiagnosticResult, setFlowDiagnosticResult] = useState<Record<string, unknown> | null>(null)
   const [flowRuntimeSessionId, setFlowRuntimeSessionId] = useState<string>('')
+  const [flowRecoverySnapshot, setFlowRecoverySnapshot] = useState<FlowRecoverySnapshot | null>(null)
+  const [flowRecoveryBusyAction, setFlowRecoveryBusyAction] = useState('')
   const flowDiagnosticMountedRef = useRef(false)
+
+  const refreshFlowRecoverySnapshot = useCallback(async () => {
+    if (activeProvider !== 'flow') return
+    const response = await chrome.runtime.sendMessage({ action: 'FLOW_GET_RECOVERY_SNAPSHOT' }) as {
+      success?: boolean
+      snapshot?: FlowRecoverySnapshot
+    }
+    if (response?.success === true && response.snapshot) setFlowRecoverySnapshot(response.snapshot)
+  }, [activeProvider])
+
+  useEffect(() => {
+    if (activeProvider !== 'flow') return
+    void refreshFlowRecoverySnapshot().catch(() => undefined)
+    const interval = window.setInterval(() => {
+      void refreshFlowRecoverySnapshot().catch(() => undefined)
+    }, 3_000)
+    return () => window.clearInterval(interval)
+  }, [activeProvider, refreshFlowRecoverySnapshot])
 
   useEffect(() => {
     const startNewSession = flowDiagnosticMountedRef.current && flowRuntimeDiagnosticsEnabled
@@ -2691,29 +2728,51 @@ const handleCancel = useCallback(() => {
 const handleFlowAdmissionReset = useCallback(async () => {
   if (flowAdmissionResetting) return
   const acknowledged = window.confirm(
-    'Google Flow may still be processing a previous submit. Resetting only unlocks this extension; it does not cancel Flow. Check the Flow tab before generating again. Continue?'
+    'Resetting extension state does not cancel an existing Flow generation. Check the Flow tab before generating again. Continue?'
   )
   if (!acknowledged) return
 
   setFlowAdmissionResetting(true)
   try {
     const response = await chrome.runtime.sendMessage({
-      action: 'FLOW_RESET_ADMISSION',
+      action: 'FLOW_RESET_RECOVERY',
       payload: { userAcknowledged: true },
-    }) as { success?: boolean; snapshot?: { state?: string } }
-    const state = String(response?.snapshot?.state || '')
+    }) as { success?: boolean; admission?: { state?: string }; recovery?: FlowRecoverySnapshot; error?: string }
+    const state = String(response?.admission?.state || '')
+    if (response?.recovery) setFlowRecoverySnapshot(response.recovery)
     if (response?.success === true && state === 'idle') {
       setFlowAdmissionResetReason('')
-      setFlowStep('Flow admission reset. Review the Flow tab before generating again.')
+      setFlowStep('Flow admission and recovery state reset. Review the Flow tab before generating again.')
       return
     }
-    setFlowStep(`Flow admission remains ${state || 'blocked'}`)
+    setFlowStep(String(response?.error || `Flow admission remains ${state || 'blocked'}`))
   } catch (error) {
     setFlowStep(`Flow admission reset failed: ${error instanceof Error ? error.message : String(error)}`)
   } finally {
     setFlowAdmissionResetting(false)
   }
 }, [flowAdmissionResetting])
+
+const runFlowRecoveryAction = useCallback(async (action: string) => {
+  if (flowRecoveryBusyAction) return
+  setFlowRecoveryBusyAction(action)
+  try {
+    const response = await chrome.runtime.sendMessage({ action }) as {
+      success?: boolean
+      error?: string
+      snapshot?: FlowRecoverySnapshot
+      recovery?: FlowRecoverySnapshot
+    }
+    const snapshot = response.snapshot || response.recovery
+    if (snapshot) setFlowRecoverySnapshot(snapshot)
+    if (response.success === false && response.error) setFlowStep(response.error)
+  } catch (error) {
+    setFlowStep(`Flow recovery action failed: ${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    setFlowRecoveryBusyAction('')
+    void refreshFlowRecoverySnapshot().catch(() => undefined)
+  }
+}, [flowRecoveryBusyAction, refreshFlowRecoverySnapshot])
 
 const handleFlowDiagnosticToggle = useCallback((enabled: boolean) => {
   updateSettings({ flowRuntimeDiagnosticsEnabled: enabled })
@@ -3266,6 +3325,73 @@ const handleGenerate = useCallback(async () => {
         </div>
 
         {/* ── Flow Runtime Verification (read-only) ── */}
+        {activeProvider === 'flow' && (
+          <div className="px-4 pb-3">
+            <div className="rounded-xl border border-amber-400/15 bg-amber-400/[0.04] p-3">
+              <div className="flex items-center gap-2">
+                <Activity className={cn(
+                  'h-3.5 w-3.5',
+                  flowRecoverySnapshot?.state === 'healthy' ? 'text-emerald-300' : 'text-amber-300',
+                )} />
+                <div className="text-[11px] font-medium text-white/70">Flow Recovery</div>
+                <span className={cn(
+                  'ml-auto text-[10px] font-medium',
+                  flowRecoverySnapshot?.state === 'healthy' ? 'text-emerald-300' : 'text-amber-200',
+                )}>
+                  {flowRecoveryStatusText(flowRecoverySnapshot)}
+                </span>
+              </div>
+              {flowRecoverySnapshot?.terminalDecision && flowRecoverySnapshot.state !== 'healthy' && (
+                <div className="mt-1.5 break-words text-[9px] leading-4 text-white/35">
+                  {flowRecoverySnapshot.terminalDecision}
+                </div>
+              )}
+              <div className="mt-3 grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => void runFlowRecoveryAction('FLOW_RUN_RECOVERY_HEALTH_PROBE')}
+                  disabled={!!flowRecoveryBusyAction}
+                  className="rounded-lg border border-white/[0.07] bg-white/[0.04] px-2 py-1.5 text-[10px] text-white/55 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-30"
+                >
+                  {flowRecoveryBusyAction === 'FLOW_RUN_RECOVERY_HEALTH_PROBE' ? 'Probing…' : 'Run health probe'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void runFlowRecoveryAction('FLOW_ATTEMPT_SESSION_RECOVERY')}
+                  disabled={!!flowRecoveryBusyAction || !(
+                    flowRecoverySnapshot?.state === 'session_suspect'
+                    && flowRecoverySnapshot.errorCode === 'session_expired'
+                    && flowRecoverySnapshot.sessionRefreshAttempted === false
+                  )}
+                  className="rounded-lg border border-white/[0.07] bg-white/[0.04] px-2 py-1.5 text-[10px] text-white/55 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-30"
+                >
+                  {flowRecoveryBusyAction === 'FLOW_ATTEMPT_SESSION_RECOVERY' ? 'Recovering…' : 'Attempt session recovery'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void runFlowRecoveryAction('FLOW_OPEN_TAB')}
+                  disabled={!!flowRecoveryBusyAction}
+                  className="rounded-lg border border-white/[0.07] bg-white/[0.04] px-2 py-1.5 text-[10px] text-white/55 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-30"
+                >
+                  Open Flow tab
+                </button>
+                <button
+                  type="button"
+                  onClick={handleFlowAdmissionReset}
+                  disabled={flowAdmissionResetting || !!flowRecoveryBusyAction}
+                  className="rounded-lg border border-amber-400/15 bg-amber-400/[0.05] px-2 py-1.5 text-[10px] text-amber-200/75 hover:bg-amber-400/[0.09] disabled:cursor-not-allowed disabled:opacity-30"
+                >
+                  {flowAdmissionResetting ? 'Resetting…' : 'Acknowledge / manual reset'}
+                </button>
+              </div>
+              <div className="mt-2 text-[9px] leading-4 text-white/30">
+                Resetting extension state does not cancel an existing Flow generation.
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Flow Runtime Verification (read-only) */}
         {activeProvider === 'flow' && (
           <div className="px-4 pb-3">
             <div className="rounded-xl border border-sky-400/15 bg-sky-400/[0.04] p-3">

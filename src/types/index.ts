@@ -350,6 +350,14 @@ export type MessageAction =
   | 'FLOW_CONTENT_PING'
   | 'FLOW_GET_ADMISSION_HEALTH'
   | 'FLOW_GET_ADMISSION_SNAPSHOT'
+  // owner: google-flow — Phase 3 Recovery Controller actions.
+  | 'FLOW_GET_RECOVERY_SNAPSHOT'
+  | 'FLOW_RUN_RECOVERY_HEALTH_PROBE'
+  | 'FLOW_ATTEMPT_SESSION_RECOVERY'
+  | 'FLOW_RECONCILE_UNCERTAIN'
+  | 'FLOW_OPEN_TAB'
+  | 'FLOW_RESET_RECOVERY'
+  | 'FLOW_SESSION_REVALIDATE'
   // owner: google-flow — read-only Phase 2.6 runtime verification harness.
   | 'FLOW_RUNTIME_SET_ENABLED'
   | 'FLOW_RUNTIME_HANDSHAKE'

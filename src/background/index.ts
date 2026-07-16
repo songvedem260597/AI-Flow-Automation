@@ -20,6 +20,12 @@ import type { ChromeMessage } from '@/types'
 import { PROVIDER_TABS } from '@/constants'
 import { DEBUG_FLAGS, debugLog } from '@/lib/debug'
 import { FlowAdmissionController } from './flow/FlowAdmissionController'
+import { FlowRecoveryController } from './flow/FlowRecoveryController'
+import { FlowSessionRefresher } from './flow/FlowSessionRefresher'
+import { createFlowHealthProbeResult } from './flow/recoveryHealth'
+import { isManualSessionRecoveryAllowed } from './flow/recoveryPolicy'
+import { waitForFlowRecoveryDelay } from './flow/recoveryBackoff'
+import { reconcileSubmitUncertain } from './flow/submitUncertainReconciliation'
 import { createFlowEvidence, ensureFlowResultContract } from '@/lib/flow/resultContract'
 import { isGoogleFlowUrl } from '@/lib/flow/url'
 import {
@@ -44,6 +50,8 @@ import type {
   FlowAdmissionSnapshot,
   FlowErrorCode,
   FlowErrorEvidence,
+  FlowHealthProbeResult,
+  FlowRecoverySnapshot,
   FlowResultContract,
 } from '@/types/flow'
 
@@ -64,13 +72,17 @@ var workflowEditorWindowId: number | null = null
 var workflowEditorTabId: number | null = null
 
 const FLOW_ADMISSION_STORAGE_KEY = 'flowAdmissionP0'
+const FLOW_RECOVERY_STORAGE_KEY = 'flowRecoveryV1'
 const FLOW_RUNTIME_DIAGNOSTICS_STORAGE_KEY = 'flowRuntimeDiagnosticsV1'
 const FLOW_BACKGROUND_INSTANCE_ID = `flow-background-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
 const flowDispatchedJobIds = new Set<string>()
+let flowRecoveryController!: FlowRecoveryController
 const flowAdmissionController = new FlowAdmissionController({
   // Conservative extension-side safety debounce, not a claimed Google Flow
   // rate limit. The controller option remains configurable for runtime tuning.
   minimumCooldownMs: 1_000,
+  recoveryOwnsBlockingFailures: true,
+  recoveryGate: async () => flowRecoveryController.getAdmissionDecision(),
   storage: {
     async load(): Promise<FlowAdmissionSnapshot | null> {
       const stored = await chrome.storage.session?.get?.(FLOW_ADMISSION_STORAGE_KEY)
@@ -85,6 +97,55 @@ const flowAdmissionController = new FlowAdmissionController({
     // Admission logs intentionally exclude prompt text, cookies, tokens, and
     // response bodies. These lifecycle fields are safe for default logging.
     console.log(`[FlowAdmission] ${event} ${JSON.stringify(payload)}`)
+    void appendFlowRuntimeDiagnosticEvent(event, payload)
+  },
+})
+
+const flowSessionRefresher = new FlowSessionRefresher({
+  getAdmissionSnapshot: () => flowAdmissionController.getSnapshot(),
+  async revalidateSession(tabId, signal) {
+    if (signal?.aborted) return { success: false, supported: false, reason: String(signal.reason || 'session_revalidation_aborted') }
+    const response = await chrome.tabs.sendMessage(tabId, { action: 'FLOW_SESSION_REVALIDATE' }).catch((error) => ({
+      success: false,
+      supported: false,
+      statusReason: error instanceof Error ? error.message : String(error),
+    })) as Record<string, unknown>
+    return {
+      success: response.success === true,
+      supported: response.supported === true,
+      reason: String(response.statusReason || 'session_revalidation_not_supported'),
+    }
+  },
+  async reconnectBridge(tabId, signal) {
+    return reconnectFlowBridgeSafely(tabId, signal)
+  },
+  async probeHealth(tabId, signal) {
+    return runFlowRecoveryHealthProbe(tabId, signal)
+  },
+  async controlledReload(tabId, signal) {
+    return controlledReloadFlowTab(tabId, signal)
+  },
+  maxReloadsPerIncident: 1,
+})
+
+flowRecoveryController = new FlowRecoveryController({
+  storage: {
+    async load(): Promise<FlowRecoverySnapshot | null> {
+      const stored = await chrome.storage.session?.get?.(FLOW_RECOVERY_STORAGE_KEY)
+      const value = stored?.[FLOW_RECOVERY_STORAGE_KEY]
+      return value && typeof value === 'object' ? value as FlowRecoverySnapshot : null
+    },
+    async save(snapshot: FlowRecoverySnapshot): Promise<void> {
+      await chrome.storage.session?.set?.({ [FLOW_RECOVERY_STORAGE_KEY]: snapshot })
+    },
+  },
+  sessionRefresher: flowSessionRefresher,
+  probeHealth: (tabId, signal) => runFlowRecoveryHealthProbe(tabId, signal),
+  reconnectBridge: (tabId, signal) => reconnectFlowBridgeSafely(tabId, signal),
+  log(event, payload) {
+    // Recovery logs contain lifecycle metadata only. Prompt text, request
+    // bodies, credentials and media URLs are excluded by construction.
+    console.log(`[FlowRecovery] ${event} ${JSON.stringify(payload)}`)
     void appendFlowRuntimeDiagnosticEvent(event, payload)
   },
 })
@@ -722,6 +783,68 @@ async function handleMessage(message: ChromeMessage, sender: chrome.runtime.Mess
     // owner: google-flow — P0 admission lifecycle and Wait-node probes.
     case 'FLOW_GET_ADMISSION_SNAPSHOT':
       return { success: true, snapshot: await flowAdmissionController.getSnapshot() }
+
+    // owner: google-flow — Phase 3 Recovery Controller. These exact actions
+    // never dispatch generation and are intentionally separate from ChatGPT.
+    case 'FLOW_GET_RECOVERY_SNAPSHOT':
+      return { success: true, snapshot: await flowRecoveryController.getSnapshot() }
+
+    case 'FLOW_RUN_RECOVERY_HEALTH_PROBE': {
+      const tab = await findExistingFlowDiagnosticTab()
+      if (tab?.id === undefined) {
+        return { success: false, error: 'flow_tab_not_found', snapshot: await flowRecoveryController.getSnapshot() }
+      }
+      const probe = await runFlowRecoveryHealthProbe(tab.id)
+      const decision = await flowRecoveryController.getAdmissionDecision()
+      return { success: true, probe, decision, snapshot: await flowRecoveryController.getSnapshot() }
+    }
+
+    case 'FLOW_ATTEMPT_SESSION_RECOVERY': {
+      const snapshot = await flowRecoveryController.getSnapshot()
+      if (!isManualSessionRecoveryAllowed(snapshot) || snapshot.incidentId === undefined || snapshot.triggeringTabId === undefined) {
+        return { success: false, error: 'session_recovery_not_allowed_by_policy', snapshot }
+      }
+      const next = await flowRecoveryController.attemptSessionRecovery(
+        snapshot.incidentId,
+        snapshot.triggeringTabId,
+        'high',
+        true,
+      )
+      return { success: next.state === 'healthy', snapshot: next }
+    }
+
+    case 'FLOW_RECONCILE_UNCERTAIN': {
+      const jobId = String(((message.payload || {}) as { jobId?: string }).jobId || '')
+      if (!jobId) return { success: false, error: 'job_id_required' }
+      return reconcileFlowUncertainJob(jobId)
+    }
+
+    case 'FLOW_OPEN_TAB': {
+      const tabId = await findOrOpenFlowTab()
+      if (!tabId) return { success: false, error: 'flow_tab_not_found' }
+      await chrome.tabs.update(tabId, { active: true }).catch(() => undefined)
+      return { success: true, tabId }
+    }
+
+    case 'FLOW_RESET_RECOVERY': {
+      const acknowledged = ((message.payload || {}) as { userAcknowledged?: boolean }).userAcknowledged === true
+      if (!acknowledged) {
+        return {
+          success: false,
+          error: 'user_acknowledgement_required',
+          admission: await flowAdmissionController.getSnapshot(),
+          recovery: await flowRecoveryController.getSnapshot(),
+        }
+      }
+      const beforeAdmission = await flowAdmissionController.getSnapshot()
+      const admission = await flowAdmissionController.resetBlockedState(true)
+      if (admission.state === 'checking' || admission.state === 'admitted' || admission.state === 'in_flight' || admission.state === 'submit_uncertain') {
+        return { success: false, error: 'active_or_uncertain_flow_job_prevents_recovery_reset', admission, recovery: await flowRecoveryController.getSnapshot() }
+      }
+      if (beforeAdmission.activeJob && admission.state === 'idle') flowDispatchedJobIds.delete(beforeAdmission.activeJob.jobId)
+      const recovery = await flowRecoveryController.manualReset(true)
+      return { success: recovery.state === 'healthy', admission, recovery }
+    }
 
     // owner: google-flow — read-only Phase 2.6 runtime verification harness.
     // Exact-action guards keep these probes out of ChatGPT routing. They do
@@ -2686,7 +2809,8 @@ async function fetchFlowMediaAsData(payload: FlowFetchMediaAsDataPayload): Promi
   }
 }
 
-async function ensureBridgeReady(tabId: number): Promise<void> {
+async function ensureBridgeReady(tabId: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return
   const scripts = await getFlowScriptFiles()
   if (!scripts.content) return
 
@@ -2701,11 +2825,12 @@ async function ensureBridgeReady(tabId: number): Promise<void> {
   }
 
   for (let i = 0; i < 10; i++) {
+    if (signal?.aborted) return
     try {
       const ready = await chrome.tabs.sendMessage(tabId, { action: 'FLOW_INJECT_BRIDGE' }).catch(() => null)
       if (ready?.bridgeReady) return
     } catch { /* not ready yet */ }
-    await new Promise(r => setTimeout(r, 500))
+    await waitForFlowRecoveryDelay(500, signal)
   }
 }
 
@@ -2727,6 +2852,66 @@ async function findExistingFlowDiagnosticTab(): Promise<chrome.tabs.Tab | null> 
   const tabs = await chrome.tabs.query({ url: 'https://labs.google/fx/*' }).catch(() => [])
   const flowTabs = tabs.filter((tab) => isGoogleFlowUrl(String(tab.url || tab.pendingUrl || '')))
   return flowTabs.find((tab) => tab.active) || flowTabs[0] || null
+}
+
+async function runFlowRecoveryHealthProbe(tabId: number, signal?: AbortSignal): Promise<FlowHealthProbeResult> {
+  const checkedAt = Date.now()
+  if (signal?.aborted) throw new Error(String(signal.reason || 'flow_recovery_probe_aborted'))
+  const probeSignal = signal || new AbortController().signal
+  const health = await probeFlowAdmissionHealth(tabId, probeSignal).catch(() => null)
+  if (!health) return createFlowHealthProbeResult({ checkedAt })
+  const errorCode = health.errorCode
+  return createFlowHealthProbeResult({
+    checkedAt,
+    tabExists: health.tabExists,
+    routeValid: !!health.url && isGoogleFlowUrl(health.url),
+    bridgeReady: health.bridgeReady,
+    composerReady: health.composerPresent,
+    loginRequired: errorCode === 'session_expired',
+    sessionWarning: errorCode === 'session_expired',
+    unusualActivityWarning: errorCode === 'unusual_activity',
+    rateLimitWarning: errorCode === 'rate_limited',
+    blockingDialog: health.blockingDialog && errorCode !== 'session_expired' && errorCode !== 'rate_limited',
+    activeGenerationCount: health.processing + health.pending + health.generating,
+  })
+}
+
+async function reconnectFlowBridgeSafely(tabId: number, signal?: AbortSignal) {
+  if (signal?.aborted) return { success: false, reason: String(signal.reason || 'bridge_reconnect_aborted') }
+  const tab = await chrome.tabs.get(tabId).catch(() => null)
+  if (!tab || !isGoogleFlowUrl(String(tab.url || tab.pendingUrl || ''))) {
+    return { success: false, reason: 'flow_tab_or_route_unavailable' }
+  }
+  if (tab.status !== 'complete') {
+    await waitForFlowRecoveryDelay(500, signal)
+  }
+  await ensureBridgeReady(tabId, signal)
+  if (signal?.aborted) return { success: false, reason: String(signal.reason || 'bridge_reconnect_aborted') }
+  const ping = await pingFlowBridgeViaMainWorld(tabId).catch(() => null)
+  return {
+    success: ping?.bridgeReady === true,
+    reason: ping?.bridgeReady === true ? 'bridge_reconnected' : 'bridge_still_unavailable',
+  }
+}
+
+async function controlledReloadFlowTab(tabId: number, signal?: AbortSignal) {
+  if (signal?.aborted) return { success: false, reason: String(signal.reason || 'controlled_reload_aborted') }
+  const admission = await flowAdmissionController.getSnapshot()
+  if (admission.state === 'in_flight' || admission.state === 'submit_uncertain') {
+    return { success: false, reason: 'active_or_uncertain_flow_job_prevents_reload' }
+  }
+  await chrome.tabs.reload(tabId)
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if (signal?.aborted) return { success: false, reason: String(signal.reason || 'controlled_reload_aborted') }
+    const tab = await chrome.tabs.get(tabId).catch(() => null)
+    if (!tab) return { success: false, reason: 'flow_tab_closed_during_reload' }
+    if (tab.status === 'complete') {
+      const reconnect = await reconnectFlowBridgeSafely(tabId, signal)
+      return { success: reconnect.success, reason: reconnect.success ? 'controlled_reload_complete' : reconnect.reason }
+    }
+    await waitForFlowRecoveryDelay(500, signal)
+  }
+  return { success: false, reason: 'controlled_reload_timeout' }
 }
 
 async function runFlowRuntimeHandshake(): Promise<FlowRuntimeHandshakeResult> {
@@ -2827,6 +3012,7 @@ async function runFlowRuntimeHealthProbe(): Promise<FlowRuntimeHealthReport> {
 
 async function runFlowRuntimeAdmissionDryRun() {
   const admission = await flowAdmissionController.getDiagnostics()
+  const recovery = await flowRecoveryController.getSnapshot()
   const health = await runFlowRuntimeHealthProbe()
   const counts = [health.processingTileCount, health.pendingTileCount, health.generatingTileCount]
   const activeTileCount = counts.reduce((sum, signal) => sum + (typeof signal.value === 'number' ? signal.value : 0), 0)
@@ -2836,9 +3022,11 @@ async function runFlowRuntimeAdmissionDryRun() {
   const failedHealth = Object.entries(health)
     .filter(([key]) => key !== 'timestamp')
     .some(([, signal]) => (signal as { status?: string }).status === 'fail')
-  const wouldAdmit = admission.state === 'idle' && activeTileCount === 0 && !unknownHealth && !failedHealth
+  const wouldAdmit = admission.state === 'idle' && recovery.state === 'healthy' && activeTileCount === 0 && !unknownHealth && !failedHealth
   const statusReason = admission.state !== 'idle'
     ? `admission_owned_${admission.state}`
+    : recovery.state !== 'healthy'
+      ? `recovery_state_${recovery.state}`
     : activeTileCount > 0
       ? 'provider_busy_before_dispatch'
       : unknownHealth
@@ -2854,6 +3042,7 @@ async function runFlowRuntimeAdmissionDryRun() {
     statusReason,
     activeTileCount,
     admission,
+    recovery,
     health,
     timestamp: Date.now(),
   }
@@ -2863,6 +3052,7 @@ async function runFlowRuntimeAdmissionDryRun() {
     statusReason,
     activeTileCount,
     admissionState: admission.state,
+    recoveryState: recovery.state,
   })
   return result
 }
@@ -2870,6 +3060,7 @@ async function runFlowRuntimeAdmissionDryRun() {
 async function getFlowRuntimeDiagnosticReport() {
   const state = await loadFlowRuntimeDiagnosticState()
   const admission = await flowAdmissionController.getDiagnostics()
+  const recovery = await flowRecoveryController.getSnapshot()
   const handshake = state.lastHandshake
   const report = {
     schemaVersion: FLOW_RUNTIME_DIAGNOSTICS_VERSION,
@@ -2908,6 +3099,7 @@ async function getFlowRuntimeDiagnosticReport() {
     handshake,
     injectionCounts: handshake?.injectionCounts || null,
     admissionSnapshots: [admission],
+    recoverySnapshots: [recovery],
     stateTransitionLogs: state.logs,
     healthProbe: state.lastHealthProbe,
     runtimeTestCaseResults: state.testCaseResults,
@@ -2923,6 +3115,7 @@ async function resetFlowRuntimeDiagnosticReportLogs() {
     enabled: state.enabled,
     runtimeSessionId: state.runtimeSessionId,
     admission: await flowAdmissionController.getDiagnostics(),
+    recovery: await flowRecoveryController.getSnapshot(),
   }
 }
 
@@ -3019,6 +3212,36 @@ async function probeFlowAdmissionHealth(tabId: number, signal: AbortSignal): Pro
   }
 }
 
+async function reconcileFlowUncertainJob(jobId: string) {
+  const admission = await flowAdmissionController.getSnapshot()
+  const job = admission.activeJob
+  if (!job || job.jobId !== jobId || job.state !== 'submit_uncertain') {
+    return { success: false, error: 'no_matching_submit_uncertain_job', admission }
+  }
+  const recovery = await flowRecoveryController.getSnapshot()
+  if (!recovery.incidentId) {
+    return { success: false, error: 'no_matching_recovery_incident', admission, recovery }
+  }
+  const health = await probeFlowAdmissionHealth(job.tabId, new AbortController().signal).catch(() => null)
+  const activeGenerationCount = health ? health.processing + health.pending + health.generating : 0
+  // No persisted job-specific tile identity is available at this layer yet.
+  // Provider activity without matching identity is ambiguous; provider idle is
+  // no evidence. Neither outcome releases admission or creates a new job.
+  const result = reconcileSubmitUncertain({ jobId, activeGenerationCount })
+  const nextRecovery = await flowRecoveryController.recordReconciliationResult(recovery.incidentId, result)
+  if (result.status === 'job_found_terminal') {
+    // This branch is reserved for future strong matching terminal evidence.
+    // Release remains owned by FlowAdmissionController, never recovery.
+    await flowAdmissionController.completeJob(jobId, undefined, 'reconciled_matching_terminal_evidence')
+  }
+  return {
+    success: true,
+    result,
+    admission: await flowAdmissionController.getSnapshot(),
+    recovery: nextRecovery,
+  }
+}
+
 async function cancelFlowAdmission(payload: { jobId?: string; callerId?: string }) {
   const snapshot = await flowAdmissionController.getSnapshot()
   const job = snapshot.activeJob
@@ -3059,7 +3282,55 @@ async function checkFlowSelector(payload: { selector?: string; tabId?: number })
   }
 }
 
-function flowPreAdmissionFailure(statusReason: string, error: string, tabId?: number): FlowResultContract {
+async function recordFlowRecoveryFailure(input: {
+  errorCode: FlowErrorCode
+  jobId?: string
+  tabId?: number
+  statusReason?: string
+  evidence?: FlowErrorEvidence[]
+  admissionState?: string
+}) {
+  const statusReason = String(input.statusReason || '')
+  const sessionEvidence = input.errorCode === 'session_expired'
+  try {
+    const snapshot = await flowRecoveryController.handleFailure({
+      errorCode: input.errorCode,
+      jobId: input.jobId,
+      tabId: input.tabId ?? -1,
+      evidence: input.evidence,
+      context: {
+        pageLoading: /loading|route.*not.*ready|document.*not.*ready/i.test(statusReason),
+        routeValid: /route.*invalid|url.*not.*ready/i.test(statusReason) ? false : undefined,
+        bridgeReady: input.errorCode === 'bridge_unavailable' ? false : undefined,
+        loginRequired: sessionEvidence,
+        sessionWarning: sessionEvidence,
+        sessionEvidenceConfidence: sessionEvidence ? 'high' : 'low',
+        admissionState: input.admissionState,
+      },
+    })
+    const reconciliation = input.jobId && input.admissionState === 'submit_uncertain'
+      ? await reconcileFlowUncertainJob(input.jobId)
+      : undefined
+    return { snapshot: reconciliation?.recovery || snapshot, reconciliation }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error('[FlowRecovery] persistence_or_controller_failure', message)
+    await appendFlowRuntimeDiagnosticEvent('FLOW_RECOVERY_PERSISTENCE_FAILED', {
+      errorCode: input.errorCode,
+      jobId: input.jobId,
+      reason: message,
+    }).catch(() => undefined)
+    return { error: message }
+  }
+}
+
+async function flowPreAdmissionFailure(statusReason: string, error: string, tabId?: number): Promise<FlowResultContract> {
+  const recovery = await recordFlowRecoveryFailure({
+    errorCode: 'bridge_unavailable',
+    tabId,
+    statusReason,
+    evidence: [createFlowEvidence('orchestrator', statusReason, { confidence: 'high' })],
+  })
   return ensureFlowResultContract({
     success: false,
     ...(tabId ? { tabId } : {}),
@@ -3068,6 +3339,8 @@ function flowPreAdmissionFailure(statusReason: string, error: string, tabId?: nu
     errorCode: 'bridge_unavailable',
     statusReason,
     evidence: [createFlowEvidence('orchestrator', statusReason, { confidence: 'high' })],
+    recovery: recovery.snapshot,
+    recoveryError: recovery.error,
   }, 'orchestrator')
 }
 
@@ -3109,7 +3382,7 @@ async function runFlowPrompt(
         rawResult: null,
         payloadSummary: { mode: payload.mode, model: payload.model, quantity: payload.quantity },
       }))
-      return flowPreAdmissionFailure('flow_tab_not_found', 'Could not find or open Flow tab')
+      return await flowPreAdmissionFailure('flow_tab_not_found', 'Could not find or open Flow tab')
     }
   }
   // Log tab URL so we can detect stale / wrong tab
@@ -3180,7 +3453,7 @@ async function runFlowPrompt(
           reason: 'FLOW_SCRIPTS_NOT_FOUND',
           rawResult: null,
         }))
-        return flowPreAdmissionFailure('flow_content_bundle_not_found', 'Could not find flow-content script in manifest', tabId)
+        return await flowPreAdmissionFailure('flow_content_bundle_not_found', 'Could not find flow-content script in manifest', tabId)
       }
 
       // Inject content script (ISOLATED world)
@@ -3197,7 +3470,7 @@ async function runFlowPrompt(
           reason: 'FLOW_CONTENT_INJECTION_FAILED',
           rawResult: { message: (e as Error).message },
         }))
-        return flowPreAdmissionFailure('flow_content_injection_failed', 'Content script injection failed: ' + (e as Error).message, tabId)
+        return await flowPreAdmissionFailure('flow_content_injection_failed', 'Content script injection failed: ' + (e as Error).message, tabId)
       }
 
       // Inject bridge (MAIN world)
@@ -3216,7 +3489,7 @@ async function runFlowPrompt(
             reason: 'FLOW_BRIDGE_INJECTION_FAILED',
             rawResult: { message: (e as Error).message },
           }))
-          return flowPreAdmissionFailure('flow_bridge_injection_failed', 'Bridge MAIN world injection failed: ' + (e as Error).message, tabId)
+          return await flowPreAdmissionFailure('flow_bridge_injection_failed', 'Bridge MAIN world injection failed: ' + (e as Error).message, tabId)
         }
       }
 
@@ -3318,6 +3591,15 @@ async function runFlowPrompt(
   }, (signal) => probeFlowAdmissionHealth(tabId as number, signal))
 
   if (!admission.granted || !admission.job) {
+    const recovery = admission.health && admission.errorCode && admission.errorCode !== 'flow_busy'
+      ? await recordFlowRecoveryFailure({
+        errorCode: admission.errorCode,
+        tabId,
+        statusReason: admission.statusReason,
+        evidence: admission.health.evidence,
+        admissionState: admission.snapshot.state,
+      })
+      : undefined
     return ensureFlowResultContract({
       success: false,
       tabId,
@@ -3327,6 +3609,8 @@ async function runFlowPrompt(
       statusReason: admission.statusReason,
       evidence: admission.health?.evidence || [],
       admission: admission.snapshot,
+      recovery: recovery?.snapshot,
+      recoveryError: recovery?.error,
     }, 'orchestrator')
   }
 
@@ -3384,7 +3668,9 @@ async function runFlowPrompt(
       imageUrlsCount: Array.isArray(result?.imageUrls) ? (result?.imageUrls as unknown[]).length : 0,
     }))
     const structured = ensureFlowResultContract(result, 'bridge')
-    const uncertain = structured.errorCode === 'submit_uncertain' || structured.status === 'RUN_FLOW_PROMPT_TIMEOUT'
+    const uncertain = structured.errorCode === 'submit_uncertain'
+      || structured.errorCode === 'generation_timeout'
+      || structured.status === 'RUN_FLOW_PROMPT_TIMEOUT'
     if (uncertain) {
       await flowAdmissionController.markSubmitUncertain(admissionJob.jobId, structured.statusReason || 'flow_response_uncertain')
     } else {
@@ -3395,11 +3681,23 @@ async function runFlowPrompt(
       )
       flowDispatchedJobIds.delete(admissionJob.jobId)
     }
+    const recovery = !structured.success
+      ? await recordFlowRecoveryFailure({
+        errorCode: structured.errorCode || (uncertain ? 'submit_uncertain' : 'unknown'),
+        jobId: admissionJob.jobId,
+        tabId,
+        statusReason: structured.statusReason || String(structured.status || 'flow_job_failed'),
+        evidence: structured.evidence,
+        admissionState: uncertain ? 'submit_uncertain' : 'in_flight',
+      })
+      : undefined
     return {
       ...structured,
       tabId,
       jobId: admissionJob.jobId,
       admission: await flowAdmissionController.getSnapshot(),
+      recovery: recovery?.snapshot,
+      recoveryError: recovery?.error,
     }
   } catch (e) {
     const message = (e as Error).message || String(e)
@@ -3423,6 +3721,14 @@ async function runFlowPrompt(
       extra: isContextInvalidated ? { hint: 'Reload the Flow tab and retry.', contextInvalidated: true } : undefined,
     }))
     await flowAdmissionController.markSubmitUncertain(admissionJob.jobId, reason)
+    const recovery = await recordFlowRecoveryFailure({
+      errorCode: 'submit_uncertain',
+      jobId: admissionJob.jobId,
+      tabId,
+      statusReason: reason,
+      evidence: [createFlowEvidence('orchestrator', reason, { confidence: 'high' })],
+      admissionState: 'submit_uncertain',
+    })
     return ensureFlowResultContract({
       success: false,
       tabId,
@@ -3433,6 +3739,8 @@ async function runFlowPrompt(
       statusReason: reason,
       evidence: [createFlowEvidence('orchestrator', reason, { confidence: 'high' })],
       admission: await flowAdmissionController.getSnapshot(),
+      recovery: recovery.snapshot,
+      recoveryError: recovery.error,
     }, 'orchestrator')
   }
 }
