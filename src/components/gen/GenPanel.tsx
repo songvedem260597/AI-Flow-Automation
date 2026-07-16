@@ -2292,7 +2292,10 @@ export const GenPanel: React.FC<{
         resolvedRefImages.push({
           id: realTileId,
           name: realFileName,
-          thumbnail: uploadResult.thumbnail || ref.thumbnail,
+          // Keep the local data URL for Side Panel rendering. Flow returns a
+          // relative /fx/api/... thumbnail which would otherwise resolve
+          // against chrome-extension:// and display as a broken image.
+          thumbnail: ref.thumbnail || uploadResult.thumbnail,
           type: ref.type,
           alias: ref.alias,
         })

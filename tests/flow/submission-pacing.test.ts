@@ -434,6 +434,7 @@ test('content requests controller permits in verify-before-click order', () => {
   assert.match(background, /flowAdmissionController\.waitForSubmissionPacing\(jobId, phase\)/)
   assert.match(background, /providerBusyWaitTimeoutMs:\s*30_000/)
   assert.match(genPanel, /persistResolvedFlowReferences\(selectedRefImages, resolved\.resolvedRefImages\)/)
+  assert.match(genPanel, /thumbnail:\s*ref\.thumbnail \|\| uploadResult\.thumbnail/)
   assert.doesNotMatch(genPanel, /console\.warn\('\[FlowAdmission\]\[GenPanelResult\]'/)
 })
 

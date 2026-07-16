@@ -110,6 +110,7 @@ test('synthetic fallback wrappers do not block Flow admission', () => {
 test('explicit English and Vietnamese queue labels are pending signals', () => {
   assert.equal(isFlowQueueStatusText('In queue'), true)
   assert.equal(isFlowQueueStatusText('Waiting in the queue…'), true)
+  assert.equal(isFlowQueueStatusText('Đang trong hàng đợi'), true)
   assert.equal(isFlowQueueStatusText('Hiện đang trong hàng đợi'), true)
   assert.equal(isFlowQueueStatusText('Đang chờ'), true)
   assert.equal(isFlowQueueStatusText('Create a scene about waiting in the queue'), false)
