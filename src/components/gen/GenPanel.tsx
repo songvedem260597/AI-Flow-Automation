@@ -57,6 +57,8 @@ const FLOW_VIDEO_MODELS: FlowModelOption[] = [
 
 const DEFAULT_FLOW_IMAGE_MODEL = 'Nano Banana 2'
 const DEFAULT_FLOW_VIDEO_MODEL = 'Omni Flash'
+const FLOW_UTILITY_PANEL_CLASS = 'rounded-xl border border-white/[0.07] bg-[#141414] p-3'
+const FLOW_UTILITY_ACTION_CLASS = 'rounded-lg border border-white/[0.08] bg-[#111111] px-2 py-1.5 text-[10px] text-white/45 transition-colors hover:border-[#7C5CFF]/30 hover:bg-[#7C5CFF]/[0.08] hover:text-[#C8BCFF] disabled:cursor-not-allowed disabled:border-white/[0.05] disabled:bg-[#101010] disabled:text-white/20 disabled:opacity-60'
 
 function flowDiagnosticFilename(now = new Date()): string {
   const pad = (value: number) => String(value).padStart(2, '0')
@@ -3324,19 +3326,20 @@ const handleGenerate = useCallback(async () => {
           </div>
         </div>
 
-        {/* ── Flow Runtime Verification (read-only) ── */}
+        {/* Flow Recovery */}
         {activeProvider === 'flow' && (
           <div className="px-4 pb-3">
-            <div className="rounded-xl border border-amber-400/15 bg-amber-400/[0.04] p-3">
+            <div className={FLOW_UTILITY_PANEL_CLASS}>
               <div className="flex items-center gap-2">
-                <Activity className={cn(
-                  'h-3.5 w-3.5',
-                  flowRecoverySnapshot?.state === 'healthy' ? 'text-emerald-300' : 'text-amber-300',
-                )} />
+                <Activity className="h-3.5 w-3.5 text-[#9B82FF]" />
                 <div className="text-[11px] font-medium text-white/70">Flow Recovery</div>
                 <span className={cn(
                   'ml-auto text-[10px] font-medium',
-                  flowRecoverySnapshot?.state === 'healthy' ? 'text-emerald-300' : 'text-amber-200',
+                  flowRecoverySnapshot?.state === 'healthy'
+                    ? 'text-emerald-300'
+                    : flowRecoverySnapshot?.state === 'recovering'
+                      ? 'text-[#B8A8FF]'
+                      : 'text-amber-200',
                 )}>
                   {flowRecoveryStatusText(flowRecoverySnapshot)}
                 </span>
@@ -3351,7 +3354,7 @@ const handleGenerate = useCallback(async () => {
                   type="button"
                   onClick={() => void runFlowRecoveryAction('FLOW_RUN_RECOVERY_HEALTH_PROBE')}
                   disabled={!!flowRecoveryBusyAction}
-                  className="rounded-lg border border-white/[0.07] bg-white/[0.04] px-2 py-1.5 text-[10px] text-white/55 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-30"
+                  className={FLOW_UTILITY_ACTION_CLASS}
                 >
                   {flowRecoveryBusyAction === 'FLOW_RUN_RECOVERY_HEALTH_PROBE' ? 'Probing…' : 'Run health probe'}
                 </button>
@@ -3363,7 +3366,7 @@ const handleGenerate = useCallback(async () => {
                     && flowRecoverySnapshot.errorCode === 'session_expired'
                     && flowRecoverySnapshot.sessionRefreshAttempted === false
                   )}
-                  className="rounded-lg border border-white/[0.07] bg-white/[0.04] px-2 py-1.5 text-[10px] text-white/55 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-30"
+                  className={FLOW_UTILITY_ACTION_CLASS}
                 >
                   {flowRecoveryBusyAction === 'FLOW_ATTEMPT_SESSION_RECOVERY' ? 'Recovering…' : 'Attempt session recovery'}
                 </button>
@@ -3371,7 +3374,7 @@ const handleGenerate = useCallback(async () => {
                   type="button"
                   onClick={() => void runFlowRecoveryAction('FLOW_OPEN_TAB')}
                   disabled={!!flowRecoveryBusyAction}
-                  className="rounded-lg border border-white/[0.07] bg-white/[0.04] px-2 py-1.5 text-[10px] text-white/55 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-30"
+                  className={FLOW_UTILITY_ACTION_CLASS}
                 >
                   Open Flow tab
                 </button>
@@ -3379,7 +3382,7 @@ const handleGenerate = useCallback(async () => {
                   type="button"
                   onClick={handleFlowAdmissionReset}
                   disabled={flowAdmissionResetting || !!flowRecoveryBusyAction}
-                  className="rounded-lg border border-amber-400/15 bg-amber-400/[0.05] px-2 py-1.5 text-[10px] text-amber-200/75 hover:bg-amber-400/[0.09] disabled:cursor-not-allowed disabled:opacity-30"
+                  className={FLOW_UTILITY_ACTION_CLASS}
                 >
                   {flowAdmissionResetting ? 'Resetting…' : 'Acknowledge / manual reset'}
                 </button>
@@ -3394,18 +3397,18 @@ const handleGenerate = useCallback(async () => {
         {/* Flow Runtime Verification (read-only) */}
         {activeProvider === 'flow' && (
           <div className="px-4 pb-3">
-            <div className="rounded-xl border border-sky-400/15 bg-sky-400/[0.04] p-3">
+            <div className={FLOW_UTILITY_PANEL_CLASS}>
               <div className="flex items-center gap-2">
-                <Activity className="h-3.5 w-3.5 text-sky-300" />
+                <Activity className="h-3.5 w-3.5 text-[#9B82FF]" />
                 <div className="text-[11px] font-medium text-white/70">Runtime Verification</div>
                 <div className="ml-auto flex items-center gap-2">
-                  <span className={cn('text-[10px] font-medium', flowRuntimeDiagnosticsEnabled ? 'text-emerald-300' : 'text-white/30')}>
+                  <span className={cn('text-[10px] font-medium', flowRuntimeDiagnosticsEnabled ? 'text-[#B8A8FF]' : 'text-white/30')}>
                     Runtime Diagnostics: {flowRuntimeDiagnosticsEnabled ? 'ON' : 'OFF'}
                   </span>
                   <Toggle checked={flowRuntimeDiagnosticsEnabled} onChange={handleFlowDiagnosticToggle} />
                 </div>
               </div>
-              <div className="mt-1.5 text-[10px] text-sky-100/45">These checks do not generate media.</div>
+              <div className="mt-1.5 text-[10px] text-white/35">These checks do not generate media.</div>
               {flowRuntimeSessionId && flowRuntimeDiagnosticsEnabled && (
                 <div className="mt-1 truncate font-mono text-[9px] text-white/25" title={flowRuntimeSessionId}>
                   Session: {flowRuntimeSessionId}
@@ -3424,7 +3427,7 @@ const handleGenerate = useCallback(async () => {
                     type="button"
                     onClick={() => void runFlowDiagnosticAction(action, label)}
                     disabled={!flowRuntimeDiagnosticsEnabled || !!flowDiagnosticBusyAction}
-                    className="rounded-lg border border-white/[0.07] bg-white/[0.04] px-2 py-1.5 text-[10px] text-white/55 transition-colors hover:bg-white/[0.08] hover:text-white/75 disabled:cursor-not-allowed disabled:opacity-30"
+                    className={FLOW_UTILITY_ACTION_CLASS}
                   >
                     {flowDiagnosticBusyAction === action ? 'Running…' : label}
                   </button>
@@ -3433,7 +3436,7 @@ const handleGenerate = useCallback(async () => {
                   type="button"
                   onClick={() => void handleFlowDiagnosticExport()}
                   disabled={!flowRuntimeDiagnosticsEnabled || !!flowDiagnosticBusyAction}
-                  className="rounded-lg border border-white/[0.07] bg-white/[0.04] px-2 py-1.5 text-[10px] text-white/55 transition-colors hover:bg-white/[0.08] hover:text-white/75 disabled:cursor-not-allowed disabled:opacity-30"
+                  className={FLOW_UTILITY_ACTION_CLASS}
                 >
                   {flowDiagnosticBusyAction === 'FLOW_RUNTIME_GET_REPORT' ? 'Exporting…' : 'Export Diagnostic Report'}
                 </button>
