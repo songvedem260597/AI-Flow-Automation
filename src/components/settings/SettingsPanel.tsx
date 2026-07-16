@@ -77,15 +77,6 @@ export const SettingsPanel: React.FC = () => {
           />
         </Section>
 
-        <Section title="Google Flow" icon={<Eye className="w-4 h-4" />}>
-          <Toggle
-            label="Show Recovery & Verification"
-            description="Show both utility panels in Generate. Flow safety remains active when hidden."
-            checked={settings.showFlowUtilityPanels !== false}
-            onChange={(v) => settings.updateSettings({ showFlowUtilityPanels: v })}
-          />
-        </Section>
-
         <Section title="Notifications" icon={<Bell className="w-4 h-4" />}>
           <Toggle
             label="On Complete"

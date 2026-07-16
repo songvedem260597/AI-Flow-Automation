@@ -127,6 +127,33 @@ export const SettingsPanel: React.FC = () => {
 
         <section>
           <div className="border-b border-white/[0.06] pb-3">
+            <h3 className="text-[10px] font-semibold uppercase tracking-widest text-white/30">Google Flow</h3>
+          </div>
+          <div className="flex min-h-14 items-center justify-between gap-6 border-b border-white/[0.055] py-3.5">
+            <div>
+              <p className="text-xs font-medium text-white/50">Recovery & Runtime Verification</p>
+              <p className={settingDescriptionClass}>Show both utility panels in Generate. Flow safety remains active when hidden.</p>
+            </div>
+            <button
+              type="button"
+              aria-label="Show Flow Recovery and Runtime Verification"
+              aria-pressed={settings.showFlowUtilityPanels !== false}
+              onClick={() => settings.updateSettings({ showFlowUtilityPanels: settings.showFlowUtilityPanels === false })}
+              className={cn(
+                'relative h-5 w-9 shrink-0 rounded-full transition-all',
+                settings.showFlowUtilityPanels !== false ? 'bg-[#7C5CFF]' : 'bg-white/10'
+              )}
+            >
+              <span className={cn(
+                'absolute top-1/2 h-3.5 w-3.5 -translate-y-1/2 rounded-full bg-white transition-all',
+                settings.showFlowUtilityPanels !== false ? 'left-[18px]' : 'left-1'
+              )} />
+            </button>
+          </div>
+        </section>
+
+        <section>
+          <div className="border-b border-white/[0.06] pb-3">
             <h3 className="text-[10px] font-semibold uppercase tracking-widest text-white/30">Prompt execution</h3>
           </div>
 
