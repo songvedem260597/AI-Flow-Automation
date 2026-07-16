@@ -1,6 +1,7 @@
 import {
   ensureFlowResultContract,
   shouldExitFlowConfirmedPartialCollection,
+  shouldExitFlowVideoPartialGrace,
 } from '../lib/flow/resultContract'
 import {
   dedupeFlowTileObservations,
@@ -2001,17 +2002,21 @@ async function runFlowPrompt(payload: {
       // This is a FALLBACK path. The primary exit is the
       // confirmed + stable-failed branch above. We reach this branch only
       // when Flow never painted a failure icon AND confirmed > 0 but
-      // confirmed < expectedQuantity. Without a failed-icon signal we
-      // cannot tell which tiles are stuck — the short 8s grace gives
-      // them one more chance to settle. After that, download confirmed.
+      // confirmed < expectedQuantity AND no pending tile remains. A queued,
+      // blank-transition, or percentage tile is active work and must keep
+      // the collector alive. Only a truly missing tile uses the 8s grace.
       if (
         payload.mode === 'video' &&
-        uniqueConfirmed.length > 0 &&
-        uniqueConfirmed.length < payload.quantity &&
-        failed.length === 0 &&                       // no failed icon detected
-        freshFailedIds.size === 0 &&                 // no transient failed either
-        lastProgressMs > 0 &&
-        (waitedMs - lastProgressMs) >= VIDEO_PARTIAL_GRACE_MS
+        shouldExitFlowVideoPartialGrace({
+          expected: payload.quantity,
+          confirmed: uniqueConfirmed.length,
+          pending: uniquePending.length,
+          failed: failed.length,
+          freshFailed: freshFailedIds.size,
+          lastProgressMs: lastProgressMs,
+          waitedMs: waitedMs,
+          graceMs: VIDEO_PARTIAL_GRACE_MS,
+        })
       ) {
         var noProgressMs = waitedMs - lastProgressMs
         console.warn('[FlowContent][AUTO_DOWNLOAD_VIDEO_PARTIAL_GRACE]', JSON.stringify({

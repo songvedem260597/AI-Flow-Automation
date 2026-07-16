@@ -88,6 +88,28 @@ export function shouldExitFlowConfirmedPartialCollection(
   return input.confirmed >= targetSuccessful
 }
 
+export interface FlowVideoPartialGraceInput {
+  expected: number
+  confirmed: number
+  pending: number
+  failed: number
+  freshFailed: number
+  lastProgressMs: number
+  waitedMs: number
+  graceMs: number
+}
+
+/** A missing video may become partial only after every live tile is gone. */
+export function shouldExitFlowVideoPartialGrace(input: FlowVideoPartialGraceInput): boolean {
+  return input.confirmed > 0 &&
+    input.confirmed < input.expected &&
+    input.pending === 0 &&
+    input.failed === 0 &&
+    input.freshFailed === 0 &&
+    input.lastProgressMs > 0 &&
+    (input.waitedMs - input.lastProgressMs) >= input.graceMs
+}
+
 export function flowErrorCodeFromLegacy(status: unknown, error: unknown): FlowErrorCode | undefined {
   const combined = `${String(status || '')} ${String(error || '')}`.toLocaleLowerCase()
   const textClassification = classifyFlowErrorText(combined)

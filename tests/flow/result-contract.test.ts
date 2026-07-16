@@ -5,6 +5,7 @@ import {
   classifyFlowErrorText,
   ensureFlowResultContract,
   shouldExitFlowConfirmedPartialCollection,
+  shouldExitFlowVideoPartialGrace,
 } from '../../src/lib/flow/resultContract.ts'
 
 test('fixture 9: unusual activity is preserved as a specific error', () => {
@@ -72,5 +73,31 @@ test('blank pre-queue tiles cannot trigger the confirmed partial exit', () => {
     expected: 2,
     confirmed: 1,
     failed: 1,
+  }), true)
+})
+
+test('video partial grace keeps waiting while another tile is active', () => {
+  assert.equal(shouldExitFlowVideoPartialGrace({
+    expected: 2,
+    confirmed: 1,
+    pending: 1,
+    failed: 0,
+    freshFailed: 0,
+    lastProgressMs: 50_600,
+    waitedMs: 58_600,
+    graceMs: 8_000,
+  }), false)
+})
+
+test('video partial grace can finish only when no pending tile remains', () => {
+  assert.equal(shouldExitFlowVideoPartialGrace({
+    expected: 2,
+    confirmed: 1,
+    pending: 0,
+    failed: 0,
+    freshFailed: 0,
+    lastProgressMs: 50_600,
+    waitedMs: 58_600,
+    graceMs: 8_000,
   }), true)
 })
